@@ -1,0 +1,12 @@
+node_modules
+.git
+.env
+*.log
+npm-debug.log*
+.agent
+.claude
+.github
+Dockerfile
+docker-compose.yaml
+MIGRATION.md
+README.md

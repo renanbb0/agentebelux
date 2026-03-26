@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  belux-agent:
+    build: .
+    container_name: belux-agent
+    restart: always
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10mb"
+        max-file: "3"
