@@ -4,6 +4,9 @@ const express = require('express');
 const woocommerce = require('./services/woocommerce');
 const zapi = require('./services/zapi');
 const groq = require('./services/groq');
+const tts = require('./services/tts');
+
+const TTS_ENABLED = process.env.TTS_ENABLED === 'true';
 
 const app = express();
 app.use(express.json());
@@ -52,6 +55,19 @@ app.post('/webhook', async (req, res) => {
   try {
     const body = req.body;
 
+    // LOG DIAGNÓSTICO — remover após identificar o problema do trial
+    console.log('[Webhook RAW]', JSON.stringify({
+      phone: body?.phone,
+      fromMe: body?.fromMe,
+      type: body?.type,
+      isGroup: body?.isGroup,
+      broadcast: body?.broadcast,
+      isStatusReply: body?.isStatusReply,
+      messageId: body?.messageId,
+      textMessage: body?.text?.message?.substring(0, 80),
+      keys: Object.keys(body || {}),
+    }));
+
     const from = body?.phone || '';
     if (!from) return;
     if (body?.fromMe) return;
@@ -64,6 +80,9 @@ app.post('/webhook', async (req, res) => {
 
     const text = extractTextFromEvent(body);
     if (!text) return;
+
+    // Ignora mensagens de sistema do Z-API trial ("MENSAGEM DE TESTE / CONTA EM TRIAL")
+    if (text.includes('CONTA EM TRIAL') || text.includes('MENSAGEM DE TESTE')) return;
 
     console.log(`[MSG] ${from}: "${text}"`);
 
@@ -98,6 +117,15 @@ app.post('/webhook', async (req, res) => {
 
     if (cleanText) {
       await zapi.sendText(from, cleanText);
+
+      if (TTS_ENABLED) {
+        try {
+          const { buffer, mimeType } = await tts.textToSpeech(cleanText);
+          await zapi.sendAudio(from, buffer, mimeType);
+        } catch (ttsErr) {
+          console.error('[TTS Error]', ttsErr.message);
+        }
+      }
     }
 
     if (action) {
@@ -131,7 +159,16 @@ async function executeAction(phone, action, session) {
         return;
       }
       if (session.productOffset >= session.products.length) {
-        await zapi.sendText(phone, '✅ Você já viu todos os produtos disponíveis! Quer escolher algum ou buscar outra coisa?');
+        // Let the AI respond naturally when all products have been shown
+        const nudgeFim = `[SISTEMA: O lojista pediu ver mais produtos, mas já viu todos os ${session.products.length} disponíveis na categoria. Informe isso de forma natural e sugira escolher algum ou explorar outra categoria. Máximo 2 frases.]`;
+        session.history.push({ role: 'system', content: nudgeFim });
+        const catalogContext = buildCatalogContext(session);
+        const aiRaw = await groq.chat(session.history, catalogContext);
+        const { cleanText } = groq.parseAction(aiRaw);
+        if (cleanText) {
+          session.history.push({ role: 'assistant', content: cleanText });
+          await zapi.sendText(phone, cleanText);
+        }
         return;
       }
       await sendProductPage(phone, session);
@@ -203,8 +240,12 @@ async function executeAction(phone, action, session) {
       break;
     }
 
-    case 'FINALIZAR':
-      await finalizeOrder(phone, session);
+    case 'HANDOFF':
+      await handoffToConsultant(phone, session);
+      break;
+
+    case 'FINALIZAR': // fallback legado — fluxo principal usa [HANDOFF]
+      await handoffToConsultant(phone, session);
       break;
   }
 }
@@ -272,7 +313,7 @@ async function sendProductPage(phone, session, label = '') {
     const price = woocommerce.formatPrice(p.salePrice || p.price);
     list += `${globalIdx}. *${p.name}* — ${price}\n`;
   });
-  list += '\n_Digite o número do produto para ver os tamanhos._';
+  // No instruction text — AI asks naturally via askAfterProducts
 
   await zapi.sendText(phone, list);
 
@@ -285,6 +326,26 @@ async function sendProductPage(phone, session, label = '') {
 
   session.productOffset = end;
   session.remainingProducts = remaining;
+
+  // After showing products, let the AI engage naturally
+  await askAfterProducts(phone, session);
+}
+
+async function askAfterProducts(phone, session) {
+  const nudge = session.remainingProducts > 0
+    ? `[SISTEMA: Você acabou de mostrar os produtos acima. Ainda há ${session.remainingProducts} produto(s) que o cliente não viu. De forma breve e natural, pergunte se algum chamou atenção ou se quer ver mais opções. Máximo 2 frases.]`
+    : `[SISTEMA: Você acabou de mostrar todos os produtos disponíveis. De forma breve e natural, pergunte se algum chamou atenção ou se prefere buscar algo específico. Máximo 2 frases.]`;
+
+  session.history.push({ role: 'system', content: nudge });
+
+  const catalogContext = buildCatalogContext(session);
+  const aiRaw = await groq.chat(session.history, catalogContext);
+  const { cleanText } = groq.parseAction(aiRaw);
+
+  if (cleanText) {
+    session.history.push({ role: 'assistant', content: cleanText });
+    await zapi.sendText(phone, cleanText);
+  }
 }
 
 async function showSizes(phone, product) {
@@ -293,16 +354,15 @@ async function showSizes(phone, product) {
     return;
   }
 
-  let msg = `📏 *${product.name}*\nEscolha o tamanho:\n\n`;
+  let msg = `📏 *${product.name}*\n\n`;
   product.sizes.forEach((s, i) => { msg += `${i + 1}. ${s}\n`; });
-  msg += '\n_Digite o número do tamanho desejado._';
 
   await zapi.sendText(phone, msg);
 }
 
 async function showCart(phone, session) {
   if (session.items.length === 0) {
-    await zapi.sendText(phone, '🛒 Seu carrinho está vazio!\n\nEscolha uma categoria para começar:\n👗 *Feminino* | 👔 *Masculino* | 👶 *Infantil*');
+    await zapi.sendText(phone, '🛒 Carrinho vazio ainda.');
     return;
   }
 
@@ -315,10 +375,43 @@ async function showCart(phone, session) {
     summary += `${idx + 1}. *${item.productName}*\n   📏 Tam: ${item.size} | 💰 ${woocommerce.formatPrice(price)}\n`;
   });
 
-  summary += `─────────────────\n💰 *Total: ${woocommerce.formatPrice(total)}*\n\n`;
-  summary += `➕ Continue escolhendo\n🗑️ Para remover: diga _"remover item N"_\n✅ Para fechar: diga _"finalizar"_`;
+  summary += `─────────────────\n💰 *Total: ${woocommerce.formatPrice(total)}*`;
 
   await zapi.sendText(phone, summary);
+}
+
+async function handoffToConsultant(phone, session) {
+  if (session.items.length === 0) {
+    await zapi.sendText(phone, 'Ainda não temos nada no pedido! Me conta o que você procura e a gente monta junto 😊');
+    return;
+  }
+
+  const customerName = session.customerName || 'Lojista';
+  const orderDate = new Date().toLocaleString('pt-BR');
+  let total = 0;
+
+  let orderBlock = `📋 *PEDIDO PARA ATENDIMENTO*\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+  orderBlock += `👤 ${customerName}\n📱 ${phone}\n📅 ${orderDate}\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+
+  session.items.forEach((item, idx) => {
+    const price = parseFloat(item.price);
+    total += price;
+    orderBlock += `${idx + 1}. ${item.productName}\n   📏 ${item.size} | 💰 ${woocommerce.formatPrice(price)}\n`;
+  });
+
+  orderBlock += `\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n💰 *TOTAL: ${woocommerce.formatPrice(total)}*\n📦 ${session.items.length} ${session.items.length === 1 ? 'item' : 'itens'}`;
+
+  // Notify consultant (admin) with full order
+  if (ADMIN_PHONE) {
+    try {
+      await zapi.sendText(ADMIN_PHONE, `🆕 *HANDOFF — Pedido pronto para fechar*\n${orderBlock}\n\n_Sessão preservada — entre em contato com o lojista para finalizar._`);
+    } catch (err) {
+      console.error('[Admin Handoff Error]', err.message);
+    }
+  }
+
+  console.log(`\n[HANDOFF] ${orderBlock}\n`);
+  // Session preserved intentionally — consultant may need to consult it
 }
 
 async function finalizeOrder(phone, session) {

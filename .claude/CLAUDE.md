@@ -10,7 +10,7 @@ Sempre responda em **português brasileiro**, sem exceção — mesmo que a perg
 
 Você é o arquiteto sênior do **Agente Belux**: bot de vendas via WhatsApp para a **Belux Moda Íntima**, desenvolvido pela Lume Soluções. O código é a execução; a inteligência e as regras de negócio residem no Obsidian.
 
-**Stack:** Node.js · Express 5 · Z-API (WhatsApp SaaS) · WooCommerce REST API
+**Stack:** Node.js · Express 5 · Z-API (WhatsApp SaaS) · WooCommerce REST API · Groq (llama-3.3-70b)
 
 ---
 
@@ -20,9 +20,13 @@ Você é o arquiteto sênior do **Agente Belux**: bot de vendas via WhatsApp par
 Agente Belux/
 ├── index.js               ← Servidor, webhook, lógica do bot
 ├── services/
+│   ├── groq.js            ← IA Bela: SYSTEM_PROMPT, chat(), parseAction()
 │   ├── zapi.js            ← Envio de mensagens (Z-API)
 │   └── woocommerce.js     ← Catálogo de produtos
 ├── .env                   ← Credenciais (nunca versionar)
+├── .env.example           ← Modelo de variáveis (versionado)
+├── Dockerfile             ← Imagem Docker de produção
+├── docker-compose.yaml    ← Orquestração de containers
 ├── MIGRATION.md           ← Histórico técnico
 └── CLAUDE.md              ← Este arquivo
 ```
@@ -43,8 +47,13 @@ O Obsidian é a memória de longo prazo do projeto. Antes de qualquer refatoraç
 | `03 - Serviço WooCommerce.md` | Catálogo, categorias, funções |
 | `04 - Serviço Z-API.md` | Tipos de mensagem, endpoints |
 | `05 - Sessões e Carrinho.md` | Estado em memória, ciclo de vida |
-| `06 - Configuração e Deploy.md` | Variáveis, scripts, ngrok |
+| `06 - Configuração e Deploy.md` | Variáveis, scripts, ngrok, Docker |
 | `07 - Histórico e Migrações.md` | Decisões técnicas (ADRs) |
+| `08 - Tarefas e Bugs Pendentes.md` | Checklist de trabalho em andamento |
+| `09 - Humanização e Eventos WhatsApp.md` | Comportamentos humanos, cobertura de eventos |
+| `10 - Persona da Bela.md` | Identidade, tom de voz, regras de comportamento |
+| `11 - Catálogo e Regras Comerciais.md` | Categorias, pedido mínimo, desconto PIX, prazos |
+| `12 - A Belux por Dentro.md` | Documento institucional — memória de longo prazo da Bela |
 
 ---
 

@@ -20,12 +20,6 @@ const categoryCache = {};
 const productCache = {};
 const PRODUCT_CACHE_TTL_MS = 5 * 60 * 1000;
 
-const CATEGORY_MAP = {
-  feminino: 'feminino',
-  masculino: 'masculino',
-  infantil: 'infantil',
-};
-
 /**
  * Looks up a WooCommerce category ID by slug, with in-memory caching.
  * @param {string} slug - Category slug
@@ -85,13 +79,6 @@ async function getAllProductsByCategory(categorySlug) {
   productCache[categorySlug] = { products: allProducts, ts: Date.now() };
   console.log(`[WooCommerce] Categoria "${categorySlug}": ${allProducts.length} produto(s) carregados.`);
   return allProducts;
-}
-
-/**
- * @deprecated Use getAllProductsByCategory instead.
- */
-async function getProductsByCategory(categorySlug, perPage = 20) {
-  return getAllProductsByCategory(categorySlug);
 }
 
 /**
@@ -191,12 +178,7 @@ function buildCaption(product) {
 
 module.exports = {
   getAllProductsByCategory,
-  getProductsByCategory,
   searchProducts,
-  getCategoryIdBySlug,
-  extractSizes,
-  formatProduct,
   formatPrice,
   buildCaption,
-  CATEGORY_MAP,
 };

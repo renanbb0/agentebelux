@@ -1,0 +1,8 @@
+[dotenv@17.3.1] injecting env (11) from .env -- tip: ⚙️  override existing env vars with { override: true }
+
+  ╔══════════════════════════════════════╗
+  ║   🤖 Vendedor Digital - Belux       ║
+  ║   IA: Groq (llama-3.3-70b)          ║
+  ║   Server running on port 3000       ║
+  ╚══════════════════════════════════════╝
+  

@@ -44,8 +44,19 @@ async function sendImage(to, imageUrl, caption) {
   return res;
 }
 
+async function sendAudio(to, audioBuffer, mimeType = 'audio/mp3') {
+  const base64 = audioBuffer.toString('base64');
+  const dataUri = `data:${mimeType};base64,${base64}`;
+  const res = await zapiClient.post('/send-audio', {
+    phone: to,
+    audio: dataUri,
+  });
+  console.log(`[Z-API sendAudio → ${to}]`, res.data?.zaapId || 'sent');
+  return res;
+}
+
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-module.exports = { readMessage, sendText, sendImage, delay };
+module.exports = { readMessage, sendText, sendImage, sendAudio, delay };
