@@ -16,10 +16,6 @@ const wooApi = axios.create({
 // In-memory cache for category IDs — avoids repeated lookups on each request
 const categoryCache = {};
 
-// In-memory cache for full product lists per category — TTL: 5 minutes
-const productCache = {};
-const PRODUCT_CACHE_TTL_MS = 5 * 60 * 1000;
-
 /**
  * Looks up a WooCommerce category ID by slug, with in-memory caching.
  * @param {string} slug - Category slug
@@ -38,62 +34,42 @@ async function getCategoryIdBySlug(slug) {
 }
 
 /**
- * Fetches ALL published, in-stock products for a category, paginating through
- * the WooCommerce API (max 100/page). Results are cached per category for 5 minutes.
- * Products are ordered by popularity (most sold first).
- * @param {string} categorySlug - Category slug (feminino, masculino, infantil)
- * @returns {Promise<Array>} Full array of simplified product objects
+ * Fetches products for a category with pagination.
+ * Returns metadata for pagination control.
  */
-async function getAllProductsByCategory(categorySlug) {
-  const cached = productCache[categorySlug];
-  if (cached && Date.now() - cached.ts < PRODUCT_CACHE_TTL_MS) {
-    return cached.products;
-  }
-
+async function getProductsByCategory(categorySlug, perPage = 10, page = 1) {
   const categoryId = await getCategoryIdBySlug(categorySlug);
   if (!categoryId) {
     throw new Error(`Categoria "${categorySlug}" não encontrada no WooCommerce.`);
   }
 
-  const allProducts = [];
-  let page = 1;
-
-  while (true) {
-    const { data: batch } = await wooApi.get('/products', {
-      params: {
-        category: categoryId,
-        per_page: 100,
-        page,
-        status: 'publish',
-        stock_status: 'instock',
-        orderby: 'popularity',
-        order: 'desc',
-      },
-    });
-
-    allProducts.push(...batch.map(formatProduct));
-    if (batch.length < 100) break;
-    page++;
-  }
-
-  // Deduplica por ID — produtos em múltiplas categorias podem aparecer mais de uma vez
-  const seen = new Set();
-  const unique = allProducts.filter(p => {
-    if (seen.has(p.id)) return false;
-    seen.add(p.id);
-    return true;
+  const response = await wooApi.get('/products', {
+    params: {
+      category: categoryId,
+      per_page: perPage,
+      page,
+      status: 'publish',
+      stock_status: 'instock',
+      orderby: 'popularity',
+      order: 'desc',
+    },
   });
 
-  productCache[categorySlug] = { products: unique, ts: Date.now() };
-  console.log(`[WooCommerce] Categoria "${categorySlug}": ${unique.length} produto(s) carregados (${allProducts.length - unique.length} duplicatas removidas).`);
-  return allProducts;
+  // WooCommerce retorna metadados de paginação nos headers
+  const total = parseInt(response.headers['x-wp-total'] || '0', 10);
+  const totalPages = parseInt(response.headers['x-wp-totalpages'] || '1', 10);
+
+  return {
+    products: response.data.map(formatProduct),
+    page,
+    totalPages,
+    total,
+    hasMore: page < totalPages,
+  };
 }
 
 /**
  * Searches products by name or keyword.
- * @param {string} query - Search term
- * @param {number} perPage - Number of results (default: 10)
- * @returns {Promise<Array>} Array of simplified product objects
  */
 async function searchProducts(query, perPage = 20) {
   const { data: products } = await wooApi.get('/products', {
@@ -110,9 +86,6 @@ async function searchProducts(query, perPage = 20) {
 
 /**
  * Extracts size variations from a product's attributes.
- * Looks for attribute named "Tamanho" or "size" (case-insensitive).
- * @param {object} product - Raw WooCommerce product object
- * @returns {string[]} Array of size labels (e.g., ["P", "M", "G", "GG"])
  */
 function extractSizes(product) {
   const sizeAttr = product.attributes.find(
@@ -123,10 +96,7 @@ function extractSizes(product) {
 }
 
 /**
- * Formats a raw WooCommerce product into a simplified object
- * with only the fields needed by the bot.
- * @param {object} product - Raw WooCommerce product
- * @returns {object} Simplified product
+ * Formats a raw WooCommerce product into a simplified object.
  */
 function formatProduct(product) {
   const shortDesc = product.short_description
@@ -140,6 +110,7 @@ function formatProduct(product) {
     regularPrice: product.regular_price,
     salePrice: product.sale_price,
     imageUrl: product.images.length > 0 ? product.images[0].src : null,
+    images: product.images.map((img) => img.src), // ✅ todas as fotos preservadas
     sizes: extractSizes(product),
     permalink: product.permalink,
     description: shortDesc,
@@ -148,8 +119,6 @@ function formatProduct(product) {
 
 /**
  * Formats price in BRL currency.
- * @param {string|number} price
- * @returns {string} Formatted price (e.g., "R$ 49,90")
  */
 function formatPrice(price) {
   const num = parseFloat(price);
@@ -159,11 +128,11 @@ function formatPrice(price) {
 
 /**
  * Builds the caption string for a product image message.
- * @param {object} product - Simplified product object from formatProduct
- * @returns {string} Caption text
  */
-function buildCaption(product) {
-  let caption = `✨ *${product.name}*\n`;
+function buildCaption(product, productNumber = null) {
+  let caption = productNumber
+    ? `✨ *${productNumber}. ${product.name}*\n`
+    : `✨ *${product.name}*\n`;
 
   if (product.salePrice && product.salePrice !== product.regularPrice) {
     caption += `~${formatPrice(product.regularPrice)}~\n`;
@@ -184,9 +153,37 @@ function buildCaption(product) {
   return caption;
 }
 
+/**
+ * Builds the catalog context for the AI, including photo counts and pagination.
+ */
+function buildCatalogContext(session) {
+  if (!session.products || session.products.length === 0) return null;
+
+  let ctx = `CATEGORIA: ${session.currentCategory || 'não definida'}\n`;
+  ctx += `PÁGINA: ${session.currentPage || 1} de ${session.totalPages || 1}\n\n`;
+
+  session.products.forEach((p, i) => {
+    const photoCount = p.images ? p.images.length : (p.imageUrl ? 1 : 0);
+    const priceDisplay = p.salePrice && p.salePrice !== p.regularPrice
+      ? `R$ ${p.salePrice} (era R$ ${p.regularPrice})`
+      : `R$ ${p.price}`;
+    ctx += `${i + 1}. ${p.name} — ${priceDisplay} — Tamanhos: ${p.sizes.join(', ')} — Fotos disponíveis: ${photoCount}\n`;
+  });
+
+  if (session.currentPage < session.totalPages) {
+    const remaining = (session.totalPages - session.currentPage) * 10;
+    ctx += `\n⚠️ Há mais ~${remaining} produtos não mostrados. Use [PROXIMOS] para avançar.\n`;
+  } else {
+    ctx += `\n✅ Todos os produtos desta categoria já foram mostrados.\n`;
+  }
+
+  return ctx;
+}
+
 module.exports = {
-  getAllProductsByCategory,
+  getProductsByCategory,
   searchProducts,
   formatPrice,
   buildCaption,
+  buildCatalogContext,
 };
