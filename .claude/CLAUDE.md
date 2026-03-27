@@ -10,7 +10,7 @@ Sempre responda em **português brasileiro**, sem exceção — mesmo que a perg
 
 Você é o arquiteto sênior do **Agente Belux**: bot de vendas via WhatsApp para a **Belux Moda Íntima**, desenvolvido pela Lume Soluções. O código é a execução; a inteligência e as regras de negócio residem no Obsidian.
 
-**Stack:** Node.js · Express 5 · Z-API (WhatsApp SaaS) · WooCommerce REST API · Groq (llama-3.3-70b)
+**Stack:** Node.js · Express 5 · Z-API (WhatsApp SaaS) · WooCommerce REST API · OpenRouter (Llama 4 Maverick) · Gemini TTS (feature flag)
 
 ---
 
@@ -20,7 +20,10 @@ Você é o arquiteto sênior do **Agente Belux**: bot de vendas via WhatsApp par
 Agente Belux/
 ├── index.js               ← Servidor, webhook, lógica do bot
 ├── services/
-│   ├── groq.js            ← IA Bela: SYSTEM_PROMPT, chat(), parseAction()
+│   ├── openrouter.js      ← IA Bela: SYSTEM_PROMPT, chat(), parseAction() — ATIVO
+│   ├── groq.js            ← IA Bela: SYSTEM_PROMPT, chat(), parseAction() — STANDBY
+│   ├── gemini.js          ← IA Bela: chat(), parseAction() — STANDBY
+│   ├── tts.js             ← TTS: textToSpeech() via Gemini 2.5 Pro (feature flag)
 │   ├── zapi.js            ← Envio de mensagens (Z-API)
 │   └── woocommerce.js     ← Catálogo de produtos
 ├── .env                   ← Credenciais (nunca versionar)
@@ -54,6 +57,8 @@ O Obsidian é a memória de longo prazo do projeto. Antes de qualquer refatoraç
 | `10 - Persona da Bela.md` | Identidade, tom de voz, regras de comportamento |
 | `11 - Catálogo e Regras Comerciais.md` | Categorias, pedido mínimo, desconto PIX, prazos |
 | `12 - A Belux por Dentro.md` | Documento institucional — memória de longo prazo da Bela |
+| `13 - Serviço OpenRouter.md` | Provider de IA ativo (Llama 4 Maverick), interface chat/parseAction |
+| `14 - Serviço TTS.md` | Text-to-Speech via Gemini 2.5 Pro (feature flag TTS_ENABLED) |
 
 ---
 
@@ -113,3 +118,35 @@ graph TD;
 - Nunca assuma — se não está no Obsidian, pergunte.
 - Nunca exponha chaves de API, tokens ou segredos.
 - Sempre atualize o Obsidian no mesmo turno que o código muda.
+
+---
+
+## Protocolo de Inicialização (MANDATÓRIO)
+
+O Agente Belux depende da porta **3000** e de um túnel **Ngrok** ativo para receber webhooks da Z-API.
+
+### 🚀 Como Iniciar o Servidor
+
+1. **Limpeza de Ambiente:** Garanta que nenhum processo antigo esteja ocupando a porta 3000.
+   - `Stop-Process -Name node -Force`
+   - Se a porta 3000 continuar ocupada (erro "EADDRINUSE"), verifique o **WSL**: `wsl --shutdown`.
+2. **Execução:**
+   - Modo Nativo (Preferencial no Windows): `node index.js`
+   - Modo Docker (Se o Docker Desktop estiver ativo): `docker-compose up -d --build`
+3. **Túnel Externo:**
+   - O Ngrok deve estar rodando na porta 3000: `ngrok http 3000`.
+   - **URL Crítica:** Verifique a URL gerada e certifique-se de que ela está configurada no painel da **Z-API** com o sufixo `/webhook`.
+
+3. **Túnel Externo (Ngrok):**
+   - **Comando não-bloqueante (PowerShell):** `Start-Process ngrok -ArgumentList "http 3000" -WindowStyle Hidden`
+   - **Como obter a URL via CLI:** Após 5 segundos, execute:
+     `Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels" | Select-Object -ExpandProperty tunnels | Select-Object public_url`
+   - **URL Crítica:** A URL gerada deve ser atualizada manualmente ou via API no painel da **Z-API** com o sufixo `/webhook`.
+
+### ⚠️ Resolução de Problemas Comuns
+
+| Problema | Causa Provável | Solução |
+|----------|----------------|---------|
+| `EADDRINUSE :3000` | WSL ou Node fantasma | `Stop-Process -Name node -Force` ou `wsl --shutdown`. |
+| Ngrok bloqueia terminal | Execução em foreground | Use `Start-Process` com `-WindowStyle Hidden`. |
+| Sem resposta no WhatsApp | Webhook URL errada | Valide se a URL do Ngrok termina em `/webhook` na Z-API. |

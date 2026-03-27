@@ -76,8 +76,16 @@ async function getAllProductsByCategory(categorySlug) {
     page++;
   }
 
-  productCache[categorySlug] = { products: allProducts, ts: Date.now() };
-  console.log(`[WooCommerce] Categoria "${categorySlug}": ${allProducts.length} produto(s) carregados.`);
+  // Deduplica por ID — produtos em múltiplas categorias podem aparecer mais de uma vez
+  const seen = new Set();
+  const unique = allProducts.filter(p => {
+    if (seen.has(p.id)) return false;
+    seen.add(p.id);
+    return true;
+  });
+
+  productCache[categorySlug] = { products: unique, ts: Date.now() };
+  console.log(`[WooCommerce] Categoria "${categorySlug}": ${unique.length} produto(s) carregados (${allProducts.length - unique.length} duplicatas removidas).`);
   return allProducts;
 }
 

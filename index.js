@@ -3,7 +3,9 @@ require('dotenv').config();
 const express = require('express');
 const woocommerce = require('./services/woocommerce');
 const zapi = require('./services/zapi');
-const groq = require('./services/groq');
+// const groq = require('./services/groq');       // Standby — Groq (llama-3.3-70b)
+// const groq = require('./services/gemini');     // Standby — Gemini (2.0-flash-lite)
+const groq = require('./services/openrouter');    // Ativo — Llama 4 Maverick via OpenRouter
 const tts = require('./services/tts');
 
 const TTS_ENABLED = process.env.TTS_ENABLED === 'true';
@@ -52,23 +54,11 @@ setInterval(() => {
 app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
 
+  let from = '';
   try {
     const body = req.body;
 
-    // LOG DIAGNÓSTICO — remover após identificar o problema do trial
-    console.log('[Webhook RAW]', JSON.stringify({
-      phone: body?.phone,
-      fromMe: body?.fromMe,
-      type: body?.type,
-      isGroup: body?.isGroup,
-      broadcast: body?.broadcast,
-      isStatusReply: body?.isStatusReply,
-      messageId: body?.messageId,
-      textMessage: body?.text?.message?.substring(0, 80),
-      keys: Object.keys(body || {}),
-    }));
-
-    const from = body?.phone || '';
+    from = body?.phone || '';
     if (!from) return;
     if (body?.fromMe) return;
     if (body?.isGroup) return;
@@ -91,13 +81,19 @@ app.post('/webhook', async (req, res) => {
 
     const session = getSession(from);
 
-    // Inject quoted message context so the AI knows what the client is replying to
+    // Inject quoted message context so the AI knows what the client is replying to.
+    // For image replies, Z-API puts the original image caption in quotedMessage.image.caption.
     if (body?.quotedMessage) {
-      const quotedText = body.quotedMessage.text?.message || '[mensagem anterior]';
-      session.history.push({
-        role: 'system',
-        content: `[O cliente está respondendo à seguinte mensagem: "${quotedText}"]`,
-      });
+      const quotedText =
+        body.quotedMessage.text?.message ||
+        body.quotedMessage.image?.caption ||
+        null;
+      if (quotedText) {
+        session.history.push({
+          role: 'system',
+          content: `[O cliente está respondendo à seguinte mensagem: "${quotedText}"]`,
+        });
+      }
     }
 
     session.history.push({ role: 'user', content: text });
@@ -106,7 +102,18 @@ app.post('/webhook', async (req, res) => {
     const aiRaw = await groq.chat(session.history, catalogContext);
     console.log(`[AI] ${from}: "${aiRaw}"`);
 
-    const { cleanText, action } = groq.parseAction(aiRaw);
+    let { cleanText, action } = groq.parseAction(aiRaw);
+
+    // Guard: bloqueia VER/BUSCAR apenas quando a IA está perguntando QUAL categoria ver.
+    // Permite tokens quando a pergunta é sobre os produtos já mostrados (ex: "Qual você gostaria?").
+    const askingForCategory = action &&
+      (action.type === 'VER' || action.type === 'BUSCAR') &&
+      cleanText.includes('?') &&
+      /qual.*categoria|que tipo|qual.*linha|por onde|qual.*prefer|começa por|começar por/i.test(cleanText);
+    if (askingForCategory) {
+      console.log(`[Guard] Token [${action.type}] descartado — IA perguntou sobre categoria junto com ação.`);
+      action = null;
+    }
 
     session.history.push({ role: 'assistant', content: cleanText });
 
@@ -136,6 +143,12 @@ app.post('/webhook', async (req, res) => {
     console.error('[Webhook Error]', error.message);
     if (error.response) {
       console.error('[Response]', JSON.stringify(error.response.data));
+    }
+    // Rate limit do Groq — avisa o cliente em vez de sumir
+    const isRateLimit = error.status === 429 || error.response?.status === 429 ||
+      error.message?.includes('429') || error.message?.includes('rate_limit');
+    if (isRateLimit && from) {
+      await zapi.sendText(from, 'Estou sobrecarregada no momento 😅 Tenta de novo em alguns minutinhos!').catch(() => {});
     }
   }
 });
@@ -206,11 +219,23 @@ async function executeAction(phone, action, session) {
         price: product.salePrice || product.price,
       });
       session.currentProduct = null;
-      const count = session.items.length;
-      await zapi.sendText(
-        phone,
-        `✅ *${product.name}* (Tam: ${size}) adicionado ao carrinho!\n🛒 ${count} ${count === 1 ? 'item' : 'itens'} no carrinho.\n\nContinue escolhendo ou diga *"finalizar"* para fechar o pedido.`
-      );
+      const itemCount = session.items.length;
+      const cartTotal = session.items.reduce((acc, it) => acc + parseFloat(it.price), 0);
+
+      // Let the AI confirm naturally — no robot message
+      const nudge = `[SISTEMA: O item "${product.name}" tamanho ${size} foi adicionado ao carrinho. Carrinho: ${itemCount} ${itemCount === 1 ? 'item' : 'itens'}, total ${woocommerce.formatPrice(cartTotal)}. Confirme de forma natural (sem emojis excessivos) e pergunte se quer adicionar mais ou finalizar. Máximo 2 frases. NÃO emita nenhum token de ação.]`;
+      session.history.push({ role: 'system', content: nudge });
+
+      try {
+        const aiRaw = await groq.chat(session.history, null);
+        const { cleanText } = groq.parseAction(aiRaw);
+        const reply = cleanText || `*${product.name}* (${size}) no carrinho! Quer continuar escolhendo ou vê o resumo do pedido?`;
+        session.history.push({ role: 'assistant', content: reply });
+        await zapi.sendText(phone, reply);
+      } catch (err) {
+        console.error('[TAMANHO AI Error]', err.message);
+        await zapi.sendText(phone, `*${product.name}* (${size}) adicionado! Quer continuar ou finalizar o pedido?`);
+      }
       break;
     }
 
@@ -333,18 +358,27 @@ async function sendProductPage(phone, session, label = '') {
 
 async function askAfterProducts(phone, session) {
   const nudge = session.remainingProducts > 0
-    ? `[SISTEMA: Você acabou de mostrar os produtos acima. Ainda há ${session.remainingProducts} produto(s) que o cliente não viu. De forma breve e natural, pergunte se algum chamou atenção ou se quer ver mais opções. Máximo 2 frases.]`
-    : `[SISTEMA: Você acabou de mostrar todos os produtos disponíveis. De forma breve e natural, pergunte se algum chamou atenção ou se prefere buscar algo específico. Máximo 2 frases.]`;
+    ? `[SISTEMA: As fotos acabaram de ser enviadas. Responda com APENAS 1 frase de texto puro — sem tokens, sem lista, sem preços. Pergunte naturalmente se algum chamou atenção ou se quer ver os próximos ${session.remainingProducts}. NÃO emita nenhum token de ação.]`
+    : `[SISTEMA: As fotos acabaram de ser enviadas e todos os produtos foram mostrados. Responda com APENAS 1 frase de texto puro — sem tokens, sem lista, sem preços. Pergunte naturalmente se algum chamou atenção ou se quer buscar algo específico. NÃO emita nenhum token de ação.]`;
 
   session.history.push({ role: 'system', content: nudge });
 
-  const catalogContext = buildCatalogContext(session);
-  const aiRaw = await groq.chat(session.history, catalogContext);
-  const { cleanText } = groq.parseAction(aiRaw);
+  try {
+    // Pass null context — no product list, so the model can't enumerate them.
+    // The nudge in history is enough to guide the follow-up question.
+    const aiRaw = await groq.chat(session.history, null);
+    console.log(`[askAfterProducts] raw="${aiRaw}"`);
+    const { cleanText } = groq.parseAction(aiRaw);
+    console.log(`[askAfterProducts] cleanText="${cleanText}"`);
 
-  if (cleanText) {
-    session.history.push({ role: 'assistant', content: cleanText });
-    await zapi.sendText(phone, cleanText);
+    const reply = cleanText || (session.remainingProducts > 0
+      ? `Algum produto chamou sua atenção? Ainda tenho mais ${session.remainingProducts} pra mostrar 😊`
+      : 'Algum produto chamou sua atenção? Me fala qual que eu te conto mais detalhes 😊');
+
+    session.history.push({ role: 'assistant', content: reply });
+    await zapi.sendText(phone, reply);
+  } catch (err) {
+    console.error('[askAfterProducts Error]', err.message);
   }
 }
 
@@ -414,52 +448,17 @@ async function handoffToConsultant(phone, session) {
   // Session preserved intentionally — consultant may need to consult it
 }
 
-async function finalizeOrder(phone, session) {
-  if (session.items.length === 0) {
-    await zapi.sendText(phone, '🛒 Seu carrinho está vazio! Adicione produtos antes de finalizar.');
-    return;
-  }
-
-  const customerName = session.customerName || 'Cliente';
-  const orderDate = new Date().toLocaleString('pt-BR');
-  let total = 0;
-
-  let orderBlock = `📋 *RESUMO DO PEDIDO*\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
-  orderBlock += `👤 ${customerName}\n📱 ${phone}\n📅 ${orderDate}\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
-
-  session.items.forEach((item, idx) => {
-    const price = parseFloat(item.price);
-    total += price;
-    orderBlock += `${idx + 1}. ${item.productName}\n   📏 ${item.size} | 💰 ${woocommerce.formatPrice(price)}\n`;
-  });
-
-  orderBlock += `\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n💰 *TOTAL: ${woocommerce.formatPrice(total)}*\n📦 ${session.items.length} ${session.items.length === 1 ? 'item' : 'itens'}`;
-
-  // Confirm to customer
-  await zapi.sendText(
-    phone,
-    `✅ *Pedido recebido com sucesso!*\n\n${orderBlock}\n\n💜 Uma consultora Belux entrará em contato em breve para combinar entrega e pagamento.\n\n_Obrigada por escolher *Belux Moda Íntima*!_ 👗`
-  );
-
-  // Notify admin if ADMIN_PHONE is configured
-  if (ADMIN_PHONE) {
-    try {
-      await zapi.sendText(ADMIN_PHONE, `🆕 *NOVO PEDIDO via WhatsApp*\n${orderBlock}`);
-    } catch (err) {
-      console.error('[Admin Notification Error]', err.message);
-    }
-  }
-
-  console.log(`\n[ORDER] ${orderBlock}\n`);
-  delete sessions[phone];
-}
-
 // ── Helpers ───────────────────────────────────────────────────────────────
 
 function extractTextFromEvent(body) {
   if (body?.text?.message) return body.text.message.trim();
   if (body?.audio)   return '[O cliente enviou um áudio]';
-  if (body?.image)   return `[O cliente enviou uma imagem${body.image.caption ? `: "${body.image.caption}"` : ''}]`;
+  if (body?.image) {
+    // When the user replies to a bot photo, Z-API sends it as an image event
+    // with the user's reply text in `caption`. Treat that as normal text input.
+    if (body.image.caption) return body.image.caption.trim();
+    return '[O cliente enviou uma imagem]';
+  }
   if (body?.sticker) return '[O cliente enviou um sticker]';
   return null; // reactions e outros eventos silenciosos
 }
@@ -483,11 +482,18 @@ function buildCatalogContext(session) {
   }
   lines.push(stateLines.join('\n'));
 
-  if (session.products?.length > 0) {
-    let catalog = `\nProdutos disponíveis (${session.products.length}):\n`;
-    session.products.forEach((p, i) => {
+  // Only include products that have actually been shown to the user (up to productOffset),
+  // capped at last 30 to avoid bloating the context with 200-product lists.
+  if (session.products?.length > 0 && session.productOffset > 0) {
+    const shownCount = session.productOffset;
+    const startIdx = Math.max(0, shownCount - 30);
+    const visibleProducts = session.products.slice(startIdx, shownCount);
+
+    let catalog = `\nProdutos mostrados ao cliente (itens ${startIdx + 1}–${shownCount} de ${session.products.length}):\n`;
+    visibleProducts.forEach((p, i) => {
+      const num = startIdx + i + 1;
       const price = p.salePrice || p.price;
-      catalog += `${i + 1}. ${p.name} — R$ ${price}`;
+      catalog += `${num}. ${p.name} — R$ ${price}`;
       if (p.sizes.length > 0) catalog += ` — Tamanhos: ${p.sizes.join(', ')}`;
       catalog += '\n';
     });
@@ -523,7 +529,7 @@ app.listen(PORT, () => {
   console.log(`
   ╔══════════════════════════════════════╗
   ║   🤖 Vendedor Digital - Belux       ║
-  ║   IA: Groq (llama-3.3-70b)          ║
+  ║   IA: Llama 4 Maverick (OpenRouter)  ║
   ║   Server running on port ${PORT}       ║
   ╚══════════════════════════════════════╝
   `);
