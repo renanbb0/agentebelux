@@ -3,7 +3,7 @@ require('dotenv').config();
 const express = require('express');
 const woocommerce = require('./services/woocommerce');
 const zapi = require('./services/zapi');
-const ai       = require('./services/openrouter');
+const ai       = require('./services/gemini');
 const tts      = require('./services/tts');
 const db       = require('./services/supabase');
 const learnings = require('./services/learnings');
@@ -96,12 +96,38 @@ app.post('/webhook', async (req, res) => {
     const text = extractTextFromEvent(body);
     if (!text) return;
 
+    if (text === '[Áudio]') {
+      console.log(`[Intercept] Áudio recebido. Mandando fallback humano.`);
+      await zapi.replyText(from, 'Puts amada, tô sem fone aqui no depósito 😅. Consegue me digitar rapidinho o que precisa?', messageId);
+      return;
+    }
+    if (text === '[Sticker]') {
+      console.log(`[Intercept] Sticker recebido. Ignorando silenciosamente para poupar token.`);
+      return;
+    }
+
     if (text.includes('CONTA EM TRIAL') || text.includes('MENSAGEM DE TESTE')) return;
 
     console.log(`[MSG] ${from}: "${text}"`);
     if (messageId) zapi.readMessage(from, messageId);
 
     const session = await getSession(from);
+
+    // FIX-16 — Saudação pura com histórico antigo: limpa contexto para novo atendimento.
+    // Preserva carrinho e nome do cliente.
+    const PURE_GREETING = /^(o+i+|ol[aá]+|bom dia|boa tarde|boa noite|hey+|hello|tudo bem|tudo bom|e a[ií]|eai|opa|boas)(\s|[!?.,]|$)/i;
+    if (PURE_GREETING.test(text.trim()) && session.history.length > 2) {
+      console.log(`[FIX-16] Saudação com histórico antigo — resetando contexto de ${from}`);
+      session.history = [];
+      session.products = [];
+      session.currentProduct = null;
+      session.currentCategory = null;
+      session.currentPage = 0;
+      session.totalPages = 1;
+      session.totalProducts = 0;
+      session.lastViewedProduct = null;
+      session.lastViewedProductIndex = null;
+    }
 
     // Extrai o número do produto da legenda citada — independe de bold/markdown do WhatsApp.
     // Formato esperado: "✨ 3. Nome..." ou "✨ *3. Nome...*" (com ou sem asteriscos)
@@ -213,7 +239,7 @@ app.post('/webhook', async (req, res) => {
     // Guard: bloqueia VER/BUSCAR em saudações — IA não deve disparar catálogo em "boa tarde/oi/olá".
     const isGreeting = action &&
       (action.type === 'VER' || action.type === 'BUSCAR') &&
-      /^(o+i+|ol[aá]+|bom dia|boa tarde|boa noite|hey+|hello|tudo bem|tudo bom|e a[ií]|eai|opa)(\s|$)/i.test(text.trim());
+      /^(o+i+|ol[aá]+|bom dia|boa tarde|boa noite|hey+|hello|tudo bem|tudo bom|e a[ií]|eai|opa|boas)(\s|[!?.,]|$)/i.test(text.trim());
 
     if (isGreeting) {
       console.log(`[Guard] Token [${action.type}] descartado — mensagem é saudação, não pedido de catálogo.`);
@@ -380,7 +406,7 @@ async function showCategory(phone, slug, session) {
 
     await sendProductPage(phone, result, session);
   } catch (err) {
-    console.error('[showCategory]', err.message);
+    console.error(`[showCategory] slug=${slug} code=${err.code} status=${err.response?.status} msg=${err.message}`);
     await zapi.sendText(phone, '⚠️ Erro ao buscar produtos.');
   }
 }

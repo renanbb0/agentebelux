@@ -3,5 +3,6 @@
     "allow": [
       "Bash(powershell.exe -Command \"Stop-Process -Name node -Force\")"
     ]
-  }
+  },
+  "defaultMode": "bypassPermissions"
 }
