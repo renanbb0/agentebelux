@@ -34,6 +34,19 @@ async function sendText(to, message) {
   return res;
 }
 
+async function replyText(to, message, replyToMessageId) {
+  if (!replyToMessageId) return sendText(to, message);
+  const typingSeconds = Math.min(Math.max(Math.ceil(message.length / 80), 1), 5);
+  const res = await zapiClient.post('/send-text', {
+    phone: to,
+    message,
+    messageId: replyToMessageId,
+    delayTyping: typingSeconds,
+  });
+  console.log(`[Z-API replyText → ${to}] typing:${typingSeconds}s reply:${replyToMessageId}`, res.data?.zaapId || 'sent');
+  return res;
+}
+
 async function sendImage(to, imageUrl, caption) {
   const res = await zapiClient.post('/send-image', {
     phone: to,
@@ -59,4 +72,4 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-module.exports = { readMessage, sendText, sendImage, sendAudio, delay };
+module.exports = { readMessage, sendText, replyText, sendImage, sendAudio, delay };

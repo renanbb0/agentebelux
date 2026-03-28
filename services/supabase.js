@@ -30,6 +30,8 @@ async function upsertSession(phone, session) {
       current_page:     session.currentPage,
       total_pages:      session.totalPages,
       total_products:   session.totalProducts,
+      last_viewed_product: session.lastViewedProduct,
+      last_viewed_product_index: session.lastViewedProductIndex,
       last_activity:    session.lastActivity,
       updated_at:       new Date().toISOString(),
     }, { onConflict: 'phone' });

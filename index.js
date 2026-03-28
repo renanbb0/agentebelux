@@ -3,9 +3,10 @@ require('dotenv').config();
 const express = require('express');
 const woocommerce = require('./services/woocommerce');
 const zapi = require('./services/zapi');
-const groq = require('./services/openrouter');
-const tts = require('./services/tts');
-const db  = require('./services/supabase');
+const ai       = require('./services/openrouter');
+const tts      = require('./services/tts');
+const db       = require('./services/supabase');
+const learnings = require('./services/learnings');
 
 const TTS_ENABLED = process.env.TTS_ENABLED === 'true';
 
@@ -20,6 +21,12 @@ const PRODUCTS_PER_PAGE = 10;
 // ── Sessions ──────────────────────────────────────────────────────────────
 const sessions = {};
 
+const SLUG_MAP = { 'infantil': 'femininoinfantil' };
+function normalizeCategorySlug(slug) {
+  if (!slug) return null;
+  return SLUG_MAP[slug.toLowerCase()] || slug.toLowerCase();
+}
+
 async function getSession(phone) {
   if (!sessions[phone]) {
     const stored = await db.getSession(phone);
@@ -30,10 +37,12 @@ async function getSession(phone) {
           products:        stored.products         || [],
           currentProduct:  stored.current_product  || null,
           customerName:    stored.customer_name    || null,
-          currentCategory: stored.current_category || null,
+          currentCategory: normalizeCategorySlug(stored.current_category) || null,
           currentPage:     stored.current_page     || 0,
           totalPages:      stored.total_pages      || 1,
           totalProducts:   stored.total_products   || 0,
+          lastViewedProduct: stored.last_viewed_product || null,
+          lastViewedProductIndex: stored.last_viewed_product_index || null,
           lastActivity:    Date.now(),
         }
       : {
@@ -41,6 +50,8 @@ async function getSession(phone) {
           currentProduct: null, customerName: null,
           currentCategory: null, currentPage: 0,
           totalPages: 1, totalProducts: 0,
+          lastViewedProduct: null,
+          lastViewedProductIndex: null,
           lastActivity: Date.now(),
         };
   } else {
@@ -95,6 +106,8 @@ app.post('/webhook', async (req, res) => {
     // Extrai o número do produto da legenda citada — independe de bold/markdown do WhatsApp.
     // Formato esperado: "✨ 3. Nome..." ou "✨ *3. Nome...*" (com ou sem asteriscos)
     let quotedProductIdx = null;
+    let finalUserText = text;
+
     if (body?.quotedMessage) {
       // Log do payload bruto para diagnóstico de estrutura do Z-API
       console.log(`[QuotedMsg raw] ${JSON.stringify(body.quotedMessage)}`);
@@ -110,10 +123,7 @@ app.post('/webhook', async (req, res) => {
       console.log(`[QuotedMsg text] "${quotedText}"`);
 
       if (quotedText) {
-        session.history.push({
-          role: 'system',
-          content: `[O cliente está respondendo à seguinte mensagem: "${quotedText}"]`,
-        });
+        finalUserText = `[O cliente citou a seguinte mensagem sua: "${quotedText}"]\n\nMensagem do cliente: "${text}"`;
 
         if (session.products?.length > 0) {
           const numMatch = quotedText.match(/\u2728[^0-9]*(\d+)\./);
@@ -130,11 +140,11 @@ app.post('/webhook', async (req, res) => {
       }
     }
 
-    session.history.push({ role: 'user', content: text });
+    session.history.push({ role: 'user', content: finalUserText });
 
     // Intercept: pedido de fotos — resolve pelo número da legenda ou do próprio texto.
     // Z-API não envia quotedMessage; número inline é o fallback confiável.
-    const IS_PHOTO_REQUEST = /mais foto|ver foto|outra foto|tem foto|foto dela|foto dis/i.test(text);
+    const IS_PHOTO_REQUEST = /mais foto|ver foto|outra foto|tem foto|foto dela|foto dis|mais desse|tem mais|quero ver mais|ver mais|me mostra mais|mostrar mais/i.test(text);
 
     if (IS_PHOTO_REQUEST && !quotedProductIdx && session.products?.length > 0) {
       const inlineNum = text.match(/\b(\d+)\b/);
@@ -147,9 +157,28 @@ app.post('/webhook', async (req, res) => {
       }
     }
 
-    if (quotedProductIdx && IS_PHOTO_REQUEST) {
+    // Se o cliente citou um produto (quotedProductIdx), qualquer mensagem curta ou pedido
+    // de fotos/mais é tratado como solicitação de mais fotos daquele produto.
+    const isShortMessage = text.trim().length <= 40;
+    if (quotedProductIdx && (IS_PHOTO_REQUEST || isShortMessage)) {
       console.log(`[Intercept] Pedido de fotos para produto #${quotedProductIdx} — resolvido em código.`);
       await showProductPhotos(from, quotedProductIdx, session);
+      if (session.history.length > 20) session.history = session.history.slice(-20);
+      persistSession(from);
+      return;
+    }
+
+    // Se o cliente citou uma imagem mas a caption era texto de trial (sem número),
+    // e há um lastViewedProduct disponível, usa ele diretamente.
+    const quotedHasImage = !!(body?.quotedMessage && (
+      body.quotedMessage.image ||
+      body.quotedMessage.imageMessage ||
+      body.quotedMessage.type === 'image'
+    ));
+    if ((IS_PHOTO_REQUEST || (quotedHasImage && isShortMessage)) && !quotedProductIdx && session.lastViewedProduct) {
+      const idx = session.lastViewedProductIndex || 1;
+      console.log(`[LastViewed] Produto #${idx} — "${session.lastViewedProduct.name}"`);
+      await showProductPhotos(from, idx, session);
       if (session.history.length > 20) session.history = session.history.slice(-20);
       persistSession(from);
       return;
@@ -165,12 +194,12 @@ app.post('/webhook', async (req, res) => {
     }
 
     const catalogContext = woocommerce.buildCatalogContext(session);
-    const aiRaw = await groq.chat(session.history, catalogContext);
+    const aiRaw = await ai.chat(session.history, catalogContext);
     console.log(`[AI] ${from}: "${aiRaw}"`);
 
-    let { cleanText, action } = groq.parseAction(aiRaw);
+    let { cleanText, action } = ai.parseAction(aiRaw);
 
-    // Guard: bloqueia VER/BUSCAR apenas quando a IA está perguntando QUAL categoria ver.
+    // Guard: bloqueia VER/BUSCAR quando a IA pergunta QUAL categoria ver (sem que o cliente pediu).
     const askingForCategory = action &&
       (action.type === 'VER' || action.type === 'BUSCAR') &&
       cleanText.includes('?') &&
@@ -178,6 +207,16 @@ app.post('/webhook', async (req, res) => {
 
     if (askingForCategory) {
       console.log(`[Guard] Token [${action.type}] descartado — IA perguntou sobre categoria junto com ação.`);
+      action = null;
+    }
+
+    // Guard: bloqueia VER/BUSCAR em saudações — IA não deve disparar catálogo em "boa tarde/oi/olá".
+    const isGreeting = action &&
+      (action.type === 'VER' || action.type === 'BUSCAR') &&
+      /^(o+i+|ol[aá]+|bom dia|boa tarde|boa noite|hey+|hello|tudo bem|tudo bom|e a[ií]|eai|opa)(\s|$)/i.test(text.trim());
+
+    if (isGreeting) {
+      console.log(`[Guard] Token [${action.type}] descartado — mensagem é saudação, não pedido de catálogo.`);
       action = null;
     }
 
@@ -197,11 +236,11 @@ app.post('/webhook', async (req, res) => {
       }
     }
 
-    session.history.push({ role: 'assistant', content: cleanText });
+    if (cleanText) session.history.push({ role: 'assistant', content: cleanText });
     if (session.history.length > 20) session.history = session.history.slice(-20);
 
     if (cleanText) {
-      await zapi.sendText(from, cleanText);
+      await zapi.replyText(from, cleanText, messageId);
       if (TTS_ENABLED) {
         try {
           const { buffer, mimeType } = await tts.textToSpeech(cleanText);
@@ -286,8 +325,8 @@ async function executeAction(phone, action, session) {
       session.history.push({ role: 'system', content: nudge });
 
       try {
-        const aiRaw = await groq.chat(session.history, null);
-        const { cleanText } = groq.parseAction(aiRaw);
+        const aiRaw = await ai.chat(session.history, null);
+        const { cleanText } = ai.parseAction(aiRaw);
         const reply = cleanText || `✅ *${product.name}* (${size}) adicionado! Quer mais algo?`;
         session.history.push({ role: 'assistant', content: reply });
         await zapi.sendText(phone, reply);
@@ -322,6 +361,7 @@ async function executeAction(phone, action, session) {
 // ── Flow Functions ────────────────────────────────────────────────────────
 
 async function showCategory(phone, slug, session) {
+  slug = normalizeCategorySlug(slug);
   await zapi.sendText(phone, `🔍 Buscando produtos *${slug.toUpperCase()}*...`);
 
   try {
@@ -388,6 +428,12 @@ async function sendProductPage(phone, result, session, startIdx = 0) {
     }
   }
 
+  // Atualiza lastViewedProduct após enviar a última imagem do lote
+  if (result.products.length > 0) {
+    session.lastViewedProduct = result.products[result.products.length - 1];
+    session.lastViewedProductIndex = startIdx + result.products.length;
+  }
+
   // Nudge natural da IA após as fotos
   const remaining = result.total - session.products.length;
   const nudge = remaining > 0
@@ -395,8 +441,8 @@ async function sendProductPage(phone, result, session, startIdx = 0) {
     : `[SISTEMA: Fotos enviadas. Todos os produtos mostrados. Pergunte se algum chamou atenção.]`;
   
   session.history.push({ role: 'system', content: nudge });
-  const aiRaw = await groq.chat(session.history, null);
-  const { cleanText } = groq.parseAction(aiRaw);
+  const aiRaw = await ai.chat(session.history, null);
+  const { cleanText } = ai.parseAction(aiRaw);
   if (cleanText) {
     session.history.push({ role: 'assistant', content: cleanText });
     await zapi.sendText(phone, cleanText);
@@ -428,6 +474,10 @@ async function showProductPhotos(phone, index, session) {
     await zapi.sendImage(phone, url, woocommerce.buildCaption(product, index));
     await zapi.delay(500);
   }
+
+  // Atualiza lastViewedProduct após enviar fotos específicas
+  session.lastViewedProduct = product;
+  session.lastViewedProductIndex = index;
 
   // Follow-up fixo humanizado — sem chamar a IA para evitar respostas robóticas
   const followUps = [
@@ -513,6 +563,44 @@ async function handoffToConsultant(phone, session) {
 
   db.saveOrder({ phone, customerName, items: session.items, total })
     .catch(err => console.error('[Supabase] saveOrder:', err.message));
+
+  // Extrai aprendizado em background — não bloqueia o handoff
+  extractLearning(session).catch(err => console.error('[Learning]', err.message));
+}
+
+// ── Continuous Learning ───────────────────────────────────────────────────
+
+async function extractLearning(session) {
+  const turns = session.history.filter(m => m.role === 'user' || m.role === 'assistant');
+  if (turns.length < 4) return;
+
+  const convo = turns
+    .map(m => `${m.role === 'user' ? 'Lojista' : 'Bela'}: ${m.content}`)
+    .join('\n');
+
+  const prompt = [{
+    role: 'user',
+    content: `Você é um analista de vendas B2B de moda íntima atacado.
+
+Analise esta conversa entre a Bela (vendedora) e um lojista que chegou até o pedido:
+
+${convo}
+
+Extraia APENAS 1 insight específico e acionável sobre o comportamento desse lojista ou sobre o que funcionou na abordagem da Bela.
+
+Regras:
+- Máximo 20 palavras
+- Comece com "Lojistas que..." ou "Quando o lojista..." ou "A abordagem de..."
+- Deve ajudar a Bela a vender melhor em conversas futuras
+- Se não houver nada útil, responda apenas: NENHUM`,
+  }];
+
+  const raw = await ai.chat(prompt, null);
+  const insight = raw?.trim();
+  if (!insight || insight.toUpperCase().includes('NENHUM')) return;
+
+  await learnings.addLearning(insight);
+  console.log(`[Learning] Novo insight: "${insight}"`);
 }
 
 function extractTextFromEvent(body) {

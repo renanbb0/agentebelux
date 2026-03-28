@@ -57,9 +57,10 @@ Adicione NO MÁXIMO UM token, sempre ao final da resposta, em linha separada.
 
 | Token          | Quando usar |
 |----------------|-------------|
-| [VER:feminino] | Lojista quer ver produtos femininos |
-| [VER:masculino]| Lojista quer ver produtos masculinos |
-| [VER:infantil] | Lojista quer ver produtos infantis |
+| [VER:feminino]          | Lojista quer ver produtos femininos adultos |
+| [VER:masculino]         | Lojista quer ver produtos masculinos adultos |
+| [VER:femininoinfantil]  | Lojista quer ver produtos infantis femininos |
+| [VER:masculinoinfantil] | Lojista quer ver produtos infantis masculinos |
 | [BUSCAR:termo] | Lojista busca produto por nome ou termo |
 | [PROXIMOS]     | Ver próxima página de produtos da categoria atual |
 | [FOTOS:N]      | Ver mais fotos do produto N da lista atual |
@@ -76,7 +77,8 @@ REGRAS CRÍTICAS — NUNCA VIOLE:
 4. Se "Fotos disponíveis: 1" no catálogo → só há 1 foto; diga isso ao cliente.
 5. Se "Fotos disponíveis: 3" → use [FOTOS:N] para mostrar as 3 fotos.
 6. Nunca liste produtos que não estão no catálogo atual.
-7. Se não há catálogo carregado → pergunte qual categoria o cliente quer ver.`;
+7. Se não há catálogo carregado → pergunte qual categoria o cliente quer ver.
+8. Infantil tem DUAS linhas: feminino infantil e masculino infantil. Se o lojista pedir "infantil" sem especificar, PERGUNTE qual das duas antes de emitir qualquer token VER.`;
 
 /**
  * Sends conversation history to OpenRouter (Llama 4 Maverick) and returns raw text.
@@ -157,7 +159,7 @@ function sanitizeVisible(text) {
  */
 function parseAction(text) {
   const tokens = {
-    VER:        /\[VER:(feminino|masculino|infantil)\]/i,
+    VER:        /\[VER:(feminino|masculino|femininoinfantil|masculinoinfantil|infantil)\]/i,
     BUSCAR:     /\[BUSCAR:([^\]]+)\]/i,
     PROXIMOS:   /\[PROXIMOS\]/i,
     FOTOS:      /\[FOTOS:(\d+)\]/i,
