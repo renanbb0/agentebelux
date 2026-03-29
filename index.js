@@ -38,6 +38,7 @@ async function getSession(phone) {
           currentProduct:  stored.current_product  || null,
           customerName:    stored.customer_name    || null,
           currentCategory: normalizeCategorySlug(stored.current_category) || null,
+          activeCategory:  normalizeCategorySlug(stored.current_category) || null,
           currentPage:     stored.current_page     || 0,
           totalPages:      stored.total_pages      || 1,
           totalProducts:   stored.total_products   || 0,
@@ -48,8 +49,8 @@ async function getSession(phone) {
       : {
           history: [], items: [], products: [],
           currentProduct: null, customerName: null,
-          currentCategory: null, currentPage: 0,
-          totalPages: 1, totalProducts: 0,
+          currentCategory: null, activeCategory: null,
+          currentPage: 0, totalPages: 1, totalProducts: 0,
           lastViewedProduct: null,
           lastViewedProductIndex: null,
           lastActivity: Date.now(),
@@ -122,6 +123,7 @@ app.post('/webhook', async (req, res) => {
       session.products = [];
       session.currentProduct = null;
       session.currentCategory = null;
+      session.activeCategory = null;
       session.currentPage = 0;
       session.totalPages = 1;
       session.totalProducts = 0;
@@ -139,30 +141,52 @@ app.post('/webhook', async (req, res) => {
       console.log(`[QuotedMsg raw] ${JSON.stringify(body.quotedMessage)}`);
 
       // Z-API pode entregar a caption em vários campos dependendo da versão
+      // Tenta todos os paths conhecidos, incluindo estrutura aninhada (message.imageMessage)
       const quotedText =
         body.quotedMessage.text?.message ||
         body.quotedMessage.image?.caption ||
         body.quotedMessage.imageMessage?.caption ||
         body.quotedMessage.caption ||
+        body.quotedMessage.message?.imageMessage?.caption ||
+        body.quotedMessage.message?.extendedTextMessage?.text ||
         null;
 
       console.log(`[QuotedMsg text] "${quotedText}"`);
 
-      if (quotedText) {
-        finalUserText = `[O cliente citou a seguinte mensagem sua: "${quotedText}"]\n\nMensagem do cliente: "${text}"`;
+      // Tenta extrair o número do produto da caption resolvida
+      const tryExtractIdx = (src) => {
+        if (!src || !session.products?.length) return null;
+        const m = src.match(/\u2728[^0-9]*(\d+)\./);
+        if (!m) return null;
+        const n = parseInt(m[1], 10);
+        return (n >= 1 && n <= session.products.length) ? n : null;
+      };
 
-        if (session.products?.length > 0) {
-          const numMatch = quotedText.match(/\u2728[^0-9]*(\d+)\./);
-          if (numMatch) {
-            const n = parseInt(numMatch[1], 10);
-            if (n >= 1 && n <= session.products.length) {
-              quotedProductIdx = n;
-              console.log(`[QuotedProduct] Produto #${n} identificado na legenda citada.`);
-            }
-          } else {
-            console.log(`[QuotedProduct] Número não encontrado na legenda.`);
+      let extractedIdx = tryExtractIdx(quotedText);
+
+      // Último recurso: varre o JSON bruto da quotedMessage em busca do padrão ✨N.
+      // Cobre estruturas aninhadas que ainda não conhecemos.
+      if (!extractedIdx && session.products?.length > 0) {
+        const rawJson = JSON.stringify(body.quotedMessage);
+        const mRaw = rawJson.match(/\\u2728[^0-9"\\]*(\d+)\.|✨[^0-9"]*(\d+)\./);
+        if (mRaw) {
+          const n = parseInt(mRaw[1] || mRaw[2], 10);
+          if (n >= 1 && n <= session.products.length) {
+            extractedIdx = n;
+            console.log(`[QuotedProduct] Produto #${n} extraído do JSON bruto.`);
           }
         }
+      }
+
+      if (quotedText) {
+        finalUserText = `[O cliente citou a seguinte mensagem sua: "${quotedText}"]\n\nMensagem do cliente: "${text}"`;
+      }
+
+      if (extractedIdx) {
+        quotedProductIdx = extractedIdx;
+        console.log(`[QuotedProduct] Produto #${quotedProductIdx} identificado na legenda citada.`);
+      } else if (body.quotedMessage) {
+        console.log(`[QuotedProduct] Número não encontrado na legenda.`);
       }
     }
 
@@ -196,12 +220,16 @@ app.post('/webhook', async (req, res) => {
 
     // Se o cliente citou uma imagem mas a caption era texto de trial (sem número),
     // e há um lastViewedProduct disponível, usa ele diretamente.
+    // GUARD: se quotedMessage existe mas não extraímos o índice (falha de parsing),
+    // NÃO usa lastViewedProduct — pode ser um produto diferente do citado.
     const quotedHasImage = !!(body?.quotedMessage && (
       body.quotedMessage.image ||
       body.quotedMessage.imageMessage ||
-      body.quotedMessage.type === 'image'
+      body.quotedMessage.type === 'image' ||
+      body.quotedMessage.message?.imageMessage
     ));
-    if ((IS_PHOTO_REQUEST || (quotedHasImage && isShortMessage)) && !quotedProductIdx && session.lastViewedProduct) {
+    const quotedButUnresolved = !!(body?.quotedMessage && !quotedProductIdx);
+    if ((IS_PHOTO_REQUEST || (quotedHasImage && isShortMessage)) && !quotedProductIdx && !quotedButUnresolved && session.lastViewedProduct) {
       const idx = session.lastViewedProductIndex || 1;
       console.log(`[LastViewed] Produto #${idx} — "${session.lastViewedProduct.name}"`);
       await showProductPhotos(from, idx, session);
@@ -400,6 +428,7 @@ async function showCategory(phone, slug, session) {
 
     session.products = result.products;
     session.currentCategory = slug;
+    session.activeCategory = slug;
     session.currentPage = result.page;
     session.totalPages = result.totalPages;
     session.totalProducts = result.total;

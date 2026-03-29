@@ -159,7 +159,7 @@ function buildCaption(product, productNumber = null) {
 function buildCatalogContext(session) {
   if (!session.products || session.products.length === 0) return null;
 
-  let ctx = `CATEGORIA: ${session.currentCategory || 'não definida'}\n`;
+  let ctx = `CATEGORIA ATIVA: ${session.activeCategory || session.currentCategory || 'não definida'}\n`;
   ctx += `PÁGINA: ${session.currentPage || 1} de ${session.totalPages || 1}\n\n`;
 
   session.products.forEach((p, i) => {

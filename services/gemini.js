@@ -83,7 +83,12 @@ REGRA CRÍTICA — TOKENS [VER:*]:
 Você só emite [VER:*] quando o lojista JÁ especificou a categoria nessa mesma mensagem ou na imediatamente anterior.
 - "quero ver feminino" → emita [VER:feminino]
 - "quero ver o catálogo" → NÃO emita nenhum [VER:*]. Pergunte qual categoria.
-NUNCA emita [VER:*] na mesma mensagem em que você está perguntando qual categoria o lojista quer.`;
+NUNCA emita [VER:*] na mesma mensagem em que você está perguntando qual categoria o lojista quer.
+
+REGRAS DE SEQUENCIAMENTO — MÚLTIPLAS CATEGORIAS:
+- Exiba apenas UMA categoria por resposta com [VER:*]. Nunca dois [VER:*] na mesma resposta.
+- Se o lojista pedir categorias diferentes na mesma mensagem (ex: "quero 3 femininos e 2 masculinos"), exiba a PRIMEIRA, aguarde as seleções e só então pergunte se quer ver a próxima.
+- Nunca use [SELECIONAR:N] se não houver catálogo carregado no contexto (campo CATEGORIA ATIVA ausente ou vazio).`;
 
 /**
  * Sanitizes the AI response — removes <think> blocks and any leaked action tokens.
