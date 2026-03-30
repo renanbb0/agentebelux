@@ -7,6 +7,7 @@ const ai       = require('./services/gemini');
 const tts      = require('./services/tts');
 const db       = require('./services/supabase');
 const learnings = require('./services/learnings');
+const logger = require('./services/logger');
 
 const TTS_ENABLED = process.env.TTS_ENABLED === 'true';
 
@@ -16,12 +17,32 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const ADMIN_PHONE = process.env.ADMIN_PHONE || null;
 const SESSION_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes inactivity
-const PRODUCTS_PER_PAGE = 10;
-
 // ── Sessions ──────────────────────────────────────────────────────────────
 const sessions = {};
 
-const SLUG_MAP = { 'infantil': 'femininoinfantil' };
+const SLUG_MAP = { 
+  'infantil': 'femininoinfantil',
+  'lancamentos': 'lancamento-da-semana',
+  'lancamento': 'lancamento-da-semana'
+};
+const CATEGORY_OPTIONS = [
+  { id: 'cat_feminina', title: 'Linha Feminina', description: 'Vestidos, conjuntos e mais' },
+  { id: 'cat_infantil', title: 'Linha Infantil', description: 'Conforto para os pequenos' },
+  { id: 'cat_masculina', title: 'Linha Masculina', description: 'Novidades masculinas' },
+  { id: 'cat_lancamentos', title: 'Lançamentos', description: 'As novidades da semana' },
+  { id: 'falar_atendente', title: 'Falar com Humano', description: 'Tire suas dúvidas agora' },
+];
+
+async function sendCategoryMenu(phone, text) {
+  await zapi.sendOptionList(
+    phone,
+    text,
+    'Nossas Coleções',
+    'Ver Opções',
+    CATEGORY_OPTIONS
+  );
+}
+
 function normalizeCategorySlug(slug) {
   if (!slug) return null;
   return SLUG_MAP[slug.toLowerCase()] || slug.toLowerCase();
@@ -65,7 +86,7 @@ function persistSession(phone) {
   const session = sessions[phone];
   if (!session) return;
   db.upsertSession(phone, session)
-    .catch(err => console.error('[Supabase] upsertSession:', err.message));
+    .catch(err => logger.error({ err: err.message }, '[Supabase] upsertSession'));
 }
 
 // Clean up sessions
@@ -74,11 +95,11 @@ setInterval(() => {
   for (const phone of Object.keys(sessions)) {
     if (now - sessions[phone].lastActivity > SESSION_TIMEOUT_MS) {
       delete sessions[phone];
-      console.log(`[Session] Expired: ${phone}`);
+      logger.info({ phone }, '[Session] Expired');
     }
   }
   db.deleteExpiredSessions(SESSION_TIMEOUT_MS)
-    .catch(err => console.error('[Supabase] deleteExpiredSessions:', err.message));
+    .catch(err => logger.error({ err: err.message }, '[Supabase] deleteExpiredSessions'));
 }, 10 * 60 * 1000);
 
 // ── Webhook ───────────────────────────────────────────────────────────────
@@ -88,6 +109,7 @@ app.post('/webhook', async (req, res) => {
   let from = '';
   try {
     const body = req.body;
+    logger.info({ body }, '[Webhook] Evento recebido');
     from = body?.phone || '';
     if (!from) return;
     if (body?.fromMe || body?.isGroup || body?.isStatusReply || body?.broadcast) return;
@@ -98,27 +120,31 @@ app.post('/webhook', async (req, res) => {
     if (!text) return;
 
     if (text === '[Áudio]') {
-      console.log(`[Intercept] Áudio recebido. Mandando fallback humano.`);
+      logger.info({ from }, '[Intercept] Áudio recebido — fallback humano');
       await zapi.replyText(from, 'Puts amada, tô sem fone aqui no depósito 😅. Consegue me digitar rapidinho o que precisa?', messageId);
       return;
     }
     if (text === '[Sticker]') {
-      console.log(`[Intercept] Sticker recebido. Ignorando silenciosamente para poupar token.`);
+      logger.info({ from }, '[Intercept] Sticker recebido — ignorando');
       return;
     }
 
     if (text.includes('CONTA EM TRIAL') || text.includes('MENSAGEM DE TESTE')) return;
 
-    console.log(`[MSG] ${from}: "${text}"`);
+    logger.info({ phone: from, text }, '[MSG] Received');
     if (messageId) zapi.readMessage(from, messageId);
 
     const session = await getSession(from);
 
     // FIX-16 — Saudação pura com histórico antigo: limpa contexto para novo atendimento.
     // Preserva carrinho e nome do cliente.
-    const PURE_GREETING = /^(o+i+|ol[aá]+|bom dia|boa tarde|boa noite|hey+|hello|tudo bem|tudo bom|e a[ií]|eai|opa|boas)(\s|[!?.,]|$)/i;
-    if (PURE_GREETING.test(text.trim()) && session.history.length > 2) {
-      console.log(`[FIX-16] Saudação com histórico antigo — resetando contexto de ${from}`);
+    const PURE_GREETING = /^(oi+|ol[aá]+|bom dia|boa tarde|boa noite|hey+|hello|hi|tudo bem|tudo bom|e a[ií]|eai|opa|boas|salve|vcs estao ai)(\s|[!?.,]|$)/i;
+    let isFirstContact = false;
+
+    // Se é a primeira mensagem ou uma saudação, reseta tudo para focar em lançamentos
+    if (session.history.length === 0 || PURE_GREETING.test(text.trim())) {
+      logger.info({ phone: from, historyLen: session.history.length }, '[SessionReset] Forçando fluxo de lançamentos');
+      
       session.history = [];
       session.products = [];
       session.currentProduct = null;
@@ -129,6 +155,7 @@ app.post('/webhook', async (req, res) => {
       session.totalProducts = 0;
       session.lastViewedProduct = null;
       session.lastViewedProductIndex = null;
+      isFirstContact = true;
     }
 
     // Extrai o número do produto da legenda citada — independe de bold/markdown do WhatsApp.
@@ -138,11 +165,11 @@ app.post('/webhook', async (req, res) => {
 
     if (body?.quotedMessage) {
       // Log do payload bruto para diagnóstico de estrutura do Z-API
-      console.log(`[QuotedMsg raw] ${JSON.stringify(body.quotedMessage)}`);
+      logger.info({ quotedMessage: body.quotedMessage }, '[QuotedMsg] Raw payload');
 
       // Z-API pode entregar a caption em vários campos dependendo da versão
       // Tenta todos os paths conhecidos, incluindo estrutura aninhada (message.imageMessage)
-      const quotedText =
+      let quotedText =
         body.quotedMessage.text?.message ||
         body.quotedMessage.image?.caption ||
         body.quotedMessage.imageMessage?.caption ||
@@ -151,7 +178,7 @@ app.post('/webhook', async (req, res) => {
         body.quotedMessage.message?.extendedTextMessage?.text ||
         null;
 
-      console.log(`[QuotedMsg text] "${quotedText}"`);
+      logger.info({ quotedText }, '[QuotedMsg] Extracted text');
 
       // Tenta extrair o número do produto da caption resolvida
       const tryExtractIdx = (src) => {
@@ -173,8 +200,44 @@ app.post('/webhook', async (req, res) => {
           const n = parseInt(mRaw[1] || mRaw[2], 10);
           if (n >= 1 && n <= session.products.length) {
             extractedIdx = n;
-            console.log(`[QuotedProduct] Produto #${n} extraído do JSON bruto.`);
+            logger.info({ method: 'brute-force', productIdx: n }, '[QuotedProduct] Extraído do JSON bruto');
           }
+        }
+      }
+
+      // Tentativa 3 (REST API fallback): busca mensagem completa pelo ID
+      if (!extractedIdx && session.products?.length > 0) {
+        const msgId = body.quotedMessage.messageId
+          || body.quotedMessage.stanzaId
+          || body.quotedMessage.id;
+
+        if (msgId) {
+          logger.info({ msgId }, '[Quote] Inline + brute-force failed, trying REST API');
+          try {
+            const fullMsg = await zapi.getMessageById(msgId);
+            if (fullMsg) {
+              const restCaption =
+                fullMsg.caption ||
+                fullMsg.text?.message ||
+                fullMsg.image?.caption ||
+                fullMsg.imageMessage?.caption ||
+                null;
+
+              if (restCaption) {
+                logger.info({ method: 'REST', caption: restCaption.substring(0, 80) }, '[Quote] Caption found via REST');
+                extractedIdx = tryExtractIdx(restCaption);
+                if (!quotedText) quotedText = restCaption;
+              } else {
+                logger.warn({ fullMsgKeys: Object.keys(fullMsg) }, '[Quote] REST returned msg but no caption');
+              }
+            }
+          } catch (restErr) {
+            logger.error({ msgId, err: restErr.message }, '[Quote] REST fallback error');
+          }
+        } else {
+          logger.warn({
+            keys: Object.keys(body.quotedMessage),
+          }, '[Quote] No messageId/stanzaId/id in quotedMessage');
         }
       }
 
@@ -184,9 +247,9 @@ app.post('/webhook', async (req, res) => {
 
       if (extractedIdx) {
         quotedProductIdx = extractedIdx;
-        console.log(`[QuotedProduct] Produto #${quotedProductIdx} identificado na legenda citada.`);
+        logger.info({ productIdx: quotedProductIdx }, '[QuotedProduct] Identificado na legenda citada');
       } else if (body.quotedMessage) {
-        console.log(`[QuotedProduct] Número não encontrado na legenda.`);
+        logger.info('[QuotedProduct] Número não encontrado na legenda');
       }
     }
 
@@ -202,7 +265,7 @@ app.post('/webhook', async (req, res) => {
         const n = parseInt(inlineNum[1], 10);
         if (n >= 1 && n <= session.products.length) {
           quotedProductIdx = n;
-          console.log(`[InlineNum] Produto #${n} extraído do texto.`);
+          logger.info({ productIdx: n }, '[InlineNum] Produto extraído do texto');
         }
       }
     }
@@ -211,7 +274,7 @@ app.post('/webhook', async (req, res) => {
     // de fotos/mais é tratado como solicitação de mais fotos daquele produto.
     const isShortMessage = text.trim().length <= 40;
     if (quotedProductIdx && (IS_PHOTO_REQUEST || isShortMessage)) {
-      console.log(`[Intercept] Pedido de fotos para produto #${quotedProductIdx} — resolvido em código.`);
+      logger.info({ productIdx: quotedProductIdx }, '[Intercept] Pedido de fotos — resolvido em código');
       await showProductPhotos(from, quotedProductIdx, session);
       if (session.history.length > 20) session.history = session.history.slice(-20);
       persistSession(from);
@@ -231,7 +294,7 @@ app.post('/webhook', async (req, res) => {
     const quotedButUnresolved = !!(body?.quotedMessage && !quotedProductIdx);
     if ((IS_PHOTO_REQUEST || (quotedHasImage && isShortMessage)) && !quotedProductIdx && !quotedButUnresolved && session.lastViewedProduct) {
       const idx = session.lastViewedProductIndex || 1;
-      console.log(`[LastViewed] Produto #${idx} — "${session.lastViewedProduct.name}"`);
+      logger.info({ productIdx: idx, name: session.lastViewedProduct.name }, '[LastViewed] Usando último produto visto');
       await showProductPhotos(from, idx, session);
       if (session.history.length > 20) session.history = session.history.slice(-20);
       persistSession(from);
@@ -247,51 +310,97 @@ app.post('/webhook', async (req, res) => {
       return;
     }
 
+    let systemNudge = null;
+    if (isFirstContact) {
+      systemNudge = `[BOAS-VINDAS: Este é o início do atendimento. Dê uma saudação rápida e carinhosa, e NÃO faça perguntas sobre o que o lojista procura. O sistema vai disparar os lançamentos logo após sua fala por meio do token [VER_TODOS:lancamento-da-semana].]`;
+    }
+
     const catalogContext = woocommerce.buildCatalogContext(session);
-    const aiRaw = await ai.chat(session.history, catalogContext);
-    console.log(`[AI] ${from}: "${aiRaw}"`);
+    let aiRaw = '';
+    try {
+      aiRaw = await ai.chat(session.history, catalogContext, systemNudge);
+    } catch (err) {
+      logger.error({ err: err.message }, '[AI] Falha na chamada do Gemini');
+      await zapi.sendText(from, 'Poxa, tive um pequeno problema aqui, mas já tô voltando! Pode repetir sua última mensagem? 😊');
+      return;
+    }
+    logger.info({ phone: from, response: aiRaw }, '[AI] Response');
 
     let { cleanText, action } = ai.parseAction(aiRaw);
+
+    // Mão de Ferro v3 — Se é primeiro contato ou o usuário pediu lançamentos/novidades, 
+    // nós FORÇAMOS o catálogo e limpamos qualquer outra ação conflitante.
+    const requestedLancamentos = /lan[çc]amento|novidade|o que chegou/i.test(text);
+    if (isFirstContact || requestedLancamentos) {
+      logger.info({ isFirstContact, requestedLancamentos }, '[HardForce] Forçando catálogo de lançamentos');
+      action = { type: 'VER_TODOS', payload: 'lancamento-da-semana' };
+
+      // Limpa qualquer pergunta sobre categorias — o sistema vai mostrar os produtos direto
+      if (cleanText.includes('?')) {
+        cleanText = cleanText.split('?')[0].trim() + ' 😊';
+      }
+    }
 
     // Guard: bloqueia VER/BUSCAR quando a IA pergunta QUAL categoria ver (sem que o cliente pediu).
     const askingForCategory = action &&
       (action.type === 'VER' || action.type === 'BUSCAR') &&
+      action.type !== 'VER_TODOS' &&
       cleanText.includes('?') &&
       /qual.*categoria|que tipo|qual.*linha|por onde|qual.*prefer|começa por|começar por/i.test(cleanText);
 
     if (askingForCategory) {
-      console.log(`[Guard] Token [${action.type}] descartado — IA perguntou sobre categoria junto com ação.`);
+      logger.info({ actionType: action.type }, '[Guard] Token descartado — IA perguntou sobre categoria → sendList');
       action = null;
+      session.history.push({ role: 'assistant', content: cleanText });
+      await sendCategoryMenu(from, cleanText);
+      persistSession(from);
+      return;
     }
 
     // Guard: bloqueia VER/BUSCAR em saudações — IA não deve disparar catálogo em "boa tarde/oi/olá".
     const isGreeting = action &&
       (action.type === 'VER' || action.type === 'BUSCAR') &&
+      action.type !== 'VER_TODOS' &&
       /^(o+i+|ol[aá]+|bom dia|boa tarde|boa noite|hey+|hello|tudo bem|tudo bom|e a[ií]|eai|opa|boas)(\s|[!?.,]|$)/i.test(text.trim());
 
     if (isGreeting) {
-      console.log(`[Guard] Token [${action.type}] descartado — mensagem é saudação, não pedido de catálogo.`);
+      logger.info({ actionType: action.type }, '[Guard] Token descartado — saudação, não pedido de catálogo');
       action = null;
     }
 
     // Guard: limpa texto quando ação de produto vai disparar (sistema mostra os produtos).
     // Também descarta qualquer lista inventada com preços (R$ ou R\$).
     // Quando o sistema vai mostrar produtos, qualquer texto da IA antes é ruído — descarta.
+    // EXCETO para VER_TODOS inicial, onde queremos que a saudação apareça antes.
     if (action && ['VER', 'BUSCAR', 'PROXIMOS'].includes(action.type)) {
-      if (cleanText) console.log(`[Guard] Texto descartado — ação ${action.type} vai mostrar produtos.`);
+      if (cleanText) logger.info({ actionType: action.type }, '[Guard] Texto descartado — ação vai mostrar produtos');
       cleanText = '';
+    } else if (action && action.type === 'VER_TODOS') {
+      logger.info({ actionType: action.type }, '[Guard] Mantendo texto da saudação antes de exibir todos.');
     } else {
       // Descarta listas com preços em qualquer formato (R$ / R\$ / reais / número decimal)
       const hasNumberedItems = (cleanText.match(/^\s*\d+[\.\)]\s+\S/mg) || []).length >= 2;
       const hasPrices = /R\s*\\?\$\s*\d|reais|\d+[,\.]\d{2}/i.test(cleanText);
       if (hasNumberedItems && hasPrices) {
-        console.log(`[Guard] Lista inventada descartada.`);
+        logger.info('[Guard] Lista inventada descartada');
         cleanText = '';
       }
     }
 
     if (cleanText) session.history.push({ role: 'assistant', content: cleanText });
     if (session.history.length > 20) session.history = session.history.slice(-20);
+
+    // Se a IA está oferecendo categorias no texto (sem action), envia como List Message
+    const offeringCategories = !action && cleanText &&
+      /qual.*categoria|que tipo|qual.*linha|feminino|masculino|infantil/i.test(cleanText) &&
+      cleanText.includes('?');
+
+    if (offeringCategories) {
+      logger.info('[ListMenu] IA ofereceu categorias no texto → sendList');
+      await sendCategoryMenu(from, cleanText);
+      persistSession(from);
+      return;
+    }
 
     if (cleanText) {
       await zapi.replyText(from, cleanText, messageId);
@@ -300,7 +409,7 @@ app.post('/webhook', async (req, res) => {
           const { buffer, mimeType } = await tts.textToSpeech(cleanText);
           await zapi.sendAudio(from, buffer, mimeType);
         } catch (ttsErr) {
-          console.error('[TTS Error]', ttsErr.message);
+          logger.error({ err: ttsErr }, '[TTS] Error');
         }
       }
     }
@@ -312,7 +421,7 @@ app.post('/webhook', async (req, res) => {
     persistSession(from);
 
   } catch (error) {
-    console.error('[Webhook Error]', error.message);
+    logger.error({ err: error }, '[Webhook] Error');
     const isRateLimit = error.status === 429 || error.message?.includes('429');
     if (isRateLimit && from) {
       await zapi.sendText(from, 'Estou sobrecarregada no momento 😅 Tenta de novo em alguns minutinhos!').catch(() => {});
@@ -324,6 +433,10 @@ app.post('/webhook', async (req, res) => {
 
 async function executeAction(phone, action, session) {
   switch (action.type) {
+    case 'VER_TODOS':
+      await showAllCategory(phone, action.payload, session);
+      break;
+
     case 'VER':
       await showCategory(phone, action.payload, session);
       break;
@@ -435,8 +548,65 @@ async function showCategory(phone, slug, session) {
 
     await sendProductPage(phone, result, session);
   } catch (err) {
-    console.error(`[showCategory] slug=${slug} code=${err.code} status=${err.response?.status} msg=${err.message}`);
+    logger.error({ slug, code: err.code, status: err.response?.status, err: err.message }, '[showCategory] Error');
     await zapi.sendText(phone, '⚠️ Erro ao buscar produtos.');
+  }
+}
+
+async function showAllCategory(phone, slug, session) {
+  slug = normalizeCategorySlug(slug);
+  await zapi.sendText(phone, `🔍 Buscando os melhores modelos para você...`);
+
+  try {
+    // 100 de perPage para trazer todos os lançamentos em uma única paginada
+    const result = await woocommerce.getProductsByCategory(slug, 100, 1);
+
+    if (result.products.length === 0) {
+      await zapi.sendText(phone, `😕 Nenhum produto da categoria *${slug}* disponível no momento.`);
+      return;
+    }
+
+    session.products = result.products;
+    session.currentCategory = slug;
+    session.activeCategory = slug;
+    session.currentPage = 1;
+    session.totalPages = 1; // Puxamos todos.
+    session.totalProducts = result.products.length;
+
+    let msg = `✨ *${slug.toUpperCase()}* ✨\n\n`;
+    
+    result.products.forEach((p, i) => {
+      const price = woocommerce.formatPrice(p.salePrice || p.price);
+      msg += `${i + 1}. *${p.name}* — ${price}\n`;
+    });
+
+    await zapi.sendText(phone, msg);
+
+    for (const [i, product] of result.products.entries()) {
+      if (product.imageUrl) {
+        await zapi.sendImage(phone, product.imageUrl, woocommerce.buildCaption(product, i + 1));
+        await zapi.delay(400); // aguarda para evitar furos no envio do WhatsApp
+      }
+    }
+
+    if (result.products.length > 0) {
+      session.lastViewedProduct = result.products[result.products.length - 1];
+      session.lastViewedProductIndex = result.products.length;
+    }
+
+    const nudge = `[SISTEMA: Você acabou de mostrar a lista inteira de lançamentos da semana de uma única vez. Pergunte com carisma se a cliente gostou de alguma peça (ela pode dizer o número da peça) ou se prefere ver outras categorias (feminino, masculino ou infantil e se preferir ir além, ver as promoções).]`;
+    session.history.push({ role: 'system', content: nudge });
+    
+    const aiRaw = await ai.chat(session.history, null);
+    const { cleanText } = ai.parseAction(aiRaw);
+    if (cleanText) {
+      session.history.push({ role: 'assistant', content: cleanText });
+      
+      await sendCategoryMenu(phone, cleanText);
+    }
+  } catch (err) {
+    logger.error({ slug, code: err.code, err: err.message }, '[showAllCategory] Error');
+    await zapi.sendText(phone, '⚠️ Erro ao buscar itens de uma vez só.');
   }
 }
 
@@ -456,7 +626,7 @@ async function showNextPage(phone, session) {
 
     await sendProductPage(phone, result, session, startIdx);
   } catch (err) {
-    console.error('[showNextPage]', err.message);
+    logger.error({ err: err.message }, '[showNextPage] Error');
     await zapi.sendText(phone, '⚠️ Erro ao carregar mais produtos.');
   }
 }
@@ -500,7 +670,16 @@ async function sendProductPage(phone, result, session, startIdx = 0) {
   const { cleanText } = ai.parseAction(aiRaw);
   if (cleanText) {
     session.history.push({ role: 'assistant', content: cleanText });
-    await zapi.sendText(phone, cleanText);
+    
+    if (remaining > 0) {
+      const options = [
+        { id: 'btn_sim_mais', title: 'Ver Mais Produtos', description: `Ainda tem ${remaining} peças` },
+        ...CATEGORY_OPTIONS,
+      ];
+      await zapi.sendOptionList(phone, cleanText, 'O que deseja?', 'Ver Opções', options);
+    } else {
+      await sendCategoryMenu(phone, cleanText);
+    }
   }
 }
 
@@ -571,7 +750,7 @@ async function searchAndShowProducts(phone, query, session) {
       }
     }
   } catch (err) {
-    console.error('[searchProducts]', err.message);
+    logger.error({ err: err.message }, '[searchProducts] Error');
   }
 }
 
@@ -614,13 +793,13 @@ async function handoffToConsultant(phone, session) {
   orderBlock += `\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n💰 *TOTAL: ${woocommerce.formatPrice(total)}*`;
   
   if (ADMIN_PHONE) await zapi.sendText(ADMIN_PHONE, `🆕 *HANDOFF*\n${orderBlock}`);
-  console.log(`[HANDOFF] ${orderBlock}`);
+  logger.info({ orderBlock }, '[HANDOFF] Pedido enviado');
 
   db.saveOrder({ phone, customerName, items: session.items, total })
-    .catch(err => console.error('[Supabase] saveOrder:', err.message));
+    .catch(err => logger.error({ err: err.message }, '[Supabase] saveOrder'));
 
   // Extrai aprendizado em background — não bloqueia o handoff
-  extractLearning(session).catch(err => console.error('[Learning]', err.message));
+  extractLearning(session).catch(err => logger.error({ err: err.message }, '[Learning] Error'));
 }
 
 // ── Continuous Learning ───────────────────────────────────────────────────
@@ -655,19 +834,50 @@ Regras:
   if (!insight || insight.toUpperCase().includes('NENHUM')) return;
 
   await learnings.addLearning(insight);
-  console.log(`[Learning] Novo insight: "${insight}"`);
+  logger.info({ insight }, '[Learning] Novo insight');
 }
 
-function extractTextFromEvent(body) {
-  if (body?.text?.message) return body.text.message.trim();
-  if (body?.audio) return '[Áudio]';
-  if (body?.image?.caption) return body.image.caption.trim();
-  if (body?.sticker) return '[Sticker]';
-  return null;
+function extractTextFromEvent(event) {
+  try {
+    if (!event) return '';
+    
+    // Intercepta cliques em Option List da Z-API
+    const listId = event.listResponseMessage?.selectedRowId;
+    if (listId) {
+      logger.info({ from: event.phone, listId }, '[ListResponse] Item selecionado');
+      if (listId === 'cat_feminina') return 'quero ver a linha feminina';
+      if (listId === 'cat_infantil') return 'quero ver a linha infantil';
+      if (listId === 'cat_masculina') return 'quero ver a linha masculina';
+      if (listId === 'cat_lancamentos') return 'quero ver os lançamentos';
+      if (listId === 'btn_sim_mais') return 'SIM';
+      if (listId === 'falar_atendente') return 'quero falar com um atendente';
+      return listId;
+    }
+
+    // Intercepta botões da Z-API e trata como texto transparente para a IA
+    if (event.type === 'button_reply' && event.buttonReply?.id) {
+       if (event.buttonReply.id === 'btn_sim_mais') return 'SIM';
+       if (event.buttonReply.id === 'btn_outra_cat') return 'OUTRA CATEGORIA';
+       return event.buttonReply.id;
+    }
+
+    // Suporte para múltiplos formatos de payload da Z-API
+    if (typeof event.text === 'string') return event.text;
+    if (event.text && typeof event.text.message === 'string') return event.text.message;
+    if (event.content && typeof event.content === 'string') return event.content;
+    if (event.audio) return '[Áudio]';
+    if (event.image?.caption) return event.image.caption.trim();
+    if (event.sticker) return '[Sticker]';
+    
+    // Fallback para objetos complexos
+    return event.text?.message || event.content || '';
+  } catch (err) {
+    return '';
+  }
 }
 
 app.get('/', (_req, res) => res.json({ status: 'online', activeSessions: Object.keys(sessions).length }));
 
 app.listen(PORT, () => {
-  console.log(`🚀 Agente Belux running on port ${PORT}`);
+  logger.info({ port: PORT }, '🚀 Agente Belux running');
 });
