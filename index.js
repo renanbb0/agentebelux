@@ -352,9 +352,28 @@ app.post('/webhook', async (req, res) => {
 
   let from = '';
   try {
+    const body = req.body;
+    logger.info({ body }, '[Webhook] Evento recebido');
+    from = body?.phone || '';
+    if (!from) return;
+    if (body?.fromMe || body?.isGroup || body?.isStatusReply || body?.broadcast) return;
+    if (body?.type === 'DeliveryCallback' || body?.type === 'ReadCallback') return;
+
+    const messageId = body?.messageId;
+
+    // ── FSM Interceptor ───────────────────────────────────────────────────
+    const fsmButtonId = body?.buttonsResponseMessage?.buttonId;
+    const fsmListId   = body?.listResponseMessage?.selectedRowId;
     const fsmEventId  = fsmButtonId || fsmListId;
 
-    // ─────────────────────────────────────────────────────────────────────
+    if (fsmEventId && /^(buy_|size_|qty_|add_size_|skip_more_)/.test(fsmEventId)) {
+      if (messageId) zapi.readMessage(from, messageId);
+      logger.info({ from, fsmEventId }, '[FSM] Evento interativo capturado');
+      const session = await getSession(from);
+      await handlePurchaseFlowEvent(from, fsmEventId, session);
+      persistSession(from);
+      return;
+    }
     // ─────────────────────────────────────────────────────────────────────
 
     const text = extractTextFromEvent(body);
@@ -467,7 +486,7 @@ app.post('/webhook', async (req, res) => {
           for (const { size, qty } of grade) {
             const validSize = focusedProduct.sizes.find(s => s.toUpperCase() === size);
             if (!validSize) continue;
-            pushCartItem(session, focusedProduct.id, focusedProduct.name, validSize, qty, unitPrice);
+            pushCartItem(session, focusedProduct.id, focusedProduct.name, validSize, qty, unitPrice, focusedProduct.imageUrl || null);
             addedItems.push({ size: validSize, qty });
           }
 
@@ -815,7 +834,7 @@ app.post('/webhook', async (req, res) => {
           for (const { size, qty } of gradeFromQuote) {
             const validSize = quotedProduct.sizes.find(s => s.toUpperCase() === size);
             if (!validSize) continue;
-            pushCartItem(session, quotedProduct.id, quotedProduct.name, validSize, qty, unitPrice);
+            pushCartItem(session, quotedProduct.id, quotedProduct.name, validSize, qty, unitPrice, quotedProduct.imageUrl || null);
             addedItems.push({ size: validSize, qty });
           }
 
@@ -1260,10 +1279,10 @@ function registerMessageProduct(session, zaapId, messageId, product) {
  * Adiciona um item ao carrinho silenciosamente (sem mensagem, sem menu).
  * Usado pelo grade parser para batch insert antes de enviar uma confirmação consolidada.
  */
-function pushCartItem(session, productId, productName, size, qty, unitPrice) {
+function pushCartItem(session, productId, productName, size, qty, unitPrice, imageUrl = null) {
   if (!productId || !size || !qty || qty < 1) return;
   const price = unitPrice * qty;
-  session.items.push({ productId, productName, size, quantity: qty, unitPrice, price });
+  session.items.push({ productId, productName, size, quantity: qty, unitPrice, price, imageUrl });
   const pf = session.purchaseFlow;
   if (Array.isArray(pf.addedSizes) && !pf.addedSizes.includes(size)) {
     pf.addedSizes.push(size);
@@ -1295,6 +1314,10 @@ async function addToCart(phone, qty, session) {
   const unitPrice = pf.price || 0;
   const price = unitPrice * qty;
 
+  // Busca imageUrl do produto em foco (pode não estar em session.products se navegou de categoria)
+  const productRef = session.products?.find(p => p.id === pf.productId);
+  const imageUrl = productRef?.imageUrl || null;
+
   session.items.push({
     productId: pf.productId,
     productName: pf.productName,
@@ -1302,6 +1325,7 @@ async function addToCart(phone, qty, session) {
     quantity: qty,
     unitPrice,
     price,
+    imageUrl,
   });
 
   if (!Array.isArray(pf.addedSizes)) pf.addedSizes = [];
@@ -1572,6 +1596,38 @@ function buildCartSummary(session, title = '🛒 *SEU CARRINHO*') {
 
   summary += `─────────────────\n💰 *Total: ${woocommerce.formatPrice(total)}*`;
   return { summary, total };
+}
+
+/**
+ * Agrupa os itens do carrinho por productId para envio visual à vendedora.
+ * Cada grupo contém: productId, productName, imageUrl, variações (size+qty) e subtotal.
+ * Usado por handoffToConsultant para enviar 1 foto por produto distinto.
+ */
+function buildProductGroupsFromCart(session) {
+  const groups = {};
+
+  for (const item of session.items) {
+    const key = item.productId;
+    if (!groups[key]) {
+      groups[key] = {
+        productId: item.productId,
+        productName: item.productName,
+        imageUrl: item.imageUrl || null,
+        variations: [],
+        subtotal: 0,
+        totalPieces: 0,
+      };
+    }
+    groups[key].variations.push({
+      size: item.size,
+      quantity: item.quantity,
+      unitPrice: item.unitPrice,
+    });
+    groups[key].subtotal += parseFloat(item.price || 0);
+    groups[key].totalPieces += item.quantity;
+  }
+
+  return Object.values(groups);
 }
 
 async function showCart(phone, session) {
@@ -1851,6 +1907,96 @@ async function sendProductPage(phone, result, session, startIdx = 0) {
       await sendCategoryMenu(phone, cleanText);
     }
   }
+}
+
+/**
+ * Finalizes the order by notifying the customer and forwarding the order summary to the admin.
+ * Called when the AI emits [HANDOFF] or the customer confirms checkout with a pending queue.
+ *
+ * @param {string} phone - Customer phone number
+ * @param {object} session - Current session object
+ */
+async function handoffToConsultant(phone, session) {
+  // Guard: prevent duplicate handoff in the same session
+  if (session.handoffDone) {
+    logger.warn({ phone }, '[Handoff] Duplicated handoff blocked');
+    return;
+  }
+
+  if (!session.items || session.items.length === 0) {
+    await zapi.sendText(phone, '😊 Seu carrinho está vazio! Adicione alguns produtos antes de fechar o pedido.');
+    return;
+  }
+
+  const { summary, total } = buildCartSummary(session, '🛒 *RESUMO DO SEU PEDIDO*');
+
+  // ── 1. Notify the customer ──────────────────────────────────────────────
+  const customerMsg =
+    `${summary}\n\n` +
+    `✅ *Pedido recebido!*\n` +
+    `Nossa consultora já foi notificada e vai entrar em contato em breve para confirmar os detalhes e combinar a forma de pagamento. 😊\n\n` +
+    `_Qualquer dúvida, é só chamar!_ 💕`;
+
+  await zapi.sendText(phone, customerMsg);
+  logger.info({ phone, total, itemCount: session.items.length }, '[Handoff] Order summary sent to customer');
+
+  // ── 2. Notify the admin (ADMIN_PHONE) ──────────────────────────────────
+  if (ADMIN_PHONE) {
+    // 2a. Resumo em texto com header do pedido
+    const adminHeader =
+      `📦 *NOVO PEDIDO — Agente Belux*\n` +
+      `─────────────────\n` +
+      `📱 *Lojista:* wa.me/${phone}\n` +
+      (session.customerName ? `👤 *Nome:* ${session.customerName}\n` : '') +
+      `─────────────────\n` +
+      `${summary}\n\n` +
+      `📸 _Enviando fotos dos produtos a seguir..._`;
+
+    try {
+      await zapi.sendText(ADMIN_PHONE, adminHeader);
+      logger.info({ phone, adminPhone: ADMIN_PHONE }, '[Handoff] Text summary sent to admin');
+
+      // 2b. Uma foto por produto distinto (identificação visual sem SKU)
+      const groups = buildProductGroupsFromCart(session);
+      for (let i = 0; i < groups.length; i++) {
+        const g = groups[i];
+        const variationsText = g.variations
+          .map(v => `${v.size} x${v.quantity}`)
+          .join(' · ');
+
+        const caption =
+          `📦 *Produto ${i + 1}/${groups.length}*\n` +
+          `*${g.productName}*\n` +
+          `Tamanhos: ${variationsText}\n` +
+          `Total: ${g.totalPieces} ${g.totalPieces === 1 ? 'peça' : 'peças'} — ${woocommerce.formatPrice(g.subtotal)}`;
+
+        if (g.imageUrl) {
+          try {
+            await zapi.sendImage(ADMIN_PHONE, g.imageUrl, caption);
+            await zapi.delay(400); // evita flood Z-API
+          } catch (err) {
+            logger.error({ err: err?.message, productId: g.productId }, '[Handoff] Falha ao enviar foto, fallback para texto');
+            await zapi.sendText(ADMIN_PHONE, caption);
+          }
+        } else {
+          // Fallback: produto sem imagem cadastrada
+          await zapi.sendText(ADMIN_PHONE, caption + '\n⚠️ _Produto sem foto cadastrada._');
+        }
+      }
+
+      logger.info({ phone, groupCount: groups.length }, '[Handoff] Photos forwarded to admin');
+    } catch (err) {
+      logger.error({ err: err?.message || String(err), adminPhone: ADMIN_PHONE }, '[Handoff] Failed to notify admin');
+    }
+  } else {
+    logger.warn({ phone }, '[Handoff] ADMIN_PHONE not configured — skipping admin notification');
+  }
+
+  // ── 3. Reset purchase flow (keep items for audit) ──────────────────────
+  resetPurchaseFlow(session);
+  session.handoffDone = true;
+
+  logger.info({ phone }, '[Handoff] Session handed off successfully');
 }
 
 app.get('/', (_req, res) => res.json({ status: 'online', activeSessions: Object.keys(sessions).length }));
