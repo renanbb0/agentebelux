@@ -2,21 +2,21 @@
 name: agente-belux
 description: >
   Skill mestre do projeto Agente Belux — bot de vendas WhatsApp para Belux Moda Íntima,
-  desenvolvido pela Lume Soluções. Cobre Z-API (webhooks, eventos, envio de mensagens),
-  WooCommerce REST API (catálogo, categorias, produtos), Groq SDK (IA, prompts, action tokens,
-  modelo qwen3-32b), arquitetura Node.js/Express, sessões em memória, carrinho de compras,
-  e documentação no Obsidian. USE ESTA SKILL SEMPRE que o contexto envolver: WhatsApp bot,
-  Z-API, WooCommerce, Groq, Belux, moda íntima, agente de vendas, webhook, catálogo de
-  produtos, carrinho, sessão de cliente, Obsidian vault do projeto, ou qualquer tarefa
-  de desenvolvimento, debug, refatoração ou documentação do Agente Belux. Mesmo que o
-  usuário não mencione "Belux" explicitamente — se a tarefa envolve bot de WhatsApp com
-  WooCommerce neste workspace, esta skill se aplica.
+  desenvolvido pela Lume Soluções. Cobre Z-API (webhooks, envio de mensagens, quotedMessage,
+  replyText, readMessage), WooCommerce REST API (catálogo, categorias, busca, paginação,
+  deduplicação), Gemini 2.5 Flash (IA conversacional, TTS, action tokens), Supabase
+  (sessões, learnings, pedidos), arquitetura Node.js/Express 5, sessões com timeout,
+  carrinho de compras, handoff para humano, continuous learning, e documentação Obsidian.
+  USE ESTA SKILL SEMPRE que o contexto envolver: WhatsApp bot, Z-API, WooCommerce, Gemini,
+  Supabase, Belux, moda íntima, agente de vendas, webhook, catálogo, carrinho, sessão,
+  debug, troubleshooting, bugs, logs, quotedMessage, reply de foto, TTS, handoff, learning,
+  ou qualquer tarefa de desenvolvimento, debug, refatoração ou documentação do Agente Belux.
 ---
 
 # Agente Belux — Skill Mestre (Claude Code)
 
 > Bot de vendas WhatsApp para **Belux Moda Íntima** · Lume Soluções
-> Stack: Node.js · Express 5 · Z-API · WooCommerce REST · Groq SDK (qwen3-32b)
+> Stack: Node.js · Express 5 · Z-API · WooCommerce REST · Gemini 2.5 Flash · Supabase
 
 ## Mapa do Projeto
 
@@ -24,9 +24,13 @@ description: >
 Agente Belux/
 ├── index.js                 ← Servidor Express, webhook, lógica principal
 ├── services/
-│   ├── zapi.js              ← Envio de mensagens (Z-API WhatsApp SaaS)
+│   ├── zapi.js              ← Envio/recebimento de mensagens (Z-API WhatsApp SaaS)
 │   ├── woocommerce.js       ← Catálogo de produtos (WooCommerce REST v3)
-│   └── groq.js              ← IA conversacional (Groq + qwen3-32b)
+│   ├── gemini.js            ← IA conversacional (Gemini 2.5 Flash)
+│   ├── tts.js               ← TTS via Gemini (voz Aoede, feature flag)
+│   ├── supabase.js          ← Persistência (sessões, pedidos, learnings)
+│   ├── learnings.js         ← Extração de insights pós-venda
+│   └── logger.js            ← Logger estruturado (pino + pino-pretty)
 ├── .env                     ← Credenciais (NUNCA versionar)
 ├── .claude/CLAUDE.md        ← Instruções gerais do Claude Code
 ├── MIGRATION.md             ← Histórico: Evolution API → Z-API
@@ -44,6 +48,7 @@ Leia APENAS a referência necessária para a tarefa atual. Cada arquivo está em
 | IA, prompts, action tokens, persona Bela, modelo Groq | `references/groq.md` | ~2000 |
 | Visão geral, fluxo de venda, sessões, carrinho, ADRs | `references/arquitetura.md` | ~2400 |
 | Documentação Obsidian, templates, vault, padrões | `references/obsidian.md` | ~1500 |
+| Bugs, troubleshooting, erros conhecidos | `references/bugs.md` | ~1200 |
 
 **Exemplo:** Tarefa "corrigir envio de imagem no WhatsApp" → leia `references/zapi.md`.
 Tarefa "adicionar nova categoria" → leia `references/woocommerce.md` e `references/groq.md`.
@@ -57,7 +62,12 @@ ZAPI_CLIENT_TOKEN=      # Client token (segurança extra)
 WC_BASE_URL=            # Ex: https://belux.com.br/wp-json/wc/v3
 WC_CONSUMER_KEY=        # ck_xxxxx
 WC_CONSUMER_SECRET=     # cs_xxxxx
-GROQ_API_KEY=           # gsk_xxxxx
+GEMINI_API_KEY=         # Gemini 2.5 Flash (IA + TTS)
+SUPABASE_URL=           # URL do projeto Supabase
+SUPABASE_ANON_KEY=      # Chave anônima Supabase
+TTS_ENABLED=true        # Feature flag TTS
+TTS_VOICE=Aoede         # Voz do TTS
+ADMIN_PHONE=            # Notificação de handoff
 PORT=3000
 ```
 
@@ -103,23 +113,30 @@ curl localhost:3000  # Health check
 
 ## Dependências
 
-| Pacote | Versão | Uso |
-|---|---|---|
-| `express` | ^5.2.1 | Servidor HTTP + webhook |
-| `axios` | ^1.13.6 | HTTP client (Z-API, WooCommerce) |
-| `dotenv` | ^17.3.1 | Variáveis de ambiente |
-| `groq-sdk` | ^1.1.2 | SDK oficial da Groq |
+| Pacote | Uso |
+|---|---|
+| `express` | Servidor HTTP + webhook |
+| `axios` | HTTP client (Z-API, WooCommerce) |
+| `dotenv` | Variáveis de ambiente |
+| `@google/generative-ai` | Gemini 2.5 Flash (IA + TTS) |
+| `@supabase/supabase-js` | Persistência (sessões, pedidos, learnings) |
+| `pino` | Logger estruturado |
+| `pino-pretty` | Formatação de logs no console |
 
-## Status do Projeto
+## Status Atual do Projeto
 
-- ✅ Migração Evolution API → Z-API concluída (2026-03-25)
-- ✅ Webhook recebendo mensagens de texto
-- ✅ IA conversacional (Groq qwen3-32b) com persona "Bela"
-- ✅ Catálogo WooCommerce integrado (feminino, masculino, infantil)
-- ✅ Carrinho em memória + finalização de pedido
-- ✅ Envio de texto e imagem via Z-API
-- 🟡 Humanização e eventos WhatsApp (doc 09 criado, implementação pendente)
-- 🟡 Handoff para atendente humano (planejado)
-- 🟡 Link de pagamento (planejado)
-- 🟡 RAG avançado / substituição por similaridade (planejado)
-- 🟡 Persistência de sessões (atualmente só em memória)
+- ✅ Migração Evolution API → Z-API concluída
+- ✅ Migração Groq/Qwen → Gemini 2.5 Flash concluída
+- ✅ Persistência Supabase (sessões, pedidos, learnings)
+- ✅ TTS com Gemini (voz Aoede)
+- ✅ Webhook com handling de texto, áudio (fallback), imagem, sticker
+- ✅ Paginação de catálogo (10 por página)
+- ✅ Busca por texto livre no WooCommerce
+- ✅ Handoff para consultora humana com notificação
+- ✅ Continuous learning (insights pós-venda)
+- ✅ Session timeout (30min) + cleanup automático
+- ✅ Guards: anti-saudação, anti-lista-inventada, reset de contexto
+- 🔴 Bug: foto errada ao citar mensagem (quotedMessage)
+- 🔴 Bug: logs não estão sendo salvos em arquivo
+- 🟡 Bug: produtos duplicados no catálogo masculino
+- 🟡 Pedidos mistos multi-categoria (limitação estrutural)

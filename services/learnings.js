@@ -18,16 +18,4 @@ async function getActive() {
   return db.getActiveLearnings(10);
 }
 
-/**
- * Returns all learnings with metadata (for admin inspection).
- */
-async function getAll() {
-  const { data } = await db.supabase
-    .from('learnings')
-    .select('*')
-    .order('uses',      { ascending: false })
-    .order('last_seen', { ascending: false });
-  return data || [];
-}
-
-module.exports = { addLearning, getActive, getAll };
+module.exports = { addLearning, getActive };

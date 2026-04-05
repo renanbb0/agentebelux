@@ -98,39 +98,47 @@ async function sendImage(to, imageUrl, caption) {
 }
 ```
 
-### Enviar Menu de Categorias (texto simples)
+### Enviar List Message (Menu de Categorias) ✅ IMPLEMENTADO
 
 ```javascript
-async function sendCategoryMenu(to) {
-  return sendText(to,
-    '👗 *Belux Moda Íntima*\nOlá! Escolha uma categoria:\n\n'
-    + '1️⃣ Feminino\n2️⃣ Masculino\n3️⃣ Infantil\n\n'
-    + '_Digite o número da categoria desejada._'
-  );
+async function sendOptionList(to, message, title, buttonLabel, options) {
+  const typingSeconds = Math.min(Math.max(Math.ceil(message.length / 80), 1), 5);
+  const payload = {
+    phone: to,
+    message,
+    optionList: { title, buttonLabel, options },
+    delayMessage: typingSeconds,
+  };
+  return zapiClient.post('/send-option-list', payload);
 }
 ```
 
-### Enviar Seletor de Tamanhos
+**Payload de options:**
+```js
+[
+  { id: 'cat_feminina', title: 'Linha Feminina', description: 'Vestidos, conjuntos e mais' },
+  { id: 'cat_infantil', title: 'Linha Infantil', description: 'Conforto para os pequenos' },
+  // ...
+]
+```
+
+**Regras:**
+- `buttonLabel` máximo 20 caracteres
+- Quando o cliente seleciona, chega como texto normal no webhook (o `title` da opção)
+
+### Enviar Botões Interativos ✅ IMPLEMENTADO
 
 ```javascript
-async function sendSizeSelector(to, product) {
-  // Retorna array de tamanhos para roteamento
-  let msg = `📏 *${product.name}*\nEscolha o tamanho:\n\n`;
-  product.sizes.forEach((size, i) => { msg += `${i + 1}. ${size}\n`; });
-  msg += '\n_Digite o número do tamanho desejado._';
-  await sendText(to, msg);
-  return product.sizes;
+async function sendButtonList(to, message, title, footer, buttonList) {
+  return zapiClient.post('/send-button-list', { phone: to, message, title, footer, buttonList });
 }
 ```
 
-### Outros Endpoints Disponíveis (ainda não implementados)
+### Outros Endpoints Disponíveis (não implementados)
 
 | Endpoint | Uso |
 |---|---|
-| `POST /send-button-list` | Botões interativos |
-| `POST /send-option-list` | Lista de opções (select) |
 | `POST /send-link` | Link com preview |
-| `POST /send-audio` | Áudio/voz |
 | `POST /send-video` | Vídeo |
 | `POST /send-document/{extension}` | Documentos (PDF, etc) |
 | `POST /send-sticker` | Figurinhas |
@@ -248,6 +256,65 @@ app.post('/webhook', async (req, res) => {
 - body.data.message.conversation → body.text.message
 - body.data.key.fromMe          → body.fromMe
 ```
+
+---
+
+## Mensagens Citadas (quotedMessage)
+
+### Estrutura do Payload (NÃO CONFIÁVEL)
+
+Quando um cliente faz reply numa mensagem, o webhook inclui `body.quotedMessage`. A estrutura varia e NÃO é documentada oficialmente pelo Z-API. Campos conhecidos:
+
+| Campo possível | Quando aparece |
+|---|---|
+| `quotedMessage.text.message` | Quote de texto puro |
+| `quotedMessage.image.caption` | Quote de imagem (variante 1) |
+| `quotedMessage.imageMessage.caption` | Quote de imagem (variante 2) |
+| `quotedMessage.caption` | Campo direto (raro) |
+| `quotedMessage.message.imageMessage.caption` | Aninhado (variante 3) |
+| `quotedMessage.message.extendedTextMessage.text` | Texto estendido |
+
+**⚠️ PROBLEMA ABERTO:** Nenhum desses campos funciona consistentemente para replies de FOTOS com caption. A causa está sendo investigada (Bug #1 em `references/bugs.md`).
+
+### Endpoint REST para buscar mensagem por ID
+
+Alternativa ao parsing inline — buscar a mensagem completa via API:
+
+```
+GET /messages/{messageId}
+```
+
+Parâmetros:
+- `messageId`: ID da mensagem citada (disponível em `quotedMessage.messageId` ou `quotedMessage.stanzaId` ou `quotedMessage.id`)
+
+Retorna o objeto completo da mensagem incluindo `caption`, `text`, etc.
+
+Exemplo de uso:
+```javascript
+async function getMessageById(messageId) {
+  try {
+    const { data } = await zapiClient.get(`/messages/${messageId}`);
+    return data;
+  } catch (err) {
+    logger.error({ messageId, error: err.message }, '[Z-API] getMessageById failed');
+    return null;
+  }
+}
+```
+
+### Funções de envio atuais em `zapi.js`
+
+| Função | Uso |
+|---|---|
+| `sendText(to, message)` | Texto simples com delayTyping |
+| `replyText(to, message, messageId)` | Resposta citando mensagem original |
+| `sendImage(to, imageUrl, caption)` | Imagem com legenda |
+| `sendAudio(to, buffer, mimeType)` | Áudio base64 (TTS) |
+| `readMessage(phone, messageId)` | Checks azuis |
+| `getMessageById(messageId)` | Busca mensagem completa via REST |
+| `sendButtonList(to, message, title, footer, buttonList)` | Botões interativos |
+| `sendOptionList(to, message, title, buttonLabel, options)` | List Message (menu lateral) |
+| `delay(ms)` | Pausa entre envios de imagem |
 
 ---
 

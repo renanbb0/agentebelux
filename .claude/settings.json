@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(powershell.exe -Command \"\\(Invoke-RestMethod -Uri 'http://localhost:4040/api/tunnels'\\).tunnels.public_url\")",
+      "Bash(node -e \"try { require\\('./index.js'\\) } catch\\(e\\) { console.error\\(e.message\\) }\")",
+      "Bash(curl -s http://localhost:3000/)"
+    ]
+  }
+}

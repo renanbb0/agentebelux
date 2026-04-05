@@ -17,6 +17,11 @@ async function getSession(phone) {
 }
 
 async function upsertSession(phone, session) {
+  const purchaseFlowPayload = {
+    ...session.purchaseFlow,
+    contextMemory: session.conversationMemory || null,
+  };
+
   const { error } = await supabase
     .from('sessions')
     .upsert({
@@ -32,15 +37,13 @@ async function upsertSession(phone, session) {
       total_products:   session.totalProducts,
       last_viewed_product: session.lastViewedProduct,
       last_viewed_product_index: session.lastViewedProductIndex,
+      purchase_flow:    purchaseFlowPayload,
+      message_product_map: session.messageProductMap || {},
       last_activity:    session.lastActivity,
       updated_at:       new Date().toISOString(),
     }, { onConflict: 'phone' });
 
   if (error) throw error;
-}
-
-async function deleteSession(phone) {
-  await supabase.from('sessions').delete().eq('phone', phone);
 }
 
 async function deleteExpiredSessions(timeoutMs) {
@@ -49,7 +52,10 @@ async function deleteExpiredSessions(timeoutMs) {
     .from('sessions')
     .delete()
     .lt('last_activity', cutoff);
-  if (error) console.error('[Supabase] deleteExpiredSessions:', error.message);
+  if (error) {
+    const logger = require('./logger');
+    logger.error({ err: error.message }, '[Supabase] deleteExpiredSessions');
+  }
 }
 
 // ── Learnings ─────────────────────────────────────────────────────────────
@@ -108,7 +114,6 @@ module.exports = {
   // sessions
   getSession,
   upsertSession,
-  deleteSession,
   deleteExpiredSessions,
   // learnings
   addLearning,

@@ -1,8 +1,8 @@
 const axios = require('axios');
 
-const WC_BASE_URL = process.env.WC_BASE_URL;
-const WC_CONSUMER_KEY = process.env.WC_CONSUMER_KEY;
-const WC_CONSUMER_SECRET = process.env.WC_CONSUMER_SECRET;
+const WC_BASE_URL = process.env.WC_BASE_URL?.trim();
+const WC_CONSUMER_KEY = process.env.WC_CONSUMER_KEY?.trim();
+const WC_CONSUMER_SECRET = process.env.WC_CONSUMER_SECRET?.trim();
 
 const wooApi = axios.create({
   baseURL: WC_BASE_URL,
@@ -59,8 +59,10 @@ async function getProductsByCategory(categorySlug, perPage = 10, page = 1) {
   const total = parseInt(response.headers['x-wp-total'] || '0', 10);
   const totalPages = parseInt(response.headers['x-wp-totalpages'] || '1', 10);
 
+  const products = deduplicateProducts(response.data.map(formatProduct));
+
   return {
-    products: response.data.map(formatProduct),
+    products,
     page,
     totalPages,
     total,
@@ -81,7 +83,7 @@ async function searchProducts(query, perPage = 20) {
     },
   });
 
-  return products.map(formatProduct);
+  return deduplicateProducts(products.map(formatProduct));
 }
 
 /**
@@ -93,6 +95,19 @@ function extractSizes(product) {
   );
 
   return sizeAttr ? sizeAttr.options : [];
+}
+
+/**
+ * Deduplicates products by ID only.
+ * Produtos com nomes idênticos mas IDs diferentes são variações distintas e devem ser preservados.
+ */
+function deduplicateProducts(products) {
+  const seen = new Set();
+  return products.filter((product) => {
+    if (!product.id || seen.has(product.id)) return false;
+    seen.add(product.id);
+    return true;
+  });
 }
 
 /**

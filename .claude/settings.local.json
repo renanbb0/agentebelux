@@ -1,7 +1,28 @@
 {
   "permissions": {
     "allow": [
-      "Bash(powershell.exe -Command \"Stop-Process -Name node -Force\")"
+      "Bash(powershell.exe -Command \"Stop-Process -Name node -Force\")",
+      "Bash(Stop-Process -Name node -Force)",
+      "Bash(node index.js)",
+      "Bash(Start-Process ngrok:*)",
+      "Bash(powershell.exe -Command \"Start-Process ngrok -ArgumentList 'http 3000' -WindowStyle Hidden\")",
+      "Bash(curl -s http://localhost:4040/api/tunnels)",
+      "Bash(powershell.exe -Command \"Get-Process ngrok -ErrorAction SilentlyContinue | Stop-Process -Force; Write-Host 'ngrok finalizado'\")",
+      "Bash(powershell.exe -Command \"Start-Process ngrok -ArgumentList 'http 3000' -WindowStyle Hidden; Start-Sleep 5; \\(Invoke-RestMethod -Uri 'http://localhost:4040/api/tunnels'\\).tunnels[0].public_url\")",
+      "Bash(powershell.exe -Command \"Get-Process ngrok -ErrorAction SilentlyContinue | Select-Object Name, Id, StartTime\")",
+      "Bash(powershell.exe -Command \"Get-Command ngrok -ErrorAction SilentlyContinue | Select-Object Source\")",
+      "Bash(powershell.exe -Command \"Get-Process node,ngrok -ErrorAction SilentlyContinue | Stop-Process -Force; Write-Host 'Tudo encerrado'\")",
+      "Bash(netstat -ano)",
+      "Bash(powershell.exe -Command \"Invoke-RestMethod -Uri ''http://localhost:4040/api/tunnels'' | Select-Object -ExpandProperty tunnels | Select-Object public_url\")",
+      "Bash(powershell.exe -Command \"Get-Process ngrok -ErrorAction SilentlyContinue\")",
+      "Bash(powershell.exe -Command \"where.exe ngrok\")",
+      "Bash(powershell.exe -Command \"Start-Process ''C:\\\\Users\\\\renan\\\\AppData\\\\Local\\\\Microsoft\\\\WinGet\\\\Packages\\\\Ngrok.Ngrok_Microsoft.Winget.Source_8wekyb3d8bbwe\\\\ngrok.exe'' -ArgumentList ''http 3000'' -WindowStyle Hidden\")",
+      "Bash(node -c index.js)",
+      "Bash(node -c services/gemini.js)",
+      "Bash(node -c services/woocommerce.js)",
+      "Bash(powershell.exe -Command \"Stop-Process -Name node -Force -ErrorAction SilentlyContinue; Stop-Process -Name ngrok -Force -ErrorAction SilentlyContinue; echo 'Processos encerrados'\")",
+      "Bash(powershell.exe -Command \"Start-Process 'C:\\\\Users\\\\renan\\\\AppData\\\\Local\\\\Microsoft\\\\WinGet\\\\Packages\\\\Ngrok.Ngrok_Microsoft.Winget.Source_8wekyb3d8bbwe\\\\ngrok.exe' -ArgumentList 'http 3000' -WindowStyle Hidden\")",
+      "Bash(powershell.exe -Command \"Invoke-RestMethod -Uri 'http://localhost:4040/api/tunnels' | Select-Object -ExpandProperty tunnels | Select-Object public_url\")"
     ]
   },
   "defaultMode": "bypassPermissions"

@@ -65,15 +65,29 @@ graph TD;
 ### Estrutura
 
 ```javascript
-const sessions = {}; // Em memória (reinicia com o servidor)
+const sessions = {}; // Em memória + persistência Supabase
 
 sessions['5585999999999'] = {
   history: [],          // Histórico de conversa [{role, content}] — máx 20
-  items: [],            // Carrinho [{productId, productName, size, price}]
+  items: [],            // Carrinho [{productId, productName, size, quantity, unitPrice, price}]
   products: [],         // Produtos da última busca/categoria visualizada
-  currentProduct: null, // Produto selecionado (aguardando tamanho)
+  currentProduct: null, // Produto selecionado (contexto de reply)
   customerName: null,   // Nome do cliente (registrado via [NOME:nome])
-  lastActivity: Date.now(), // Timestamp da última mensagem (para TTL)
+  currentCategory: null,      // Slug da categoria ativa
+  currentPage: 0,             // Página atual (paginação)
+  totalPages: 1,              // Total de páginas
+  lastViewedProduct: null,    // Último produto visualizado
+  lastActivity: Date.now(),   // Timestamp da última mensagem (para TTL)
+  purchaseFlow: {             // FSM de compra interativa
+    state: 'idle',            // idle | awaiting_size | awaiting_quantity | awaiting_more_sizes
+    productId: null,          // ID do produto em processo
+    productName: null,        // Nome do produto em processo
+    price: null,              // Preço unitário
+    selectedSize: null,       // Tamanho selecionado
+    addedSizes: [],           // Tamanhos já adicionados (fluxo atacado)
+    interactiveVersion: null, // Timestamp de versão dos menus (anti-stale)
+    buyQueue: [],             // Fila de produtos pendentes (cliques simultâneos)
+  },
 };
 ```
 
@@ -336,6 +350,31 @@ app.get('/', (_req, res) => {
 - ✅ TTL evita memory leak
 - ❌ Perde tudo no restart do servidor
 - ❌ Não escala para múltiplas instâncias
+
+### ADR-005: FSM de Compra Interativa com buyQueue (2026-04-03)
+
+**Contexto:** Clientes clicam em "Comprar" em vários produtos quase simultaneamente antes de terminar o fluxo do primeiro. O campo `currentProduct` suportava apenas 1 produto ativo, fazendo o segundo clic sobrescrever o fluxo em andamento.
+
+**Decisão:** Implementar uma FSM (`purchaseFlow`) com estados (`idle → awaiting_size → awaiting_quantity → awaiting_more_sizes → idle`) e uma fila `buyQueue` que acumula produtos enquanto a FSM está ocupada.
+
+**Fluxo da Fila:**
+1. Cliente clica "Comprar" em produto A → FSM entra em `awaiting_size`
+2. Cliente clica "Comprar" em produto B → produto B vai para `buyQueue`; Bela confirma: *"✅ Produto B anotado na fila! Vamos um de cada vez 😊"*
+3. Após finalizar produto A (tamanhos/quantidade): `processNextInQueue` busca produto B da fila e inicia automaticamente
+4. Menu pós-adição: quando há itens na `buyQueue`, o botão "Próximo Produto" (`skip_more_v{version}`) aparece no lugar de "Ver Mais Produtos"
+
+**Funções-chave:**
+- `handlePurchaseFlowEvent(phone, eventId, session)` — roteador central da FSM
+- `addToCart(phone, quantity, session)` — adiciona item, chama `processNextInQueue` se fila não vazia
+- `processNextInQueue(phone, session)` — avança para o próximo produto da fila
+- `resetPurchaseFlow(session)` — reseta FSM preservando `buyQueue`
+- `sendPostAddMenu(phone, session, remainingSizes)` — menu pós-adição; exibe botão de fila quando aplicável
+
+**Consequências:**
+- ✅ Múltiplos produtos processados sequencialmente sem perda
+- ✅ Bela comunica claramente a fila para o cliente
+- ✅ Transição automática entre produtos da fila
+- ❌ Produtos da fila precisam estar em `session.products` (mesma categoria/busca)
 
 ### ADR-004: Reorganização do Agente (2026-03-26)
 

@@ -1,11 +1,20 @@
 ---
 name: agente-belux-skill
-description: "Core skill set for Claude Code working on the Bela Belux project. Includes Socratic Gate, Clean Code, Node.js Best Practices, and Systematic Debugging."
+description: "Core skill set for Claude Code working on the Bela Belux project. Includes Socratic Gate, Clean Code, Node.js Best Practices, Systematic Debugging, and Z-API hybrid commerce flow guidance."
 ---
 
 # Agente Belux - Core Skills for Claude Code
 
 You are working on the **Bela Belux** project, an advanced wholesale sales assistant via WhatsApp using Node.js and the Gemini API. It is CRITICAL that you follow these foundational skills and rules over any default behavior.
+
+## 0. Hybrid Commerce Flow Context
+For any task involving WhatsApp purchase orchestration, assume the project now has a documented hybrid flow based on Z-API:
+- product showcase with image + CTA
+- size selection via list message
+- quantity selection via quick buttons with manual fallback
+- final cart confirmation
+
+Treat this flow as a first-class project capability, not as an experimental idea.
 
 ## 1. The Socratic Gate (Brainstorming)
 **DO NOT WRITE CODE IMMEDIATELY** when the user requests a new feature, complex logic change, or adjustment to the AI persona.

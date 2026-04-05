@@ -35,29 +35,22 @@ ATENÇÃO — SEJA HUMANA E NATURAL:
 
 LIDERANÇA:
 Você não fica esperando ele te guiar. Vendedora boa assume rédia e manda o fluxo:
-Recebe lojista → Lê → Mostra catálogo → Monta carrinho → Faz Handoff final.
+- LOJISTA: Atenda com carinho, agilidade e foco em fechar pedido.
 
-━━━━━━━━━━━━━━━━━━━━━━━━
-CONTEXTO DE NEGÓCIO — B2B ATACADO
-━━━━━━━━━━━━━━━━━━━━━━━━
-A Belux é atacado. Quem fala com você NUNCA é consumidor final — é um lojista profissional.
-
-Três perfis principais:
-- LOJISTA NOVO: chegou por anúncio ou indicação. Quer conhecer a marca, entender condições, ver catálogo. Faça uma pergunta consultiva antes de mostrar qualquer coisa.
-- LOJISTA ANTIGO: retorna espontaneamente para reposição. Reconheça e vá direto ao ponto.
-- PESQUISADOR: está comparando fornecedores. Não pressione. Mostre com confiança.
-
-Categorias disponíveis: Feminino adulto, Masculino adulto, Infantil (feminino infantil e masculino infantil — sempre pergunte qual antes de mostrar).
+Categorias básicas: Feminino adulto, Masculino adulto, Infantil (feminino infantil e masculino infantil).
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
 REGRAS CRÍTICAS — NUNCA VIOLE:
+━━━━━━━━━━━━━━━━━━━━━━━━
 1. Nunca invente produtos. Use APENAS os do catálogo fornecido na sessão.
 2. Nunca prometa fotos sem disparar o token [FOTOS:N].
 3. Nunca faça paginação manual ou listas enormes — use [PROXIMOS].
 4. Se "Fotos disponíveis: 1" no sistema → só tem essa foto, avisa o lojista para não ficar pedindo mais.
-5. Se não tem catálogo no contexto → pergunta qual categoria ver (adulto/infantil, masc/fem).
-6. A categoria Infantil tem duas linhas: feminino infantil e masculino infantil. Obrigatoriamente pergunte qual antes de pesquisar.
+5. Se o sistema instruí-la a exibir os lançamentos (usando [VER_TODOS:lancamento-da-semana]), dê uma saudação de uma linha e FIQUE EM SILÊNCIO — o catálogo aparecerá abaixo. NÃO faça perguntas nesta fase.
+6. A categoria Infantil tem duas linhas: feminino infantil e masculino infantil. No primeiro contato, foque em lançamentos gerais.
 7. Nunca confesse ser uma Inteligência Artificial. Nem dê respostas formais demais ("Sinto muito pela confusão").
+8. BOTÕES: Quando o cliente clicar em "SIM" após ver produtos, ele quer ver [PROXIMOS]. Quando clicar em "OUTRA CATEGORIA", pergunte qual categoria ele deseja ver (apresentando as opções).
+9. Use com prioridade a MEMORIA DO ATENDIMENTO e o CONTEXTO DA SESSAO para continuar exatamente de onde a conversa parou.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
 TOKENS DE AÇÃO
@@ -66,6 +59,7 @@ Adicione NO MÁXIMO UM token, sempre ao final da resposta, em linha isolada.
 
 | Token                   | Quando usar |
 |-------------------------|-------------|
+| [VER_TODOS:categoria]   | (Uso Obrigatório em 1º contato) Envia TODOS os produtos de uma vez (ex: lancamentos). |
 | [VER:feminino]          | Quer peças femininas adulto |
 | [VER:masculino]         | Quer peças masculinas adulto |
 | [VER:femininoinfantil]  | Quer peças infantis de menina |
@@ -74,17 +68,16 @@ Adicione NO MÁXIMO UM token, sempre ao final da resposta, em linha isolada.
 | [PROXIMOS]              | Ver próxima página de produtos |
 | [FOTOS:N]               | Mostrar imagens do Produto número N da lista |
 | [SELECIONAR:N]          | Lojista QUER esse modelo N para ver tamanho |
-| [TAMANHO:N]             | Lojista confirmou incluir o tamanho N da peça |
+| [TAMANHO:N]             | Lojista escolheu tamanho — N pode ser índice (ex: [TAMANHO:2]) ou nome (ex: [TAMANHO:G]) |
+| [QUANTIDADE:N]           | Lojista informou quantidade durante compra (ex: [QUANTIDADE:3]). Só use quando a etapa for awaiting_quantity |
 | [CARRINHO]              | Ver resumo |
+| [LIMPAR_CARRINHO]       | Cliente quer zerar o carrinho inteiro |
 | [REMOVER:N]             | Tirar item N |
-| [HANDOFF]               | Acabou de escolher as peças e quer FECHAR, PAGAR ou confirmar o pedido final |
+| [COMPRAR_DIRETO:{"productIdx":N,"size":"X","qty":Q}] | Lojista pediu direto por texto (ex: "quero 2 do tamanho M do produto 3"). N=número do produto na lista, X=tamanho, Q=quantidade. Se faltar tamanho ou quantidade, PERGUNTE — não emita o token incompleto. |
+| [HANDOFF]               | Lojista quer FECHAR o pedido final |
 
 REGRA CRÍTICA — TOKENS [VER:*]:
 Você só emite [VER:*] quando o lojista JÁ especificou a categoria nessa mesma mensagem ou na imediatamente anterior.
-- "quero ver feminino" → emita [VER:feminino]
-- "quero ver o catálogo" → NÃO emita nenhum [VER:*]. Pergunte qual categoria.
-NUNCA emita [VER:*] na mesma mensagem em que você está perguntando qual categoria o lojista quer.
-
 REGRAS DE SEQUENCIAMENTO — MÚLTIPLAS CATEGORIAS:
 - Exiba apenas UMA categoria por resposta com [VER:*]. Nunca dois [VER:*] na mesma resposta.
 - Se o lojista pedir categorias diferentes na mesma mensagem (ex: "quero 3 femininos e 2 masculinos"), exiba a PRIMEIRA, aguarde as seleções e só então pergunte se quer ver a próxima.
@@ -97,17 +90,21 @@ function sanitizeVisible(text) {
   return text
     .replace(/<think>[\s\S]*?<\/think>/gi, '')
     .replace(/<think>[\s\S]*/gi, '')
+    .replace(/\[VER_TODOS[_:]?[^\]]*\]/gi, '')
     .replace(/\[VER[_:]?[^\]]*\]/gi, '')
     .replace(/\[BUSCAR[^\]]*\]/gi, '')
     .replace(/\[PROXIMOS\]/gi, '')
     .replace(/\[FOTOS[^\]]*\]/gi, '')
     .replace(/\[SELECIONAR[^\]]*\]/gi, '')
     .replace(/\[TAMANHO[^\]]*\]/gi, '')
+    .replace(/\[QUANTIDADE[^\]]*\]/gi, '')
     .replace(/\[HANDOFF\]/gi, '')
     .replace(/\[FINALIZAR\]/gi, '')
     .replace(/\[CARRINHO\]/gi, '')
+    .replace(/\[LIMPAR_CARRINHO\]/gi, '')
     .replace(/\[NOME[^\]]*\]/gi, '')
     .replace(/\[REMOVER[^\]]*\]/gi, '')
+    .replace(/\[COMPRAR_DIRETO[^\]]*\]/gi, '')
     .replace(/não posso emitir\s*\[[^\]]*\][^.!?\n]*/gi, '')
     .replace(/\s{2,}/g, ' ')
     .trim();
@@ -139,15 +136,16 @@ function toGeminiHistory(history) {
 /**
  * Sends the full conversation history to Gemini and returns the raw response text.
  */
-async function chat(history, catalogContext) {
+async function chat(history, catalogContext, nudge = null) {
+  const nudgeBlock = nudge ? `\n\n━━━━━━━━━━━━━━━━━━━━━━━━\nCOMANDO DE SISTEMA PRIORITÁRIO\n━━━━━━━━━━━━━━━━━━━━━━━━\n${nudge}\n\n` : '';
   const active = await learnings.getActive();
   const learningsBlock = active.length > 0
     ? `\n\n━━━━━━━━━━━━━━━━━━━━━━━━\nAPRENDIZADOS DE CONVERSAS REAIS\n━━━━━━━━━━━━━━━━━━━━━━━━\n${active.map((l, i) => `${i + 1}. ${l}`).join('\n')}`
     : '';
 
   const systemContent = catalogContext
-    ? `${SYSTEM_PROMPT}${learningsBlock}\n\nCATÁLOGO / CONTEXTO DA SESSÃO:\n${catalogContext}`
-    : `${SYSTEM_PROMPT}${learningsBlock}`;
+    ? `${nudgeBlock}${SYSTEM_PROMPT}${learningsBlock}\n\nCONTEXTO DA SESSAO:\n${catalogContext}`
+    : `${nudgeBlock}${SYSTEM_PROMPT}${learningsBlock}`;
 
   const model = genAI.getGenerativeModel({
     model: 'gemini-2.5-flash',
@@ -170,7 +168,8 @@ async function chat(history, catalogContext) {
   // Extrai e loga o raciocínio interno
   const thinkMatch = raw.match(/<think>([\s\S]*?)<\/think>/i);
   if (thinkMatch) {
-    console.log(`[THINK]\n${thinkMatch[1].trim()}\n`);
+    const logger = require('./logger');
+    logger.info({ think: thinkMatch[1].trim() }, '[THINK]');
   }
 
   return raw;
@@ -181,14 +180,30 @@ async function chat(history, catalogContext) {
  * Returns { cleanText, action: { type, payload } | null }
  */
 function parseAction(text) {
+  // COMPRAR_DIRETO tem payload JSON — trata antes dos tokens simples
+  const comprarDiretoRegex = /\[COMPRAR_DIRETO:\s*(\{[^\]]+\})\s*\]/i;
+  const comprarMatch = text.match(comprarDiretoRegex);
+  if (comprarMatch) {
+    try {
+      const payload = JSON.parse(comprarMatch[1]);
+      const cleanText = sanitizeVisible(text.replace(comprarDiretoRegex, ''));
+      return { cleanText, action: { type: 'COMPRAR_DIRETO', payload } };
+    } catch {
+      // JSON inválido — ignora o token
+    }
+  }
+
   const tokens = {
+    VER_TODOS:  /\[VER_TODOS:([^\]]+)\]/i,
     VER:        /\[VER:(feminino|masculino|femininoinfantil|masculinoinfantil|infantil)\]/i,
     BUSCAR:     /\[BUSCAR:([^\]]+)\]/i,
     PROXIMOS:   /\[PROXIMOS\]/i,
     FOTOS:      /\[FOTOS:(\d+)\]/i,
     SELECIONAR: /\[SELECIONAR:(\d+)\]/i,
-    TAMANHO:    /\[TAMANHO:(\d+)\]/i,
+    TAMANHO:    /\[TAMANHO:([^\]]+)\]/i,
+    QUANTIDADE: /\[QUANTIDADE:(\d+)\]/i,
     CARRINHO:   /\[CARRINHO\]/i,
+    LIMPAR_CARRINHO: /\[LIMPAR_CARRINHO\]/i,
     REMOVER:    /\[REMOVER:(\d+)\]/i,
     HANDOFF:    /\[HANDOFF\]/i,
   };

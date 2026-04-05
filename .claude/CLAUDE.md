@@ -10,7 +10,7 @@ Sempre responda em **português brasileiro**, sem exceção — mesmo que a perg
 
 Você é o arquiteto sênior do **Agente Belux**: bot de vendas via WhatsApp para a **Belux Moda Íntima**, desenvolvido pela Lume Soluções. O código é a execução; a inteligência e as regras de negócio residem no Obsidian.
 
-**Stack:** Node.js · Express 5 · Z-API (WhatsApp SaaS) · WooCommerce REST API · OpenRouter (Llama 4 Maverick) · Gemini TTS (feature flag)
+**Stack:** Node.js · Express 5 · Z-API (WhatsApp SaaS) · WooCommerce REST API · Gemini 2.5 Flash (IA ativa) · Gemini TTS (feature flag)
 
 ---
 
@@ -20,12 +20,14 @@ Você é o arquiteto sênior do **Agente Belux**: bot de vendas via WhatsApp par
 Agente Belux/
 ├── index.js               ← Servidor, webhook, lógica do bot
 ├── services/
-│   ├── openrouter.js      ← IA Bela: SYSTEM_PROMPT, chat(), parseAction() — ATIVO
-│   ├── groq.js            ← IA Bela: SYSTEM_PROMPT, chat(), parseAction() — STANDBY
-│   ├── gemini.js          ← IA Bela: chat(), parseAction() — STANDBY
+│   ├── gemini.js          ← IA Bela: chat(), parseAction() — ATIVO (gemini-2.5-flash)
+│   ├── openrouter.js      ← IA Bela: chat(), parseAction() — STANDBY (Llama 4 Maverick)
+│   ├── groq.js            ← IA Bela: chat(), parseAction() — STANDBY (llama-3.3-70b)
 │   ├── tts.js             ← TTS: textToSpeech() via Gemini 2.5 Pro (feature flag)
 │   ├── zapi.js            ← Envio de mensagens (Z-API)
-│   └── woocommerce.js     ← Catálogo de produtos
+│   ├── woocommerce.js     ← Catálogo de produtos
+│   ├── logger.js          ← Logger estruturado (pino)
+│   └── conversation-memory.js ← Contexto de conversa
 ├── .env                   ← Credenciais (nunca versionar)
 ├── .env.example           ← Modelo de variáveis (versionado)
 ├── Dockerfile             ← Imagem Docker de produção
@@ -57,8 +59,10 @@ O Obsidian é a memória de longo prazo do projeto. Antes de qualquer refatoraç
 | `10 - Persona da Bela.md` | Identidade, tom de voz, regras de comportamento |
 | `11 - Catálogo e Regras Comerciais.md` | Categorias, pedido mínimo, desconto PIX, prazos |
 | `12 - A Belux por Dentro.md` | Documento institucional — memória de longo prazo da Bela |
-| `13 - Serviço OpenRouter.md` | Provider de IA ativo (Llama 4 Maverick), interface chat/parseAction |
+| `13 - Serviço OpenRouter.md` | Provider de IA standby (Llama 4 Maverick), interface chat/parseAction |
 | `14 - Serviço TTS.md` | Text-to-Speech via Gemini 2.5 Pro (feature flag TTS_ENABLED) |
+| `16 - Serviço Gemini.md` | Provider de IA ativo (Gemini 2.5 Flash), interface chat/parseAction |
+| `17 - Inteligência Híbrida (FSM + IA).md` | Arquitetura FSM ↔ IA, buildFsmContext, interceptors pendentes |
 
 ---
 
