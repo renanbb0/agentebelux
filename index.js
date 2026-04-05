@@ -366,7 +366,7 @@ app.post('/webhook', async (req, res) => {
     const fsmListId   = body?.listResponseMessage?.selectedRowId;
     const fsmEventId  = fsmButtonId || fsmListId;
 
-    if (fsmEventId && /^(buy_|size_|qty_|add_size_|skip_more_)/.test(fsmEventId)) {
+    if (fsmEventId && /^(buy_|size_|qty_|add_size_|skip_more_|queue_continue|queue_finalize_anyway)/.test(fsmEventId)) {
       if (messageId) zapi.readMessage(from, messageId);
       logger.info({ from, fsmEventId }, '[FSM] Evento interativo capturado');
       const session = await getSession(from);
@@ -398,6 +398,16 @@ app.post('/webhook', async (req, res) => {
     const inactivityMs = session.previousLastActivity
       ? Date.now() - session.previousLastActivity
       : 0;
+
+    // Guard: "finalizar pedido" via lista/botão vai pro handleQueueGuard, não pra IA
+    if (text === 'quero finalizar o pedido') {
+      const intercepted = await handleQueueGuard(from, 'cart_finalize', session);
+      if (intercepted) {
+        persistSession(from);
+        return;
+      }
+      // Sem fila pendente → desce para IA que emitirá [HANDOFF]
+    }
 
     if (/(limpar|esvaziar|zerar).*(carrinho)|carrinho.*(limpar|esvaziar|zerar)/i.test(text)) {
       logger.info({ from, text }, '[Cart] Comando direto para limpar carrinho');
@@ -1414,8 +1424,8 @@ async function handlePurchaseFlowEvent(phone, eventId, session) {
     const parts = eventId.split('_');        // ['buy', '422', 'v12345']
     const productIdStr = parts[1];
     const productId = parseInt(productIdStr, 10);
-    const product = session.products?.find(p => p.id === productId || String(p.id) === productIdStr)
-                 || session.lastViewedProduct;
+    const product = session.products?.find(p => p.id === productId || String(p.id) === productIdStr);
+    // No fallback to lastViewedProduct — stale clicks must fail safely, not silently buy the wrong product.
 
     if (!product) {
       await zapi.sendText(phone, '❌ Não consegui localizar esse produto. Me chama no catálogo que te mostro de novo 😊');
@@ -1630,6 +1640,22 @@ function buildProductGroupsFromCart(session) {
   return Object.values(groups);
 }
 
+/**
+ * Clears the cart, resets purchase state, and enables a new handoff.
+ */
+async function clearCart(phone, session) {
+  session.items = [];
+  session.currentProduct = null;
+  session.handoffDone = false;       // allow a new handoff after clearing
+  if (session.purchaseFlow) {
+    session.purchaseFlow.buyQueue = [];
+  }
+  resetPurchaseFlow(session);
+  logger.info({ phone }, '[Cart] Carrinho limpo');
+  await zapi.sendText(phone, '🗑️ Carrinho esvaziado! Quer escolher outros produtos?');
+  await sendCategoryMenu(phone, 'Qual linha você quer ver agora? 😊');
+}
+
 async function showCart(phone, session) {
   if (!session.items || session.items.length === 0) {
     await zapi.sendText(phone, '🛒 Seu carrinho está vazio por enquanto. Quer dar uma olhadinha no catálogo?');
@@ -1708,6 +1734,7 @@ async function startInteractivePurchase(phone, product, session, introText = nul
   }
 
   session.currentProduct = product;
+  session.handoffDone = false;        // enable new handoff when starting fresh purchase
   session.purchaseFlow.state = 'awaiting_size';
   session.purchaseFlow.productId = product.id;
   session.purchaseFlow.productName = product.name;
@@ -1992,7 +2019,21 @@ async function handoffToConsultant(phone, session) {
     logger.warn({ phone }, '[Handoff] ADMIN_PHONE not configured — skipping admin notification');
   }
 
-  // ── 3. Reset purchase flow (keep items for audit) ──────────────────────
+  // ── 3. Persist order to Supabase (audit trail) ───────────────────────────
+  try {
+    await db.saveOrder({
+      phone,
+      customerName: session.customerName || null,
+      items: session.items,
+      total,
+    });
+    logger.info({ phone, total }, '[Handoff] Order persisted to Supabase');
+  } catch (err) {
+    // Non-blocking: do not abort handoff if persistence fails
+    logger.error({ err: err?.message || String(err) }, '[Handoff] Failed to persist order — handoff continues');
+  }
+
+  // ── 4. Reset purchase flow (keep items for audit) ──────────────────
   resetPurchaseFlow(session);
   session.handoffDone = true;
 
