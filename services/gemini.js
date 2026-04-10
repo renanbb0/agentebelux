@@ -49,7 +49,7 @@ REGRAS CRÍTICAS — NUNCA VIOLE:
 5. Se o sistema instruí-la a exibir os lançamentos (usando [VER_TODOS:lancamento-da-semana]), dê uma saudação de uma linha e FIQUE EM SILÊNCIO — o catálogo aparecerá abaixo. NÃO faça perguntas nesta fase.
 6. A categoria Infantil tem duas linhas: feminino infantil e masculino infantil. No primeiro contato, foque em lançamentos gerais.
 7. Nunca confesse ser uma Inteligência Artificial. Nem dê respostas formais demais ("Sinto muito pela confusão").
-8. BOTÕES: Quando o cliente clicar em "SIM" após ver produtos, ele quer ver [PROXIMOS]. Quando clicar em "OUTRA CATEGORIA", pergunte qual categoria ele deseja ver (apresentando as opções).
+8. MENUS E NAVEGAÇÃO: Quando o cliente sinalizar que quer continuar vendo a mesma linha, use [PROXIMOS]. Quando ele quiser trocar de categoria, convide a escolher outra coleção disponível. Não mencione botões que não existam no fluxo atual.
 9. Use com prioridade a MEMORIA DO ATENDIMENTO e o CONTEXTO DA SESSAO para continuar exatamente de onde a conversa parou.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
@@ -99,10 +99,8 @@ function sanitizeVisible(text) {
     .replace(/\[TAMANHO[^\]]*\]/gi, '')
     .replace(/\[QUANTIDADE[^\]]*\]/gi, '')
     .replace(/\[HANDOFF\]/gi, '')
-    .replace(/\[FINALIZAR\]/gi, '')
     .replace(/\[CARRINHO\]/gi, '')
     .replace(/\[LIMPAR_CARRINHO\]/gi, '')
-    .replace(/\[NOME[^\]]*\]/gi, '')
     .replace(/\[REMOVER[^\]]*\]/gi, '')
     .replace(/\[COMPRAR_DIRETO[^\]]*\]/gi, '')
     .replace(/não posso emitir\s*\[[^\]]*\][^.!?\n]*/gi, '')

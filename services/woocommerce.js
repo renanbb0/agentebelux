@@ -1,4 +1,5 @@
 const axios = require('axios');
+const logger = require('./logger');
 
 const WC_BASE_URL = process.env.WC_BASE_URL?.trim();
 const WC_CONSUMER_KEY = process.env.WC_CONSUMER_KEY?.trim();
@@ -15,6 +16,8 @@ const wooApi = axios.create({
 
 // In-memory cache for category IDs — avoids repeated lookups on each request
 const categoryCache = {};
+const variationCache = new Map();
+const VARIATION_CACHE_TTL_MS = 2 * 60 * 1000;
 
 /**
  * Looks up a WooCommerce category ID by slug, with in-memory caching.
@@ -87,6 +90,20 @@ async function searchProducts(query, perPage = 20) {
 }
 
 /**
+ * Fetches a single product by WooCommerce ID.
+ */
+async function getProductById(productId) {
+  if (!productId) return null;
+
+  const { data: product } = await wooApi.get(`/products/${productId}`);
+  if (!product || product.status !== 'publish' || product.stock_status !== 'instock') {
+    return null;
+  }
+
+  return formatProduct(product);
+}
+
+/**
  * Extracts size variations from a product's attributes.
  */
 function extractSizes(product) {
@@ -95,6 +112,149 @@ function extractSizes(product) {
   );
 
   return sizeAttr ? sizeAttr.options : [];
+}
+
+function normalizeSizeLabel(value) {
+  return String(value || '').trim().toUpperCase();
+}
+
+function buildDefaultSizeDetails(product) {
+  return (product.sizes || []).map((size) => ({
+    size,
+    stockQuantity: null,
+    isAvailable: true,
+    stockLabel: 'Disponível',
+  }));
+}
+
+function extractVariationSize(variation) {
+  const attrs = Array.isArray(variation?.attributes) ? variation.attributes : [];
+  const sizeAttr = attrs.find((attr) => {
+    const name = String(attr?.name || '').toLowerCase();
+    return name === 'tamanho' || name === 'size';
+  });
+
+  return sizeAttr?.option || null;
+}
+
+function parseStockQuantity(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function buildSizeDetailsFromVariations(product, variations) {
+  const bySize = new Map();
+
+  for (const variation of variations) {
+    const size = extractVariationSize(variation);
+    if (!size) continue;
+
+    const key = normalizeSizeLabel(size);
+    const current = bySize.get(key) || {
+      size,
+      stockQuantity: 0,
+      hasKnownStock: true,
+      isAvailable: false,
+    };
+
+    const qty = parseStockQuantity(variation.stock_quantity);
+    const hasKnownStock = Boolean(variation.manage_stock) && qty !== null;
+    const isAvailable = variation.stock_status === 'instock' || (qty !== null && qty > 0);
+
+    current.size = current.size || size;
+    current.isAvailable = current.isAvailable || isAvailable;
+
+    if (hasKnownStock) {
+      current.stockQuantity += Math.max(qty, 0);
+    } else {
+      current.hasKnownStock = false;
+    }
+
+    bySize.set(key, current);
+  }
+
+  return (product.sizes || []).map((size) => {
+    const found = bySize.get(normalizeSizeLabel(size));
+
+    if (!found) {
+      return {
+        size,
+        stockQuantity: null,
+        isAvailable: true,
+        stockLabel: 'Disponível',
+      };
+    }
+
+    if (!found.isAvailable) {
+      return {
+        size,
+        stockQuantity: found.hasKnownStock ? 0 : null,
+        isAvailable: false,
+        stockLabel: 'Indisponível',
+      };
+    }
+
+    if (found.hasKnownStock) {
+      return {
+        size,
+        stockQuantity: found.stockQuantity,
+        isAvailable: found.stockQuantity > 0,
+        stockLabel: `Disponível: ${found.stockQuantity}`,
+      };
+    }
+
+    return {
+      size,
+      stockQuantity: null,
+      isAvailable: true,
+      stockLabel: 'Disponível',
+    };
+  });
+}
+
+async function getProductVariations(productId) {
+  if (!productId) return [];
+
+  const { data: variations } = await wooApi.get(`/products/${productId}/variations`, {
+    params: {
+      per_page: 100,
+      status: 'publish',
+    },
+  });
+
+  return Array.isArray(variations) ? variations : [];
+}
+
+async function enrichProductWithStock(product) {
+  if (!product?.id || !Array.isArray(product.sizes) || product.sizes.length === 0) {
+    return product;
+  }
+
+  const cacheKey = String(product.id);
+  const cached = variationCache.get(cacheKey);
+  if (cached && (Date.now() - cached.loadedAt) < VARIATION_CACHE_TTL_MS) {
+    product.sizeDetails = cached.sizeDetails.map((detail) => ({ ...detail }));
+    return product;
+  }
+
+  let sizeDetails = buildDefaultSizeDetails(product);
+
+  try {
+    const variations = await getProductVariations(product.id);
+    if (variations.length > 0) {
+      sizeDetails = buildSizeDetailsFromVariations(product, variations);
+    }
+  } catch (err) {
+    logger.warn({ productId: product.id, err: err?.message || String(err) }, '[WooCommerce] Falha ao carregar estoque por tamanho');
+  }
+
+  product.sizeDetails = sizeDetails;
+  variationCache.set(cacheKey, {
+    loadedAt: Date.now(),
+    sizeDetails: sizeDetails.map((detail) => ({ ...detail })),
+  });
+
+  return product;
 }
 
 /**
@@ -121,12 +281,16 @@ function formatProduct(product) {
   return {
     id: product.id,
     name: product.name,
+    type: product.type,
     price: product.price,
     regularPrice: product.regular_price,
     salePrice: product.sale_price,
+    stockStatus: product.stock_status,
+    stockQuantity: parseStockQuantity(product.stock_quantity),
     imageUrl: product.images.length > 0 ? product.images[0].src : null,
     images: product.images.map((img) => img.src), // ✅ todas as fotos preservadas
     sizes: extractSizes(product),
+    sizeDetails: buildDefaultSizeDetails({ sizes: extractSizes(product) }),
     permalink: product.permalink,
     description: shortDesc,
   };
@@ -196,7 +360,9 @@ function buildCatalogContext(session) {
 }
 
 module.exports = {
+  enrichProductWithStock,
   getProductsByCategory,
+  getProductById,
   searchProducts,
   formatPrice,
   buildCaption,

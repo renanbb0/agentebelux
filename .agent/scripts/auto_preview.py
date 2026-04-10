@@ -38,7 +38,7 @@ def get_start_command(root):
     if not pkg_file.exists():
         return None
     
-    with open(pkg_file, 'r') as f:
+    with open(pkg_file, 'r', encoding='utf-8') as f:
         data = json.load(f)
     
     scripts = data.get("scripts", {})

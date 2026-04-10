@@ -6,3 +6,8 @@ debug.log
 error.log
 server.log
 server.err
+
+# Agent temporary files
+.agent/*.pid
+.agent/preview.pid
+.agent/cache/

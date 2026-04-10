@@ -15,13 +15,26 @@ async function run() {
       return;
     }
 
+    // Z-API endpoint to update received message webhook
+    const endpoint = `https://api.z-api.io/instances/${process.env.ZAPI_INSTANCE_ID}/token/${process.env.ZAPI_TOKEN}/update-webhook-received`;
+    
+    console.log('Updating webhook at:', endpoint);
+    
     const { data } = await axios.put(
-      `https://api.z-api.io/instances/${process.env.ZAPI_INSTANCE_ID}/token/${process.env.ZAPI_TOKEN}/webhooks`,
-      { value: `${ngrokUrl}/webhook` }
+      endpoint,
+      { value: `${ngrokUrl}/webhook` },
+      { headers: { 'Client-Token': process.env.ZAPI_CLIENT_TOKEN } }
     );
-    console.log('Webhook updated successfully to:', data.value);
+    
+    console.log('Webhook update response:', JSON.stringify(data, null, 2));
+    
+    if (data.value || data.status === 'success') {
+      console.log('✅ Webhook updated successfully to:', `${ngrokUrl}/webhook`);
+    } else {
+      console.warn('⚠️ Webhook update might have failed. Response above.');
+    }
   } catch(e) {
-    console.error('Error updating webhook:', e.response?.data || e.message);
+    console.error('❌ Error updating webhook:', e.response?.data || e.message);
   }
 }
 run();

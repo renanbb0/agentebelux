@@ -19,6 +19,7 @@ async function getSession(phone) {
 async function upsertSession(phone, session) {
   const purchaseFlowPayload = {
     ...session.purchaseFlow,
+    handoffDone: session.handoffDone,
     contextMemory: session.conversationMemory || null,
   };
 
@@ -40,6 +41,9 @@ async function upsertSession(phone, session) {
       purchase_flow:    purchaseFlowPayload,
       message_product_map: session.messageProductMap || {},
       last_activity:    session.lastActivity,
+      active_category:  session.activeCategory || null,
+      support_mode:     session.supportMode || null,
+      cart_notified:    session.cartNotified || false,
       updated_at:       new Date().toISOString(),
     }, { onConflict: 'phone' });
 
@@ -47,7 +51,7 @@ async function upsertSession(phone, session) {
 }
 
 async function deleteExpiredSessions(timeoutMs) {
-  const cutoff = Date.now() - timeoutMs;
+  const cutoff = new Date(Date.now() - timeoutMs).toISOString();
   const { error } = await supabase
     .from('sessions')
     .delete()

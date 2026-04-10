@@ -176,16 +176,26 @@ async function sendProductShowcase(phone, product, version) {
  * @param {number} version
  */
 async function sendSizeList(phone, product, version, excludeSizes = []) {
-  const options = product.sizes
-    .filter(size => !excludeSizes.includes(size))
-    .map(size => ({
-      id: `size_${product.id}_${size}_v${version}`,
-      title: `Tamanho ${size}`,
-      description: 'Disponível',
+  const sizeDetails = Array.isArray(product.sizeDetails) && product.sizeDetails.length > 0
+    ? product.sizeDetails
+    : (product.sizes || []).map((size) => ({ size, stockLabel: 'Disponível', isAvailable: true }));
+  const options = sizeDetails
+    .filter((detail) => detail.isAvailable !== false)
+    .filter((detail) => !excludeSizes.includes(detail.size))
+    .map((detail) => ({
+      id: `size_${product.id}_${detail.size}_v${version}`,
+      title: `Tamanho ${detail.size}`,
+      description: detail.stockLabel || 'Disponível',
     }));
 
   if (options.length === 0) {
-    await sendText(phone, `✅ Todos os tamanhos de *${product.name}* já foram adicionados!`);
+    const hasAvailableSizes = sizeDetails.some((detail) => detail.isAvailable !== false);
+    await sendText(
+      phone,
+      !hasAvailableSizes
+        ? `No momento *${product.name}* está sem tamanhos disponíveis para separar.`
+        : `✅ Todos os tamanhos de *${product.name}* já foram adicionados!`
+    );
     return;
   }
 
@@ -216,24 +226,33 @@ async function sendSizeList(phone, product, version, excludeSizes = []) {
  * @param {string} size - tamanho já selecionado
  * @param {number} version
  */
-async function sendQuantityList(phone, size, version) {
-  const options = [
+async function sendQuantityList(phone, size, version, availableQty = null) {
+  const presetOptions = [
     { id: `qty_1_v${version}`,  title: '1 peça',   description: '' },
     { id: `qty_2_v${version}`,  title: '2 peças',  description: '' },
     { id: `qty_3_v${version}`,  title: '3 peças',  description: '' },
     { id: `qty_6_v${version}`,  title: '6 peças',  description: '' },
     { id: `qty_12_v${version}`, title: '12 peças', description: '' },
   ];
+  const options = availableQty === null
+    ? presetOptions
+    : presetOptions.filter((option) => {
+      const qty = Number(option.id.split('_')[1]);
+      return Number.isFinite(qty) && qty <= availableQty;
+    });
+  const availabilityText = availableQty === null
+    ? ''
+    : ` Disponível: *${availableQty}*${availableQty === 1 ? ' peça' : ' peças'}.`;
 
   try {
     const res = await sendOptionList(
       phone,
-      `Quantas peças no tamanho *${size}*? (Pode digitar outro número se preferir 😊)`,
+      `Quantas peças no tamanho *${size}*?${availabilityText} (Pode digitar outro número se preferir 😊)`,
       'Quantidade',
       'Escolher Quantidade',
       options,
     );
-    logger.info({ phone, size, zaapId: res?.data?.zaapId }, '[Z-API] sendQuantityList');
+    logger.info({ phone, size, availableQty, zaapId: res?.data?.zaapId }, '[Z-API] sendQuantityList');
     return res;
   } catch (err) {
     logger.error({ err: err.message }, '[Z-API] sendQuantityList failed');

@@ -10,6 +10,7 @@ const db       = require('./services/supabase');
 const learnings = require('./services/learnings');
 const logger = require('./services/logger');
 const conversationMemory = require('./services/conversation-memory');
+const semantic = require('./services/semantic');
 
 const TTS_ENABLED = process.env.TTS_ENABLED === 'true';
 
@@ -93,6 +94,26 @@ const SLUG_MAP = {
   'lancamentos': 'lancamento-da-semana',
   'lancamento': 'lancamento-da-semana'
 };
+
+const CATEGORY_DISPLAY_NAMES = {
+  'feminino':             'Feminino',
+  'femininoinfantil':     'Feminino Infantil',
+  'masculino':            'Masculino',
+  'masculinoinfantil':    'Masculino Infantil',
+  'lancamento-da-semana': 'Lançamentos da Semana',
+};
+
+function getCategoryDisplayName(slug) {
+  return CATEGORY_DISPLAY_NAMES[slug] || slug;
+}
+
+const CAT_SENTINELS = {
+  'CAT_FEMININO':          'feminino',
+  'CAT_FEMININOINFANTIL':  'femininoinfantil',
+  'CAT_MASCULINO':         'masculino',
+  'CAT_MASCULINOINFANTIL': 'masculinoinfantil',
+  'CAT_LANCAMENTOS':       'lancamento-da-semana',
+};
 const CATEGORY_OPTIONS = [
   { id: 'cat_feminina', title: 'Feminino', description: 'Moda íntima feminina' },
   { id: 'cat_feminino_infantil', title: 'Feminino Infantil', description: 'Conforto para as meninas' },
@@ -145,7 +166,7 @@ function buildFsmContext(session) {
   const pf = session.purchaseFlow;
   if (!pf || pf.state === 'idle') return null;
 
-  const product = session.products?.find(p => p.id === pf.productId);
+  const product = getLoadedProductById(session, pf.productId) || session.currentProduct;
   const lines = [
     `[ESTADO ATUAL DA COMPRA]`,
     `Produto em foco: ${pf.productName || 'desconhecido'}`,
@@ -153,7 +174,8 @@ function buildFsmContext(session) {
   ];
 
   if (pf.state === 'awaiting_size' && product?.sizes?.length) {
-    lines.push(`Tamanhos disponíveis: ${product.sizes.map((s, i) => `${i + 1}=${s}`).join(', ')}`);
+    const availableSizes = getAvailableSizesForSession(session, product);
+    lines.push(`Tamanhos disponíveis: ${availableSizes.map((s, i) => `${i + 1}=${s}`).join(', ')}`);
     lines.push(`→ O cliente precisa escolher UM tamanho. Se ele disser "G", "M", "P" etc., use [TAMANHO:G]. Se disser o número, use [TAMANHO:2].`);
   }
 
@@ -164,7 +186,7 @@ function buildFsmContext(session) {
 
   if (pf.state === 'awaiting_more_sizes') {
     lines.push(`Tamanhos já adicionados: ${pf.addedSizes?.join(', ') || 'nenhum'}`);
-    const remaining = product?.sizes?.filter(s => !pf.addedSizes?.includes(s)) || [];
+    const remaining = getAvailableSizesForSession(session, product, pf.addedSizes || []);
     if (remaining.length > 0) {
       lines.push(`Tamanhos ainda disponíveis: ${remaining.join(', ')}`);
     }
@@ -184,13 +206,14 @@ function buildFsmContext(session) {
   return lines.join('\n');
 }
 
-function buildAiContext(session) {
+function buildAiContext(session, extraBlocks = []) {
   const blocks = [conversationMemory.buildConversationContext(session)];
   const fsmContext = buildFsmContext(session);
   const catalogContext = woocommerce.buildCatalogContext(session);
 
   if (fsmContext) blocks.push(fsmContext);
   if (catalogContext) blocks.push(catalogContext);
+  if (Array.isArray(extraBlocks)) blocks.push(...extraBlocks);
 
   return blocks.filter(Boolean).join('\n\n');
 }
@@ -198,6 +221,43 @@ function buildAiContext(session) {
 function normalizeCategorySlug(slug) {
   if (!slug) return null;
   return SLUG_MAP[slug.toLowerCase()] || slug.toLowerCase();
+}
+
+function clearSupportMode(session, reason = 'unknown') {
+  if (!session?.supportMode) return;
+  logger.info({ supportMode: session.supportMode, reason }, '[SupportMode] Clearing support mode');
+  session.supportMode = null;
+}
+
+function isShoppingResumeIntent(analysis) {
+  if (!analysis) return false;
+  return Boolean(
+    analysis.wantsBrowse
+    || analysis.wantsLaunches
+    || analysis.wantsMoreProducts
+    || analysis.wantsProductSelection
+    || analysis.wantsCheckout
+    || analysis.wantsPhotosExplicit
+    || analysis.wantsSize
+    || analysis.wantsQuantity
+    || analysis.categories?.length > 0
+  );
+}
+
+async function cancelCurrentFlow(phone, session, userText = null) {
+  if (session.purchaseFlow) {
+    session.purchaseFlow.buyQueue = [];
+  }
+  resetPurchaseFlow(session);
+  clearSupportMode(session, 'cancel_current_flow');
+
+  if (userText) {
+    appendHistory(session, 'user', userText);
+    conversationMemory.refreshConversationMemory(session, { userText });
+  }
+
+  await zapi.sendText(phone, 'Sem problemas! 😊 O que você gostaria de fazer agora?');
+  await sendCategoryMenu(phone, 'Quer ver alguma linha específica?');
 }
 
 async function getSession(phone) {
@@ -216,17 +276,20 @@ async function getSession(phone) {
           currentProduct:  stored.current_product  || null,
           customerName:    stored.customer_name    || null,
           currentCategory: normalizeCategorySlug(stored.current_category) || null,
-          activeCategory:  normalizeCategorySlug(stored.current_category) || null,
+          activeCategory:  normalizeCategorySlug(stored.active_category || stored.current_category) || null,
           currentPage:     stored.current_page     || 0,
           totalPages:      stored.total_pages      || 1,
           totalProducts:   stored.total_products   || 0,
           lastViewedProduct: stored.last_viewed_product || null,
           lastViewedProductIndex: stored.last_viewed_product_index || null,
+          handoffDone: storedPurchaseFlow?.handoffDone || false,
           purchaseFlow: storedPurchaseFlow
             ? { ...defaultPurchaseFlow, ...storedPurchaseFlow, addedSizes: storedPurchaseFlow.addedSizes || [], buyQueue: storedPurchaseFlow.buyQueue || [] }
             : defaultPurchaseFlow,
           conversationMemory: storedConversationMemory || conversationMemory.createDefaultConversationMemory(),
           messageProductMap: stored.message_product_map || {},
+          supportMode:     stored.support_mode || null,
+          cartNotified:    stored.cart_notified || false,
           previousLastActivity: stored.last_activity || null,
           lastActivity:    Date.now(),
         }
@@ -237,9 +300,12 @@ async function getSession(phone) {
           currentPage: 0, totalPages: 1, totalProducts: 0,
           lastViewedProduct: null,
           lastViewedProductIndex: null,
+          handoffDone: false,
           purchaseFlow: defaultPurchaseFlow,
           conversationMemory: conversationMemory.createDefaultConversationMemory(),
           messageProductMap: {},
+          supportMode: null,
+          cartNotified: false,
           previousLastActivity: null,
           lastActivity: Date.now(),
         };
@@ -282,9 +348,10 @@ setInterval(async () => {
       (now - session.lastActivity) > CART_ABANDON_MS
     ) {
       try {
-        await zapi.sendText(
+        await sendCartOptions(
           phone,
-          'Oii! Vi que você deixou alguns itens no carrinho 🛒 Quer ajuda para finalizar o pedido ou quer ver mais novidades?'
+          session,
+          'Oii! Vi que você deixou alguns itens no carrinho 🛒 Quer revisar, finalizar ou continuar vendo novidades?'
         );
         session.cartNotified = true;
         logger.info({ phone, items: session.items.length }, '[CartRecovery] Mensagem de recuperação enviada');
@@ -305,29 +372,30 @@ function extractTextFromEvent(event) {
     const listId = event.listResponseMessage?.selectedRowId;
     if (listId) {
       logger.info({ from: event.phone, listId }, '[ListResponse] Item selecionado');
-      if (listId === 'cat_feminina') return 'quero ver a linha feminina';
-      if (listId === 'cat_feminino_infantil') return 'quero ver a linha feminino infantil';
-      if (listId === 'cat_masculina') return 'quero ver a linha masculina';
-      if (listId === 'cat_masculino_infantil') return 'quero ver a linha masculino infantil';
-      if (listId === 'cat_lancamentos') return 'quero ver os lançamentos';
-      if (listId === 'btn_sim_mais') return 'SIM';
+      if (listId === 'cat_feminina') return 'CAT_FEMININO';
+      if (listId === 'cat_feminino_infantil') return 'CAT_FEMININOINFANTIL';
+      if (listId === 'cat_masculina') return 'CAT_MASCULINO';
+      if (listId === 'cat_masculino_infantil') return 'CAT_MASCULINOINFANTIL';
+      if (listId === 'cat_lancamentos') return 'CAT_LANCAMENTOS';
       if (listId === 'btn_ver_todos') return 'VER_TODOS_CATEGORIA';
-      if (listId === 'cart_view') return 'quero ver meu carrinho';
-      if (listId === 'cart_finalize') return 'quero finalizar o pedido';
+      if (listId === 'cart_view') return 'CART_VIEW';
+      if (listId === 'cart_finalize') return 'CART_FINALIZE';
+      if (listId === 'cart_other_category') return 'VER_OUTRA_CATEGORIA';
       // Sentinela determinístico — evita colisão com detector de fotos ("ver mais").
       // Interceptado no webhook e roteado direto para navegação/catálogo.
       if (listId === 'cart_more_products') return 'VER_MAIS_PRODUTOS';
-      if (listId === 'falar_atendente') return 'quero falar com um atendente';
+      if (listId === 'falar_atendente') return 'FALAR_ATENDENTE';
       return listId;
     }
 
     // Intercepta botões da Z-API e trata como texto transparente para a IA
     if (event.type === 'button_reply' && event.buttonReply?.id) {
-       if (event.buttonReply.id === 'btn_sim_mais') return 'SIM';
        if (event.buttonReply.id === 'btn_outra_cat') return 'OUTRA CATEGORIA';
-       if (event.buttonReply.id === 'cart_view') return 'quero ver meu carrinho';
-       if (event.buttonReply.id === 'cart_finalize') return 'quero finalizar o pedido';
+       if (event.buttonReply.id === 'cart_view') return 'CART_VIEW';
+       if (event.buttonReply.id === 'cart_finalize') return 'CART_FINALIZE';
+       if (event.buttonReply.id === 'cart_other_category') return 'VER_OUTRA_CATEGORIA';
        if (event.buttonReply.id === 'cart_more_products') return 'VER_MAIS_PRODUTOS';
+       if (event.buttonReply.id === 'falar_atendente') return 'FALAR_ATENDENTE';
        return event.buttonReply.id;
     }
 
@@ -344,6 +412,14 @@ function extractTextFromEvent(event) {
   } catch (err) {
     return '';
   }
+}
+
+function extractAudioUrl(event) {
+  return event?.audio?.audioUrl
+    || event?.audio?.url
+    || event?.audioUrl
+    || event?.message?.audioUrl
+    || null;
 }
 
 // ── Webhook ───────────────────────────────────────────────────────────────
@@ -376,8 +452,27 @@ app.post('/webhook', async (req, res) => {
     }
     // ─────────────────────────────────────────────────────────────────────
 
-    const text = extractTextFromEvent(body);
+    let text = extractTextFromEvent(body);
     if (!text) return;
+
+    if (/^\[.*udio_STT\]$/i.test(text)) {
+      const audioUrl = extractAudioUrl(body);
+      logger.info({ from, hasAudioUrl: Boolean(audioUrl) }, '[Intercept] Áudio recebido — iniciando STT');
+      const transcription = await stt.transcribe(audioUrl);
+      if (!transcription) {
+        await zapi.replyText(from, 'Puts amada, não consegui entender o áudio direitinho 😅. Consegue me mandar em texto rapidinho?', messageId);
+        return;
+      }
+      text = transcription.trim();
+      logger.info({ from, transcriptionPreview: text.slice(0, 80) }, '[Intercept] Áudio transcrito com sucesso');
+      if (session.purchaseFlow?.state !== 'idle') {
+        logger.info({
+          from,
+          transcription: text.slice(0, 80),
+          fsmState: session.purchaseFlow.state,
+        }, '[STT] Áudio transcrito durante FSM ativa');
+      }
+    }
 
     if (text === '[Áudio]') {
       logger.info({ from }, '[Intercept] Áudio recebido — fallback humano');
@@ -399,21 +494,62 @@ app.post('/webhook', async (req, res) => {
       ? Date.now() - session.previousLastActivity
       : 0;
 
-    // Guard: "finalizar pedido" via lista/botão vai pro handleQueueGuard, não pra IA
-    if (text === 'quero finalizar o pedido') {
-      const intercepted = await handleQueueGuard(from, 'cart_finalize', session);
-      if (intercepted) {
-        persistSession(from);
-        return;
-      }
-      // Sem fila pendente → desce para IA que emitirá [HANDOFF]
+    // Rotas determinísticas de carrinho
+    if (text === 'CART_VIEW') {
+      logger.info({ from }, '[Intercept] Visualização de carrinho');
+      await showCart(from, session);
+      persistSession(from);
+      return;
     }
 
-    if (/(limpar|esvaziar|zerar).*(carrinho)|carrinho.*(limpar|esvaziar|zerar)/i.test(text)) {
-      logger.info({ from, text }, '[Cart] Comando direto para limpar carrinho');
+    if (text === 'CART_FINALIZE') {
+      logger.info({ from }, '[Intercept] Finalização de carrinho determinística');
+      const intercepted = await handleQueueGuard(from, 'cart_finalize', session);
+      if (!intercepted) {
+        await handoffToConsultant(from, session);
+      }
+      persistSession(from);
+      return;
+    }
+
+    if (text === 'FALAR_ATENDENTE') {
+      logger.info({ from }, '[Intercept] Encaminhamento humano determinístico');
+      await handoffToHuman(from, session);
+      persistSession(from);
+      return;
+    }
+
+    // Sprint 1 — Interceptor global: limpeza de carrinho com linguagem natural
+    const semanticQuick = semantic.analyzeUserMessage(text);
+    if (semanticQuick.wantsClearCart) {
+      logger.info({ from, text: text.slice(0, 80) }, '[Intercept] Limpeza de carrinho via semântica');
       await clearCart(from, session);
       persistSession(from);
       return;
+    }
+
+    // Sprint 1 — Interceptor global: handoff humano com linguagem natural
+    if (semanticQuick.wantsHuman) {
+      logger.info({ from, text: text.slice(0, 80) }, '[Intercept] Handoff humano via semântica');
+      await handoffToHuman(from, session);
+      persistSession(from);
+      return;
+    }
+
+    // Sprint 1 — Interceptor global: cancelar fluxo com linguagem natural
+    if (semanticQuick.wantsCancelFlow && session.purchaseFlow?.state !== 'idle') {
+      logger.info({ from, text: text.slice(0, 80), state: session.purchaseFlow.state }, '[Intercept] Cancelamento de fluxo via semântica');
+      await cancelCurrentFlow(from, session, text);
+      persistSession(from);
+      return;
+    }
+
+    // Sprint 1 — Limpa supportMode quando o cliente retoma a conversa com intenção de compra
+    if (session.supportMode === 'human_pending') {
+      if (isShoppingResumeIntent(semanticQuick)) {
+        logger.info({ from }, '[SupportMode] Cliente retomou interesse de compra — saindo de human_pending');
+        clearSupportMode(session, 'shopping_resumed');
+      }
     }
 
     // Intercept: botão "Ver Mais Produtos" — roteado ANTES de qualquer detector semântico.
@@ -432,6 +568,29 @@ app.post('/webhook', async (req, res) => {
       return;
     }
 
+    if (text === 'VER_OUTRA_CATEGORIA' || text === 'OUTRA CATEGORIA') {
+      logger.info({ phone: from, currentCategory: session.activeCategory, cartItems: session.items?.length || 0 }, '[Intercept] VER_OUTRA_CATEGORIA — seletor de coleções');
+      await sendCategoryMenu(from, session.items?.length > 0
+        ? 'Claro 😊 Seu carrinho continua salvo. Qual outra linha você quer ver agora?'
+        : 'Claro 😊 Qual linha você quer ver agora?');
+      persistSession(from);
+      return;
+    }
+
+    // ── Seleção determinística de categoria (menu de listas) ──────────────────
+    // Seleções de menu NÃO passam pela IA — roteamento direto por sentinela.
+    // Evita que a IA re-interprete a categoria e gere o slug errado.
+    if (CAT_SENTINELS[text]) {
+      const slug = CAT_SENTINELS[text];
+      logger.info({ phone: from, sentinel: text, slug }, '[Intercept] Seleção de categoria determinística');
+      appendHistory(session, 'user', `quero ver a linha ${getCategoryDisplayName(slug)}`);
+      conversationMemory.refreshConversationMemory(session, { userText: text });
+      await showAllCategory(from, slug, session);
+      persistSession(from);
+      return;
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
     // Fallback: cliente digitou quantidade manualmente durante awaiting_quantity.
     // Só aceita quantidade pura (ex: "3", "12", "3 peças", "quero 3") — rejeita
     // textos com letras de tamanho (ex: "9P 5M 3G") para não roubar grades do
@@ -449,6 +608,19 @@ app.post('/webhook', async (req, res) => {
         }
       } else {
         logger.info({ from, text: trimmed.slice(0, 60) }, '[FSM] Texto não é quantidade pura — passando adiante (grade parser / IA)');
+      }
+    }
+
+    // ── Escape hatch: intenção de navegação durante FSM ativa ────────────────
+    // Se o cliente claramente quer navegar para outros produtos/categorias
+    // durante awaiting_size ou awaiting_quantity, reseta o estado para idle
+    // para que buildFsmContext retorne null e a IA possa responder livremente.
+    {
+      const NAV_ESCAPE = /\b(outras?\s+op[çc][õo]es?|outras?\s+categor|ver\s+outra[s]?\s+|n[aã]o\s+quero\s+mais|desistir|cancelar|voltar)\b/i;
+      const pf = session.purchaseFlow;
+      if (pf?.state !== 'idle' && NAV_ESCAPE.test(text)) {
+        logger.info({ from, state: pf.state, text: text.slice(0, 60) }, '[FSM] Navigation escape — resetting to idle');
+        pf.state = 'idle';
       }
     }
 
@@ -480,10 +652,12 @@ app.post('/webhook', async (req, res) => {
         }
       }
 
-      const focusedProduct = session.products?.find(p => p.id === pfGrade.productId);
+      const focusedProduct = await ensureProductStockData(session.products?.find(p => p.id === pfGrade.productId));
 
       if (focusedProduct?.sizes?.length) {
-        const grade = parseGradeText(text, focusedProduct.sizes);
+        const allSizes = buildSessionSizeDetails(session, focusedProduct).map(d => d.size);
+        const availableSizes = getAvailableSizesForSession(session, focusedProduct);
+        const grade = parseGradeText(text, allSizes);
 
         if (grade) {
           logger.info({ from, grade, product: pfGrade.productName }, '[Grade] Grade semântica detectada');
@@ -491,40 +665,100 @@ app.post('/webhook', async (req, res) => {
           conversationMemory.refreshConversationMemory(session, { userText: text });
 
           const unitPrice = parseFloat(focusedProduct.salePrice || focusedProduct.price);
-          const addedItems = [];
+          const addable = [];
+          const unavailable = [];
+          const unknown = [];
 
           for (const { size, qty } of grade) {
-            const validSize = focusedProduct.sizes.find(s => s.toUpperCase() === size);
-            if (!validSize) continue;
-            pushCartItem(session, focusedProduct.id, focusedProduct.name, validSize, qty, unitPrice, focusedProduct.imageUrl || null);
-            addedItems.push({ size: validSize, qty });
+            const upperSize = size.toUpperCase();
+            const matchedSize = allSizes.find(s => s.toUpperCase() === upperSize);
+
+            if (!matchedSize) {
+              unknown.push({ size, qty });
+              continue;
+            }
+
+            const availability = getSizeAvailability(session, focusedProduct, matchedSize);
+
+            if (availability?.isAvailable === false) {
+              unavailable.push({ size: matchedSize, qty, available: availability.availableQuantity || 0 });
+              continue;
+            }
+
+            if (availability && typeof availability.availableQuantity === 'number' && qty > availability.availableQuantity) {
+              unavailable.push({ size: matchedSize, qty, available: availability.availableQuantity });
+              continue;
+            }
+
+            addable.push({ size: matchedSize, qty });
+          }
+
+          logger.info({
+            from,
+            product: pfGrade.productName,
+            allSizes,
+            availableSizes,
+            gradeRequested: grade,
+            addable,
+            unavailable,
+            unknown,
+          }, '[Grade] Resultado do parsing com validação de estoque');
+
+          const addedItems = [];
+          for (const { size, qty } of addable) {
+            pushCartItem(session, focusedProduct.id, focusedProduct.name, size, qty, unitPrice, focusedProduct.imageUrl || null);
+            addedItems.push({ size, qty });
+          }
+
+          const parts = [];
+
+          if (addedItems.length > 0) {
+            const gradeLines = addedItems.map(({ size, qty }) =>
+              `• ${focusedProduct.name} (${size}) x${qty}`
+            ).join('\n');
+            const cartTotal = session.items.reduce((acc, it) => acc + parseFloat(it.price || 0), 0);
+            const { lineItems, totalPieces } = getCartStats(session);
+            parts.push(`✅ Grade separada!\n${gradeLines}\n\n🛒 Carrinho: ${totalPieces} ${totalPieces === 1 ? 'peça' : 'peças'} em ${lineItems} ${lineItems === 1 ? 'item' : 'itens'} — *${woocommerce.formatPrice(cartTotal)}*`);
+          }
+
+          if (unavailable.length > 0) {
+            const unavailLines = unavailable.map(({ size, qty, available }) =>
+              available > 0
+                ? `• ${size}: pediu ${qty}, só tem ${available} disponível`
+                : `• ${size}: indisponível no momento`
+            ).join('\n');
+            parts.push(`⚠️ Não consegui incluir:\n${unavailLines}`);
+          }
+
+          if (unknown.length > 0) {
+            const unknownList = unknown.map(u => u.size).join(', ');
+            const validList = allSizes.join(', ');
+            parts.push(`❓ Tamanho(s) *${unknownList}* não existe(m) neste produto. Disponíveis: *${validList}*`);
           }
 
           if (addedItems.length === 0) {
-            await zapi.sendText(from, `Hmm, não reconheci os tamanhos. Os disponíveis são: *${focusedProduct.sizes.join(', ')}* 😊`);
-            persistSession(from);
-            return;
+            parts.push(`Me manda as quantidades ajustadas ou escolhe pela lista abaixo 😊`);
           }
 
-          // Consolidated confirmation — single message for entire grade
-          const gradeLines = addedItems.map(({ size, qty }) =>
-            `• ${focusedProduct.name} (${size}) x${qty}`
-          ).join('\n');
-          const cartTotal = session.items.reduce((acc, it) => acc + parseFloat(it.price || 0), 0);
-          const { lineItems, totalPieces } = getCartStats(session);
-          const confirmMsg = `✅ Grade separada!\n${gradeLines}\n\n🛒 Carrinho: ${totalPieces} ${totalPieces === 1 ? 'peça' : 'peças'} em ${lineItems} ${lineItems === 1 ? 'item' : 'itens'} — *${woocommerce.formatPrice(cartTotal)}*`;
+          const confirmMsg = parts.join('\n\n');
 
           appendHistory(session, 'assistant', confirmMsg);
           conversationMemory.refreshConversationMemory(session, { assistantText: confirmMsg, action: { type: 'CARRINHO' } });
 
-          // Set FSM to awaiting_more_sizes for proper post-add menu
-          pfGrade.state = 'awaiting_more_sizes';
-          pfGrade.selectedSize = null;
-          if (!Array.isArray(pfGrade.addedSizes)) pfGrade.addedSizes = [];
-          session.currentProduct = focusedProduct;
-
-          const remainingSizes = focusedProduct.sizes.filter(s => !pfGrade.addedSizes.includes(s));
-          await sendPostAddMenu(from, session, remainingSizes, confirmMsg);
+          if (addedItems.length > 0) {
+            pfGrade.state = 'awaiting_more_sizes';
+            pfGrade.selectedSize = null;
+            if (!Array.isArray(pfGrade.addedSizes)) pfGrade.addedSizes = [];
+            session.currentProduct = focusedProduct;
+            const remainingSizes = getAvailableSizesForSession(session, focusedProduct, pfGrade.addedSizes || []);
+            await sendPostAddMenu(from, session, remainingSizes, confirmMsg);
+          } else {
+            pfGrade.state = 'awaiting_size';
+            pfGrade.interactiveVersion = Date.now();
+            session.currentProduct = focusedProduct;
+            await zapi.sendText(from, confirmMsg);
+            await sendStockAwareSizeList(from, session, focusedProduct, pfGrade.interactiveVersion, pfGrade.addedSizes || []);
+          }
           persistSession(from);
           return;
         }
@@ -539,76 +773,107 @@ app.post('/webhook', async (req, res) => {
     const pfCheck = session.purchaseFlow;
 
     // Comandos que sempre escapam o interceptor — a IA deve tratá-los
-    const FSM_ESCAPE = /limpar|esvaziar|cancelar|sair|parar|remov|carrinho|voltar|finaliz|ver cart|catálog|catalog|categoria|quero ver|não quero|nao quero|mudar|trocar|outro produto|outros produto/i;
-    const fsmEscaping = FSM_ESCAPE.test(text);
+    const fsmEscaping = Boolean(
+      semanticQuick.wantsClearCart
+      || semanticQuick.wantsHuman
+      || semanticQuick.wantsCancelFlow
+      || semanticQuick.wantsCart
+      || semanticQuick.wantsCheckout
+      || semanticQuick.wantsBrowse
+      || semanticQuick.wantsLaunches
+      || semanticQuick.wantsMoreProducts
+      || semanticQuick.wantsProductSearch
+      || semanticQuick.categories.length > 0
+    );
 
     if (!fsmEscaping && pfCheck.state === 'awaiting_size') {
-      const product = session.products?.find(p => p.id === pfCheck.productId);
+      const product = await ensureProductStockData(session.products?.find(p => p.id === pfCheck.productId));
       if (product) {
         const textUpper = text.trim().toUpperCase();
+        const availableSizes = getAvailableSizesForSession(session, product);
 
         // Direct match: text IS a size name → process immediately without AI roundtrip
-        const directSizeIdx = product.sizes.findIndex(s => s.toUpperCase().trim() === textUpper);
+        const directSizeIdx = availableSizes.findIndex(s => s.toUpperCase().trim() === textUpper);
         if (directSizeIdx >= 0) {
-          logger.info({ from, size: product.sizes[directSizeIdx] }, '[FSM] Tamanho digitado — processando direto');
+          logger.info({ from, size: availableSizes[directSizeIdx] }, '[FSM] Tamanho digitado — processando direto');
           const pf = session.purchaseFlow;
-          pf.selectedSize = product.sizes[directSizeIdx];
+          pf.selectedSize = availableSizes[directSizeIdx];
           pf.state = 'awaiting_quantity';
           pf.interactiveVersion = Date.now();
           appendHistory(session, 'user', text);
           conversationMemory.refreshConversationMemory(session, { userText: text });
-          await zapi.sendQuantityList(from, pf.selectedSize, pf.interactiveVersion);
+          await sendStockAwareQuantityList(from, session, pf.selectedSize, pf.interactiveVersion, product);
           persistSession(from);
           return;
         }
 
         // Direct match: text is a valid size index number
         const numericIdx = parseInt(textUpper, 10);
-        if (!isNaN(numericIdx) && numericIdx >= 1 && numericIdx <= product.sizes.length) {
-          logger.info({ from, sizeIdx: numericIdx, size: product.sizes[numericIdx - 1] }, '[FSM] Índice de tamanho digitado — processando direto');
+        if (!isNaN(numericIdx) && numericIdx >= 1 && numericIdx <= availableSizes.length) {
+          logger.info({ from, sizeIdx: numericIdx, size: availableSizes[numericIdx - 1] }, '[FSM] Índice de tamanho digitado — processando direto');
           const pf = session.purchaseFlow;
-          pf.selectedSize = product.sizes[numericIdx - 1];
+          pf.selectedSize = availableSizes[numericIdx - 1];
           pf.state = 'awaiting_quantity';
           pf.interactiveVersion = Date.now();
           appendHistory(session, 'user', text);
           conversationMemory.refreshConversationMemory(session, { userText: text });
-          await zapi.sendQuantityList(from, pf.selectedSize, pf.interactiveVersion);
+          await sendStockAwareQuantityList(from, session, pf.selectedSize, pf.interactiveVersion, product);
           persistSession(from);
           return;
         }
 
         // Text mentions a known size in natural language → let through to AI
         const words = textUpper.split(/\s+/);
-        const mentionsSize = product.sizes.some(s => words.includes(s.toUpperCase().trim()));
+        const mentionsSize = availableSizes.some(s => words.includes(s.toUpperCase().trim()));
+        const isPhotoRequestInSize = semantic.isLikelyPhotoRequest(text, { hasProductContext: true });
         if (mentionsSize) {
           logger.info({ from, text, state: pfCheck.state }, '[FSM] Texto menciona tamanho — passando para IA');
           // Falls through to AI processing below
+        } else if (isPhotoRequestInSize) {
+          logger.info({ from, text }, '[FSM] Pedido de foto em awaiting_size — passando para foto handler');
+          // Falls through to photo request handler below
         } else {
-          logger.info({ from, state: pfCheck.state }, '[FSM] Texto ambíguo em awaiting_size — re-enviando menu');
-          await zapi.sendText(from, `😊 Escolhe o tamanho de *${pfCheck.productName}* pelo botão abaixo!`);
-          await zapi.sendSizeList(from, product, pfCheck.interactiveVersion);
-          persistSession(from);
-          return;
+          const wordCount = text.trim().split(/\s+/).length;
+          if (wordCount <= 2) {
+            logger.info({ from, text, state: pfCheck.state }, '[FSM] Texto curto ambíguo em awaiting_size — re-enviando menu');
+            await zapi.sendText(from, `😊 Escolhe o tamanho de *${pfCheck.productName}* pelo botão abaixo!`);
+            await sendStockAwareSizeList(from, session, product, pfCheck.interactiveVersion);
+            persistSession(from);
+            return;
+          }
+          // Mensagem com 3+ palavras → provavelmente tem intenção real → passa para IA
+          logger.info({ from, text, wordCount, state: pfCheck.state }, '[FSM] Texto com intenção em awaiting_size — passando para IA');
+          // Falls through to AI processing below
         }
       }
     }
 
     if (!fsmEscaping && pfCheck.state === 'awaiting_more_sizes') {
-      const product = session.products?.find(p => p.id === pfCheck.productId);
-      const remainingSizes = product?.sizes?.filter(s => !pfCheck.addedSizes.includes(s)) ?? [];
+      const product = await ensureProductStockData(session.products?.find(p => p.id === pfCheck.productId));
+      const remainingSizes = getAvailableSizesForSession(session, product, pfCheck.addedSizes || []);
 
       // Check if text mentions a remaining size → let through to AI
       const textUpper = text.trim().toUpperCase();
       const words = textUpper.split(/\s+/);
       const mentionsRemainingSize = remainingSizes.some(s => words.includes(s.toUpperCase().trim()));
+      const isPhotoRequestEarly = semantic.isLikelyPhotoRequest(text, { hasProductContext: true });
       if (mentionsRemainingSize) {
         logger.info({ from, text, state: pfCheck.state }, '[FSM] Texto menciona tamanho restante — passando para IA');
         // Falls through to AI processing below
+      } else if (isPhotoRequestEarly) {
+        logger.info({ from, text }, '[FSM] Pedido de foto em awaiting_more_sizes — passando para foto handler');
+        // Falls through to photo request handler below
       } else {
-        logger.info({ from, state: pfCheck.state }, '[FSM] Texto ambíguo em awaiting_more_sizes — re-enviando menu');
-        await sendPostAddMenu(from, session, remainingSizes);
-        persistSession(from);
-        return;
+        const wordCount = text.trim().split(/\s+/).length;
+        if (wordCount <= 2) {
+          logger.info({ from, text, state: pfCheck.state }, '[FSM] Texto curto ambíguo em awaiting_more_sizes — re-enviando menu');
+          await sendPostAddMenu(from, session, remainingSizes);
+          persistSession(from);
+          return;
+        }
+        // Mensagem com 3+ palavras → provavelmente tem intenção real → passa para IA
+        logger.info({ from, text, wordCount, state: pfCheck.state }, '[FSM] Texto com intenção em awaiting_more_sizes — passando para IA');
+        // Falls through to AI processing below
       }
     }
 
@@ -625,7 +890,8 @@ app.post('/webhook', async (req, res) => {
 
     // Se é a primeira mensagem ou uma saudação, reseta tudo para focar em lançamentos
     const fsmIsIdle = !session.purchaseFlow || session.purchaseFlow.state === 'idle';
-    if (fsmIsIdle && (session.history.length === 0 || (PURE_GREETING.test(text.trim()) && staleConversation))) {
+    const hasActiveCart = session.items?.length > 0;
+    if (fsmIsIdle && !hasActiveCart && (session.history.length === 0 || (PURE_GREETING.test(text.trim()) && staleConversation))) {
       logger.info({ phone: from, historyLen: session.history.length }, '[SessionReset] Forçando fluxo de lançamentos');
       
       session.history = [];
@@ -645,6 +911,7 @@ app.post('/webhook', async (req, res) => {
     // Extrai o número do produto da legenda citada — independe de bold/markdown do WhatsApp.
     // Formato esperado: "✨ 3. Nome..." ou "✨ *3. Nome...*" (com ou sem asteriscos)
     let quotedProductIdx = null;
+    let quotedProduct = null;
     let finalUserText = text;
 
     // ── Tentativa 0: referenceMessageId na raiz do body (Z-API button-list replies) ──
@@ -653,19 +920,16 @@ app.post('/webhook', async (req, res) => {
     if (!quotedProductIdx && body?.referenceMessageId && session.messageProductMap) {
       const mapped = session.messageProductMap[body.referenceMessageId];
       if (mapped) {
-        const productStillLoaded = session.products?.some(p => p.id === mapped.productId);
-        if (productStillLoaded) {
-          quotedProductIdx = mapped.productIdx;
-          // Reconstruir contexto da citação para a IA (quotedText virá null para button messages)
-          const prod = session.products.find(p => p.id === mapped.productId);
-          if (prod) {
-            const price = prod.salePrice
-              ? `R$ ${parseFloat(prod.salePrice).toFixed(2).replace('.', ',')}`
-              : `R$ ${parseFloat(prod.price).toFixed(2).replace('.', ',')}`;
-            finalUserText = `[O cliente citou a vitrine do produto "${prod.name}" (${price})]\n\nMensagem do cliente: "${text}"`;
-          }
+        quotedProduct = await resolveProductById(session, mapped.productId);
+        if (quotedProduct) {
+          const loadedIdx = session.products?.findIndex(p => String(p.id) === String(mapped.productId)) ?? -1;
+          quotedProductIdx = loadedIdx >= 0 ? loadedIdx + 1 : mapped.productIdx || null;
+          const price = quotedProduct.salePrice
+            ? `R$ ${parseFloat(quotedProduct.salePrice).toFixed(2).replace('.', ',')}`
+            : `R$ ${parseFloat(quotedProduct.price).toFixed(2).replace('.', ',')}`;
+          finalUserText = `[O cliente citou a vitrine do produto "${quotedProduct.name}" (${price})]\n\nMensagem do cliente: "${text}"`;
           logger.info(
-            { refMsgId: body.referenceMessageId, productId: mapped.productId, productIdx: mapped.productIdx },
+            { refMsgId: body.referenceMessageId, productId: mapped.productId, productIdx: quotedProductIdx },
             '[QuotedProduct] Resolvido via referenceMessageId (raiz) ✓'
           );
         }
@@ -715,17 +979,18 @@ app.post('/webhook', async (req, res) => {
       }
 
       // Tentativa 3 (messageProductMap): lookup pelo messageId do quotedMessage ou referenceMessageId
-      if (!extractedIdx && session.products?.length > 0 && session.messageProductMap) {
+      if (!extractedIdx && session.messageProductMap) {
         const mapMsgId = body.referenceMessageId          // ← NOVO: raiz do body
           || body.quotedMessage.messageId
           || body.quotedMessage.stanzaId
           || body.quotedMessage.id;
         if (mapMsgId && session.messageProductMap[mapMsgId]) {
           const mapped = session.messageProductMap[mapMsgId];
-          const productStillLoaded = session.products.some(p => p.id === mapped.productId);
-          if (productStillLoaded) {
-            extractedIdx = mapped.productIdx;
-            logger.info({ msgId: mapMsgId, productId: mapped.productId, productIdx: mapped.productIdx }, '[QuotedProduct] Resolvido via messageProductMap ✓');
+          quotedProduct = quotedProduct || await resolveProductById(session, mapped.productId);
+          if (quotedProduct) {
+            const loadedIdx = session.products?.findIndex(p => String(p.id) === String(mapped.productId)) ?? -1;
+            extractedIdx = loadedIdx >= 0 ? loadedIdx + 1 : mapped.productIdx || null;
+            logger.info({ msgId: mapMsgId, productId: mapped.productId, productIdx: extractedIdx }, '[QuotedProduct] Resolvido via messageProductMap ✓');
           }
         }
       }
@@ -783,6 +1048,7 @@ app.post('/webhook', async (req, res) => {
 
       if (extractedIdx) {
         quotedProductIdx = extractedIdx;
+        quotedProduct = quotedProduct || session.products?.[quotedProductIdx - 1] || null;
         logger.info({ productIdx: quotedProductIdx }, '[QuotedProduct] Identificado na legenda citada');
       } else if (body.quotedMessage) {
         // Auditoria consolidada: quando TODAS as estratégias falham, dumpa
@@ -810,9 +1076,11 @@ app.post('/webhook', async (req, res) => {
           (Date.now() - pf.lastClickedProductTimestamp) < PRODUCT_CONTEXT_TIMEOUT;
 
         if (isProductContextFresh && pf.lastClickedProductId) {
-          const product = session.products?.find(p => p.id === pf.lastClickedProductId);
+          const product = await resolveProductById(session, pf.lastClickedProductId);
           if (product) {
-            quotedProductIdx = session.products.indexOf(product) + 1;
+            const loadedIdx = session.products?.findIndex(p => String(p.id) === String(product.id)) ?? -1;
+            quotedProductIdx = loadedIdx >= 0 ? loadedIdx + 1 : null;
+            quotedProduct = product;
             logger.info(
               { productId: pf.lastClickedProductId, productName: pf.lastClickedProductName },
               '[QuotedProduct] Identificado via lastClickedProductId'
@@ -828,45 +1096,117 @@ app.post('/webhook', async (req, res) => {
     // ── Grade Semântica via Produto Citado (FSM idle + quote) ─────────────────
     // Quando o cliente cita uma vitrine e digita grade ("Quero 3M 6P dessa"),
     // o produto vem do quotedProductIdx — não requer FSM ativa.
-    if (quotedProductIdx && session.purchaseFlow?.state === 'idle') {
-      const quotedProduct = session.products?.[quotedProductIdx - 1];
-      if (quotedProduct?.sizes?.length) {
-        const gradeFromQuote = parseGradeText(text, quotedProduct.sizes);
+    const quotedProductRef = await ensureProductStockData(
+      quotedProduct || (quotedProductIdx ? session.products?.[quotedProductIdx - 1] : null)
+    );
+
+    if (quotedProductRef && session.purchaseFlow?.state === 'idle') {
+      if (quotedProductRef?.sizes?.length) {
+        const allSizesQuote = buildSessionSizeDetails(session, quotedProductRef).map(d => d.size);
+        const availableSizesQuote = getAvailableSizesForSession(session, quotedProductRef);
+        const gradeFromQuote = parseGradeText(text, allSizesQuote);
         if (gradeFromQuote) {
-          logger.info({ from, grade: gradeFromQuote, product: quotedProduct.name }, '[Grade] Grade via produto citado (FSM idle)');
+          logger.info({ from, grade: gradeFromQuote, product: quotedProductRef.name }, '[Grade] Grade via produto citado (FSM idle)');
           const pf = session.purchaseFlow;
-          const unitPrice = parseFloat(quotedProduct.salePrice || quotedProduct.price);
-          pf.productId = quotedProduct.id;
-          pf.productName = quotedProduct.name;
+          const unitPrice = parseFloat(quotedProductRef.salePrice || quotedProductRef.price);
+          pf.productId = quotedProductRef.id;
+          pf.productName = quotedProductRef.name;
           pf.unitPrice = unitPrice;
 
-          const addedItems = [];
+          const addableQuote = [];
+          const unavailableQuote = [];
+          const unknownQuote = [];
+
           for (const { size, qty } of gradeFromQuote) {
-            const validSize = quotedProduct.sizes.find(s => s.toUpperCase() === size);
-            if (!validSize) continue;
-            pushCartItem(session, quotedProduct.id, quotedProduct.name, validSize, qty, unitPrice, quotedProduct.imageUrl || null);
-            addedItems.push({ size: validSize, qty });
+            const upperSize = size.toUpperCase();
+            const matchedSize = allSizesQuote.find(s => s.toUpperCase() === upperSize);
+
+            if (!matchedSize) {
+              unknownQuote.push({ size, qty });
+              continue;
+            }
+
+            const availability = getSizeAvailability(session, quotedProductRef, matchedSize);
+
+            if (availability?.isAvailable === false) {
+              unavailableQuote.push({ size: matchedSize, qty, available: availability.availableQuantity || 0 });
+              continue;
+            }
+
+            if (availability && typeof availability.availableQuantity === 'number' && qty > availability.availableQuantity) {
+              unavailableQuote.push({ size: matchedSize, qty, available: availability.availableQuantity });
+              continue;
+            }
+
+            addableQuote.push({ size: matchedSize, qty });
           }
 
+          logger.info({
+            from,
+            product: quotedProductRef.name,
+            allSizes: allSizesQuote,
+            availableSizes: availableSizesQuote,
+            gradeRequested: gradeFromQuote,
+            addable: addableQuote,
+            unavailable: unavailableQuote,
+            unknown: unknownQuote,
+          }, '[Grade] Resultado do parsing (produto citado) com validação de estoque');
+
+          const addedItems = [];
+          for (const { size, qty } of addableQuote) {
+            pushCartItem(session, quotedProductRef.id, quotedProductRef.name, size, qty, unitPrice, quotedProductRef.imageUrl || null);
+            addedItems.push({ size, qty });
+          }
+
+          const parts = [];
+
           if (addedItems.length > 0) {
-            const gradeLines = addedItems.map(({ size, qty }) => `• ${quotedProduct.name} (${size}) x${qty}`).join('\n');
+            const gradeLines = addedItems.map(({ size, qty }) => `• ${quotedProductRef.name} (${size}) x${qty}`).join('\n');
             const cartTotal = session.items.reduce((acc, it) => acc + parseFloat(it.price || 0), 0);
             const { lineItems, totalPieces } = getCartStats(session);
-            const confirmMsg = `✅ Grade separada!\n${gradeLines}\n\n🛒 Carrinho: ${totalPieces} ${totalPieces === 1 ? 'peça' : 'peças'} em ${lineItems} ${lineItems === 1 ? 'item' : 'itens'} — *${woocommerce.formatPrice(cartTotal)}*`;
+            parts.push(`✅ Grade separada!\n${gradeLines}\n\n🛒 Carrinho: ${totalPieces} ${totalPieces === 1 ? 'peça' : 'peças'} em ${lineItems} ${lineItems === 1 ? 'item' : 'itens'} — *${woocommerce.formatPrice(cartTotal)}*`);
+          }
 
+          if (unavailableQuote.length > 0) {
+            const unavailLines = unavailableQuote.map(({ size, qty, available }) =>
+              available > 0
+                ? `• ${size}: pediu ${qty}, só tem ${available} disponível`
+                : `• ${size}: indisponível no momento`
+            ).join('\n');
+            parts.push(`⚠️ Não consegui incluir:\n${unavailLines}`);
+          }
+
+          if (unknownQuote.length > 0) {
+            const unknownList = unknownQuote.map(u => u.size).join(', ');
+            const validList = allSizesQuote.join(', ');
+            parts.push(`❓ Tamanho(s) *${unknownList}* não existe(m) neste produto. Disponíveis: *${validList}*`);
+          }
+
+          if (addedItems.length === 0) {
+            parts.push(`Me manda as quantidades ajustadas ou escolhe pela lista abaixo 😊`);
+          }
+
+          const confirmMsg = parts.join('\n\n');
+
+          appendHistory(session, 'assistant', confirmMsg);
+          conversationMemory.refreshConversationMemory(session, { assistantText: confirmMsg, action: { type: 'CARRINHO' } });
+
+          if (addedItems.length > 0) {
             pf.state = 'awaiting_more_sizes';
             pf.selectedSize = null;
             if (!Array.isArray(pf.addedSizes)) pf.addedSizes = [];
-            session.currentProduct = quotedProduct;
-
-            appendHistory(session, 'assistant', confirmMsg);
-            conversationMemory.refreshConversationMemory(session, { assistantText: confirmMsg, action: { type: 'CARRINHO' } });
-
-            const remainingSizes = quotedProduct.sizes.filter(s => !pf.addedSizes.includes(s));
+            session.currentProduct = quotedProductRef;
+            const remainingSizes = getAvailableSizesForSession(session, quotedProductRef, pf.addedSizes || []);
             await sendPostAddMenu(from, session, remainingSizes, confirmMsg);
-            persistSession(from);
-            return;
+          } else {
+            pf.state = 'awaiting_size';
+            pf.interactiveVersion = Date.now();
+            session.currentProduct = quotedProductRef;
+            await zapi.sendText(from, confirmMsg);
+            await sendStockAwareSizeList(from, session, quotedProductRef, pf.interactiveVersion, pf.addedSizes || []);
           }
+          persistSession(from);
+          return;
         }
       }
     }
@@ -877,7 +1217,11 @@ app.post('/webhook', async (req, res) => {
     // colidiam com navegação de catálogo ("Ver Mais Produtos").
     const IS_PHOTO_REQUEST = /\b(fotos?|imagens?|v[ií]deos?)\b/i.test(text);
 
-    if (IS_PHOTO_REQUEST && !quotedProductIdx && session.products?.length > 0) {
+    const semanticHint = semantic.buildSemanticContext(text, session);
+    const photoContextActive = Boolean(quotedProductIdx || session.lastViewedProduct || session.currentProduct);
+    const EFFECTIVE_PHOTO_REQUEST = IS_PHOTO_REQUEST || semantic.isLikelyPhotoRequest(text, { hasProductContext: photoContextActive });
+
+    if (EFFECTIVE_PHOTO_REQUEST && !quotedProductIdx && session.products?.length > 0) {
       const inlineNum = text.match(/\b(\d+)\b/);
       if (inlineNum) {
         const n = parseInt(inlineNum[1], 10);
@@ -891,9 +1235,10 @@ app.post('/webhook', async (req, res) => {
     // Se o cliente citou um produto (quotedProductIdx), qualquer mensagem curta ou pedido
     // de fotos/mais é tratado como solicitação de mais fotos daquele produto.
     const isShortMessage = text.trim().length <= 40;
-    if (quotedProductIdx && (IS_PHOTO_REQUEST || isShortMessage)) {
-      logger.info({ productIdx: quotedProductIdx }, '[Intercept] Pedido de fotos — resolvido em código');
-      await showProductPhotos(from, quotedProductIdx, session);
+    const photoProductRef = quotedProduct || (quotedProductIdx ? session.products?.[quotedProductIdx - 1] : null);
+    if (photoProductRef && (EFFECTIVE_PHOTO_REQUEST || isShortMessage)) {
+      logger.info({ productId: photoProductRef.id, productIdx: quotedProductIdx }, '[Intercept] Pedido de fotos — resolvido em código');
+      await showProductPhotos(from, quotedProductIdx || photoProductRef.id, session);
       persistSession(from);
       return;
     }
@@ -912,7 +1257,7 @@ app.post('/webhook', async (req, res) => {
     const quotedIsTrialArtifact = /CONTA EM TRIAL|MENSAGEM DE TESTE/i.test(quotedRaw);
     const hasQuotedMessage = !!body?.quotedMessage;
     const canUseLastViewedFallback = !hasQuotedMessage || quotedIsTrialArtifact;
-    if ((IS_PHOTO_REQUEST || (quotedHasImage && isShortMessage)) && !quotedProductIdx && canUseLastViewedFallback && session.lastViewedProduct) {
+    if ((EFFECTIVE_PHOTO_REQUEST || (quotedHasImage && isShortMessage)) && !quotedProductIdx && canUseLastViewedFallback && session.lastViewedProduct) {
       const idx = session.lastViewedProductIndex || 1;
       logger.info({ productIdx: idx, name: session.lastViewedProduct.name }, '[LastViewed] Usando último produto visto');
       await showProductPhotos(from, idx, session);
@@ -920,7 +1265,7 @@ app.post('/webhook', async (req, res) => {
       return;
     }
 
-    if (IS_PHOTO_REQUEST && session.products?.length > 0) {
+    if (EFFECTIVE_PHOTO_REQUEST && session.products?.length > 0) {
       const guide = 'Me diz o número da peça (tá no início da legenda de cada foto) e te mostro todas as imagens 😊';
       appendHistory(session, 'assistant', guide);
       conversationMemory.refreshConversationMemory(session, { assistantText: guide });
@@ -942,22 +1287,46 @@ app.post('/webhook', async (req, res) => {
       systemNudge = `[BOAS-VINDAS: Este é o início do atendimento. Dê uma saudação rápida e carinhosa, e NÃO faça perguntas sobre o que o lojista procura. O sistema vai disparar os lançamentos logo após sua fala por meio do token [VER_TODOS:lancamento-da-semana].]`;
     }
 
-    const promptContext = buildAiContext(session);
+    const promptContext = buildAiContext(session, [semanticHint]);
     let aiRaw = '';
     try {
       aiRaw = await ai.chat(session.history, promptContext, systemNudge);
     } catch (err) {
-      logger.error({ err: err.message }, '[AI] Falha na chamada do Gemini');
+      logger.error(
+        { err: err?.message || String(err), stack: err?.stack || null, isFirstContact, text },
+        '[AI] Falha na chamada do Gemini'
+      );
+
+      if (isFirstContact) {
+        const fallbackGreeting = 'Oii, amor 😊 Separa um instantinho que já vou te mostrar nossos lançamentos.';
+        appendHistory(session, 'assistant', fallbackGreeting);
+        conversationMemory.refreshConversationMemory(session, { assistantText: fallbackGreeting });
+        await zapi.sendText(from, fallbackGreeting);
+        await showAllCategory(from, 'lancamento-da-semana', session);
+        persistSession(from);
+        return;
+      }
+
       await zapi.sendText(from, 'Poxa, tive um pequeno problema aqui, mas já tô voltando! Pode repetir sua última mensagem? 😊');
       return;
     }
     logger.info({ phone: from, response: aiRaw }, '[AI] Response');
 
     let { cleanText, action } = ai.parseAction(aiRaw);
+    const semanticFallbackAction = semantic.inferActionFromSemantics(text, session);
+    if (!action && semanticFallbackAction) {
+      action = semanticFallbackAction;
+      logger.info({ actionType: action.type, payload: action.payload || null }, '[SemanticFallback] Acao inferida por sentido');
+    }
 
     // Mão de Ferro v3 — Se é primeiro contato ou o usuário pediu lançamentos/novidades, 
     // nós FORÇAMOS o catálogo e limpamos qualquer outra ação conflitante.
-    const requestedLancamentos = /lan[çc]amento|novidade|o que chegou/i.test(text);
+    const semanticAnalysis = semantic.analyzeUserMessage(text);
+    if (action?.type === 'HANDOFF' && semanticAnalysis.wantsHuman) {
+      action = { type: 'FALAR_ATENDENTE', payload: null };
+      logger.info('[SemanticGuard] HANDOFF convertido para FALAR_ATENDENTE');
+    }
+    const requestedLancamentos = semanticAnalysis.wantsLaunches;
     if (isFirstContact || requestedLancamentos) {
       logger.info({ isFirstContact, requestedLancamentos }, '[HardForce] Forçando catálogo de lançamentos');
       action = { type: 'VER_TODOS', payload: 'lancamento-da-semana' };
@@ -1060,6 +1429,11 @@ app.post('/webhook', async (req, res) => {
       await executeAction(from, action, session);
     }
 
+    if (!cleanText && !action) {
+      logger.warn({ from, originalText: text.slice(0, 120) }, '[Fallback] IA sem texto e sem ação — enviando recuperação contextual');
+      await sendContextualFallback(from, session);
+    }
+
     persistSession(from);
 
   } catch (error) {
@@ -1107,35 +1481,38 @@ async function executeAction(phone, action, session) {
     }
 
     case 'TAMANHO': {
-      const product = session.currentProduct || session.products?.find(p => p.id === session.purchaseFlow.productId);
+      const product = await ensureProductStockData(
+        session.currentProduct || session.products?.find(p => p.id === session.purchaseFlow.productId)
+      );
       if (!product) {
         await zapi.sendText(phone, '❌ Nenhum produto selecionado. Escolha um produto primeiro.');
         return;
       }
 
       // Resolve payload: can be index (e.g., "2") or size name (e.g., "G", "GG")
+      const availableSizes = getAvailableSizesForSession(session, product);
       let sizeIdx = -1;
       const numericIdx = parseInt(action.payload, 10);
-      if (!isNaN(numericIdx) && numericIdx >= 1 && product.sizes[numericIdx - 1]) {
+      if (!isNaN(numericIdx) && numericIdx >= 1 && availableSizes[numericIdx - 1]) {
         sizeIdx = numericIdx - 1;
       } else {
         const sizeName = String(action.payload).toUpperCase().trim();
-        sizeIdx = product.sizes.findIndex(s => s.toUpperCase().trim() === sizeName);
+        sizeIdx = availableSizes.findIndex(s => s.toUpperCase().trim() === sizeName);
       }
 
-      if (sizeIdx < 0 || !product.sizes[sizeIdx]) {
-        await zapi.sendText(phone, `❌ Tamanho "${action.payload}" não encontrado. Disponíveis: ${product.sizes.join(' | ')}`);
-        await zapi.sendSizeList(phone, product, session.purchaseFlow.interactiveVersion || Date.now());
+      if (sizeIdx < 0 || !availableSizes[sizeIdx]) {
+        await zapi.sendText(phone, `❌ Tamanho "${action.payload}" não encontrado. Disponíveis: ${availableSizes.join(' | ')}`);
+        await sendStockAwareSizeList(phone, session, product, session.purchaseFlow.interactiveVersion || Date.now());
         return;
       }
 
       session.purchaseFlow.productId = product.id;
       session.purchaseFlow.productName = product.name;
       session.purchaseFlow.price = parseFloat(product.salePrice || product.price);
-      session.purchaseFlow.selectedSize = product.sizes[sizeIdx];
+      session.purchaseFlow.selectedSize = availableSizes[sizeIdx];
       session.purchaseFlow.state = 'awaiting_quantity';
       session.purchaseFlow.interactiveVersion = Date.now();
-      await zapi.sendQuantityList(phone, session.purchaseFlow.selectedSize, session.purchaseFlow.interactiveVersion);
+      await sendStockAwareQuantityList(phone, session, session.purchaseFlow.selectedSize, session.purchaseFlow.interactiveVersion, product);
       break;
     }
 
@@ -1153,47 +1530,6 @@ async function executeAction(phone, action, session) {
       await addToCart(phone, qty, session);
       break;
     }
-    /* case '__LEGACY_TAMANHO_UNUSED__': {
-      const product = session.currentProduct || session.products?.find(p => p.id === session.purchaseFlow.productId);
-      if (!product) {
-        await zapi.sendText(phone, '❌ Nenhum produto selecionado. Escolha um produto primeiro.');
-        return;
-      }
-      const sizeIdx = parseInt(action.payload, 10) - 1;
-      if (isNaN(sizeIdx) || !product.sizes[sizeIdx]) {
-        await zapi.sendText(phone, `❌ Tamanho inválido. Escolha entre 1 e ${product.sizes.length}.`);
-        await zapi.sendSizeList(phone, product, session.purchaseFlow.interactiveVersion || Date.now());
-        return;
-      }
-      session.purchaseFlow.productId = product.id;
-      session.purchaseFlow.productName = product.name;
-        productId: product.id,
-        productName: product.name,
-        size,
-        price: product.salePrice || product.price,
-      });
-      session.currentProduct = null;
-      
-      const itemCount = session.items.length;
-      const cartTotal = session.items.reduce((acc, it) => acc + parseFloat(it.price), 0);
-      const nudge = `[SISTEMA: O item "${product.name}" tamanho ${size} foi adicionado ao carrinho. Carrinho: ${itemCount} itens, total ${woocommerce.formatPrice(cartTotal)}. Confirme de forma natural e pergunte se quer mais algo ou finalizar.]`;
-      appendHistory(session, 'system', nudge);
-      conversationMemory.refreshConversationMemory(session, { action: { type: 'SELECIONAR', payload: String(idx + 1) } });
-
-      try {
-        const aiRaw = await ai.chat(session.history, buildAiContext(session));
-        const { cleanText } = ai.parseAction(aiRaw);
-        const reply = cleanText || `✅ *${product.name}* (${size}) adicionado! Quer mais algo?`;
-        appendHistory(session, 'assistant', reply);
-        conversationMemory.refreshConversationMemory(session, { assistantText: reply });
-        await zapi.sendText(phone, reply);
-      } catch (err) {
-        await zapi.sendText(phone, `✅ *${product.name}* (${size}) adicionado!`);
-      }
-      break;
-    }
-
-    */
     case 'CARRINHO':
       await showCart(phone, session);
       break;
@@ -1216,18 +1552,19 @@ async function executeAction(phone, action, session) {
 
     case 'COMPRAR_DIRETO': {
       const { productIdx, size, qty } = action.payload || {};
-      const product = session.products?.[productIdx - 1];
+      const product = await ensureProductStockData(session.products?.[productIdx - 1]);
       if (!product) {
         await zapi.sendText(phone, `❌ Produto #${productIdx} não encontrado na lista atual.`);
         return;
       }
       // Valida se o tamanho solicitado existe
       const sizeNorm = String(size).toUpperCase().trim();
-      const matchedSize = product.sizes.find(s => s.toUpperCase().trim() === sizeNorm);
+      const availableSizes = getAvailableSizesForSession(session, product);
+      const matchedSize = availableSizes.find(s => s.toUpperCase().trim() === sizeNorm);
       if (!matchedSize) {
         let msg = `⚠️ Tamanho "${size}" não disponível para *${product.name}*.`;
-        if (product.sizes.length > 0) {
-          msg += `\nTamanhos disponíveis: ${product.sizes.join(' | ')}`;
+        if (availableSizes.length > 0) {
+          msg += `\nTamanhos disponíveis: ${availableSizes.join(' | ')}`;
         }
         await zapi.sendText(phone, msg);
         return;
@@ -1242,8 +1579,20 @@ async function executeAction(phone, action, session) {
       break;
     }
 
-    case 'HANDOFF':
-      await handoffToConsultant(phone, session);
+    case 'HANDOFF': {
+      const intercepted = await handleQueueGuard(phone, 'cart_finalize', session);
+      if (!intercepted) {
+        await handoffToConsultant(phone, session);
+      }
+      break;
+    }
+
+    case 'FALAR_ATENDENTE':
+      await handoffToHuman(phone, session);
+      break;
+
+    case 'CANCELAR_FLUXO':
+      await cancelCurrentFlow(phone, session);
       break;
   }
 }
@@ -1257,7 +1606,11 @@ async function sendLoadingMessage(phone, textFallback, ttsPhrase) {
       await zapi.sendAudio(phone, buffer, mimeType);
       return;
     } catch (err) {
-      logger.error({ err: err?.message || String(err) }, '[TTS] Fallback to text for loading msg');
+      logger.error({
+        err: err?.message || String(err),
+        stack: err?.stack,
+        ttsPhrase: ttsPhrase?.slice(0, 80),
+      }, '[TTS] Fallback to text — INVESTIGAR CAUSA (créditos, API key, formato de áudio)');
     }
   }
   await zapi.sendText(phone, textFallback);
@@ -1284,6 +1637,142 @@ function registerMessageProduct(session, zaapId, messageId, product) {
     mapSize: keys.length,
   }, '[MessageMap] Produto registrado');
 }
+
+function getLoadedProductById(session, productId) {
+  if (!productId) return null;
+
+  const normalizedId = String(productId);
+  return session.products?.find(p => String(p.id) === normalizedId)
+    || (session.currentProduct && String(session.currentProduct.id) === normalizedId ? session.currentProduct : null)
+    || (session.lastViewedProduct && String(session.lastViewedProduct.id) === normalizedId ? session.lastViewedProduct : null)
+    || null;
+}
+
+async function resolveProductById(session, productId) {
+  const loaded = getLoadedProductById(session, productId);
+  if (loaded) return loaded;
+
+  try {
+    const fetched = await woocommerce.getProductById(productId);
+    if (fetched) {
+      logger.info({ productId: fetched.id, productName: fetched.name }, '[ProductResolve] Produto resolvido fora da lista atual');
+    }
+    return fetched;
+  } catch (err) {
+    logger.error({ productId, err: err?.message || String(err) }, '[ProductResolve] Falha ao buscar produto por ID');
+    return null;
+  }
+}
+
+function normalizeSizeValue(size) {
+  return String(size || '').trim().toUpperCase();
+}
+
+function getReservedCartQuantity(session, productId, size) {
+  if (!Array.isArray(session?.items) || !productId || !size) return 0;
+
+  return session.items.reduce((acc, item) => {
+    const sameProduct = String(item.productId) === String(productId);
+    const sameSize = normalizeSizeValue(item.size) === normalizeSizeValue(size);
+    return sameProduct && sameSize ? acc + (parseInt(item.quantity, 10) || 0) : acc;
+  }, 0);
+}
+
+async function ensureProductStockData(product) {
+  if (!product) return null;
+  await woocommerce.enrichProductWithStock(product);
+  return product;
+}
+
+function buildSessionSizeDetails(session, product) {
+  if (!product) return [];
+
+  const baseDetails = Array.isArray(product.sizeDetails) && product.sizeDetails.length > 0
+    ? product.sizeDetails
+    : (product.sizes || []).map((size) => ({
+        size,
+        stockQuantity: null,
+        isAvailable: true,
+        stockLabel: 'Disponível',
+      }));
+
+  return baseDetails.map((detail) => {
+    const reservedQuantity = getReservedCartQuantity(session, product.id, detail.size);
+    if (typeof detail.stockQuantity !== 'number') {
+      return {
+        ...detail,
+        reservedQuantity,
+        availableQuantity: null,
+        stockLabel: detail.stockLabel || 'Disponível',
+      };
+    }
+
+    const availableQuantity = Math.max(detail.stockQuantity - reservedQuantity, 0);
+    return {
+      ...detail,
+      reservedQuantity,
+      availableQuantity,
+      isAvailable: availableQuantity > 0,
+      stockLabel: availableQuantity > 0 ? `Disponível: ${availableQuantity}` : 'Indisponível',
+    };
+  });
+}
+
+function getAvailableSizesForSession(session, product, excludeSizes = []) {
+  return buildSessionSizeDetails(session, product)
+    .filter((detail) => detail.isAvailable !== false)
+    .filter((detail) => !excludeSizes.includes(detail.size))
+    .map((detail) => detail.size);
+}
+
+function getSizeAvailability(session, product, size) {
+  return buildSessionSizeDetails(session, product).find(
+    (detail) => normalizeSizeValue(detail.size) === normalizeSizeValue(size)
+  ) || null;
+}
+
+async function sendStockAwareSizeList(phone, session, product, version, excludeSizes = []) {
+  const stockProduct = await ensureProductStockData(product);
+  if (!stockProduct) return;
+
+  const sizeDetails = buildSessionSizeDetails(session, stockProduct);
+  const productForList = {
+    ...stockProduct,
+    sizeDetails,
+    sizes: sizeDetails
+      .filter((detail) => detail.isAvailable !== false)
+      .map((detail) => detail.size),
+  };
+
+  await zapi.sendSizeList(phone, productForList, version, excludeSizes);
+}
+
+async function sendStockAwareQuantityList(phone, session, size, version, product = null) {
+  const stockProduct = await ensureProductStockData(
+    product || getLoadedProductById(session, session.purchaseFlow?.productId) || session.currentProduct
+  );
+  const availability = stockProduct ? getSizeAvailability(session, stockProduct, size) : null;
+  const availableQty = availability && typeof availability.availableQuantity === 'number'
+    ? availability.availableQuantity
+    : null;
+
+  if (availableQty !== null && availableQty < 1) {
+    await zapi.sendText(phone, `⚠️ O tamanho *${size}* ficou sem estoque agora. Vou te mostrar os tamanhos atualizados 😊`);
+    if (stockProduct) {
+      const nextVersion = Date.now();
+      if (session.purchaseFlow) {
+        session.purchaseFlow.selectedSize = null;
+        session.purchaseFlow.state = 'awaiting_size';
+        session.purchaseFlow.interactiveVersion = nextVersion;
+      }
+      await sendStockAwareSizeList(phone, session, stockProduct, nextVersion, session.purchaseFlow?.addedSizes || []);
+    }
+    return;
+  }
+
+  await zapi.sendQuantityList(phone, size, version, availableQty);
+}
+
 
 /**
  * Adiciona um item ao carrinho silenciosamente (sem mensagem, sem menu).
@@ -1318,40 +1807,63 @@ async function addToCart(phone, qty, session) {
 
   if (!pf.productId || !pf.selectedSize) {
     await zapi.sendText(phone, '❌ Nenhum produto/tamanho em foco. Escolha um produto primeiro.');
-    return;
+    return false;
+  }
+
+  const selectedSize = pf.selectedSize;
+  const productRef = await ensureProductStockData(
+    getLoadedProductById(session, pf.productId) || session.currentProduct || await resolveProductById(session, pf.productId)
+  );
+  const sizeAvailability = productRef ? getSizeAvailability(session, productRef, selectedSize) : null;
+
+  if (sizeAvailability?.isAvailable === false) {
+    pf.selectedSize = null;
+    pf.state = 'awaiting_size';
+    pf.interactiveVersion = Date.now();
+    await zapi.sendText(phone, `⚠️ O tamanho *${selectedSize}* de *${pf.productName}* não está mais disponível agora. Vou te mostrar os tamanhos atualizados 😊`);
+    if (productRef) await sendStockAwareSizeList(phone, session, productRef, pf.interactiveVersion, pf.addedSizes || []);
+    return false;
+  }
+
+  if (sizeAvailability && typeof sizeAvailability.availableQuantity === 'number' && qty > sizeAvailability.availableQuantity) {
+    pf.interactiveVersion = Date.now();
+    await zapi.sendText(
+      phone,
+      `⚠️ No tamanho *${selectedSize}* de *${pf.productName}* eu tenho ${sizeAvailability.availableQuantity} ${sizeAvailability.availableQuantity === 1 ? 'peça disponível' : 'peças disponíveis'} no momento.`
+    );
+    await sendStockAwareQuantityList(phone, session, selectedSize, pf.interactiveVersion, productRef);
+    return false;
   }
 
   const unitPrice = pf.price || 0;
   const price = unitPrice * qty;
-
-  // Busca imageUrl do produto em foco (pode não estar em session.products se navegou de categoria)
-  const productRef = session.products?.find(p => p.id === pf.productId);
   const imageUrl = productRef?.imageUrl || null;
 
   session.items.push({
     productId: pf.productId,
     productName: pf.productName,
-    size: pf.selectedSize,
+    size: selectedSize,
     quantity: qty,
     unitPrice,
     price,
     imageUrl,
   });
+  session.handoffDone = false;
 
   if (!Array.isArray(pf.addedSizes)) pf.addedSizes = [];
-  if (!pf.addedSizes.includes(pf.selectedSize)) {
-    pf.addedSizes.push(pf.selectedSize);
+  if (!pf.addedSizes.includes(selectedSize)) {
+    pf.addedSizes.push(selectedSize);
   }
 
   const cartTotal = session.items.reduce((acc, it) => acc + parseFloat(it.price || 0), 0);
   const { lineItems, totalPieces } = getCartStats(session);
-  const confirmMsg = `✅ *${pf.productName}* (${pf.selectedSize}) x${qty} adicionado!\n\n🛒 Carrinho: ${totalPieces} ${totalPieces === 1 ? 'peça' : 'peças'} em ${lineItems} ${lineItems === 1 ? 'item' : 'itens'} — *${woocommerce.formatPrice(cartTotal)}*`;
+  const confirmMsg = `✅ *${pf.productName}* (${selectedSize}) x${qty} adicionado!\n\n🛒 Carrinho: ${totalPieces} ${totalPieces === 1 ? 'peça' : 'peças'} em ${lineItems} ${lineItems === 1 ? 'item' : 'itens'} — *${woocommerce.formatPrice(cartTotal)}*`;
 
   appendHistory(session, 'assistant', confirmMsg);
   conversationMemory.refreshConversationMemory(session, { assistantText: confirmMsg, action: { type: 'CARRINHO' } });
 
-  const product = session.products?.find(p => p.id === pf.productId);
-  const remainingSizes = product?.sizes?.filter(s => !pf.addedSizes.includes(s)) ?? [];
+  const product = productRef || getLoadedProductById(session, pf.productId) || session.currentProduct;
+  const remainingSizes = getAvailableSizesForSession(session, product, pf.addedSizes || []);
 
   pf.state = 'awaiting_more_sizes';
   pf.selectedSize = null;
@@ -1359,12 +1871,36 @@ async function addToCart(phone, qty, session) {
 
   logger.info({ phone, productId: pf.productId, qty, cartItems: session.items.length }, '[addToCart] Item adicionado');
 
-  // Se há próximo produto na fila e não há mais tamanhos, processa a fila automaticamente
   if (remainingSizes.length === 0 && pf.buyQueue?.length > 0) {
-    await sendPostAddMenu(phone, session, remainingSizes, confirmMsg);
+    logger.info({ phone }, '[addToCart] Auto-avançando fila pendente');
+    await zapi.sendText(phone, confirmMsg);
+    await processNextInQueue(phone, session);
   } else {
     await sendPostAddMenu(phone, session, remainingSizes, confirmMsg);
   }
+
+  return true;
+}
+
+/**
+ * Extrai o timestamp de versão do sufixo `_v{timestamp}` de um eventId interativo.
+ * Retorna o número ou null se não houver sufixo de versão.
+ */
+function extractEventVersion(eventId) {
+  const match = eventId.match(/_v(\d+)$/);
+  return match ? parseInt(match[1], 10) : null;
+}
+
+/**
+ * Retorna true se o evento veio de um menu desatualizado (versão menor que a sessão atual).
+ * Botões de menus antigos devem ser rejeitados para evitar efeitos colaterais.
+ */
+function isStaleEvent(eventId, session) {
+  const eventVersion = extractEventVersion(eventId);
+  if (eventVersion === null) return false;
+  const sessionVersion = session.purchaseFlow?.interactiveVersion;
+  if (!sessionVersion) return false;
+  return eventVersion < sessionVersion;
 }
 
 /**
@@ -1419,13 +1955,20 @@ async function handleQueueGuard(phone, eventId, session) {
 async function handlePurchaseFlowEvent(phone, eventId, session) {
   const pf = session.purchaseFlow;
 
+  // Opções do guard de fila chegam como cliques interativos e precisam ser
+  // tratadas antes da FSM principal.
+  if (eventId === 'queue_continue' || eventId === 'queue_finalize_anyway') {
+    await handleQueueGuard(phone, eventId, session);
+    return;
+  }
+
   // ── buy_{productId}_v{version} ─────────────────────────────────────────
   if (eventId.startsWith('buy_')) {
     const parts = eventId.split('_');        // ['buy', '422', 'v12345']
     const productIdStr = parts[1];
     const productId = parseInt(productIdStr, 10);
-    const product = session.products?.find(p => p.id === productId || String(p.id) === productIdStr);
-    // No fallback to lastViewedProduct — stale clicks must fail safely, not silently buy the wrong product.
+    const product = await resolveProductById(session, productId);
+    // No fallback to unrelated lastViewedProduct — old product cards are resolved by ID, not by current focus.
 
     if (!product) {
       await zapi.sendText(phone, '❌ Não consegui localizar esse produto. Me chama no catálogo que te mostro de novo 😊');
@@ -1437,14 +1980,14 @@ async function handlePurchaseFlowEvent(phone, eventId, session) {
       if (!Array.isArray(pf.buyQueue)) pf.buyQueue = [];
       const alreadyQueued = pf.buyQueue.some(q => q.productId === product.id);
       if (!alreadyQueued) {
-        pf.buyQueue.push({ productId: product.id, productName: product.name });
+        pf.buyQueue.push({ productId: product.id, productName: product.name, productSnapshot: product });
         logger.info({ phone, productId: product.id, queueLength: pf.buyQueue.length }, '[FSM] Produto enfileirado');
 
         // Resolve o produto atualmente em foco para calcular tamanhos restantes
-        const currentProduct = session.products?.find(p => p.id === pf.productId);
-        const remainingSizes = currentProduct?.sizes?.filter(s => !pf.addedSizes?.includes(s)) ?? [];
+        const currentProduct = await ensureProductStockData(getLoadedProductById(session, pf.productId) || session.currentProduct);
+        const remainingSizes = getAvailableSizesForSession(session, currentProduct, pf.addedSizes || []);
 
-        const queueMsg = `✅ *${product.name}* adicionado à fila! Termino o atual e já vamos pra ele 😊`;
+        const queueMsg = `✅ *${product.name}* adicionado à fila!`;
         await sendPostAddMenu(phone, session, remainingSizes, queueMsg);
       } else {
         await zapi.sendText(phone, `🙂 *${product.name}* já estava na fila, amor!`);
@@ -1462,6 +2005,13 @@ async function handlePurchaseFlowEvent(phone, eventId, session) {
 
   // ── size_{productId}_{size}_v{version} ────────────────────────────────
   if (eventId.startsWith('size_')) {
+    if (isStaleEvent(eventId, session)) {
+      const staleProd = await ensureProductStockData(getLoadedProductById(session, pf.productId) || session.currentProduct);
+      logger.info({ phone, eventId }, '[FSM] size_ expirado → reenviando menu de tamanhos');
+      await zapi.sendText(phone, '⏱️ Esse menu expirou! Enviando a lista de tamanhos atualizada...');
+      if (staleProd) await sendStockAwareSizeList(phone, session, staleProd, pf.interactiveVersion, pf.addedSizes || []);
+      return;
+    }
     // Formato: size_422_P_v1234567890  →  remove prefixo e sufixo de versão
     const withoutPrefix = eventId.slice('size_'.length);              // '422_P_v1234567890'
     const vIdx = withoutPrefix.lastIndexOf('_v');
@@ -1470,18 +2020,22 @@ async function handlePurchaseFlowEvent(phone, eventId, session) {
     const productIdStr = withoutVersion.slice(0, firstUnderscore);    // '422'
     const size = withoutVersion.slice(firstUnderscore + 1);           // 'P'
 
-    const product = session.products?.find(p => String(p.id) === productIdStr)
-                 || session.products?.find(p => p.id === pf.productId);
+    const product = await ensureProductStockData(
+      getLoadedProductById(session, productIdStr)
+      || getLoadedProductById(session, pf.productId)
+      || session.currentProduct
+    );
+    const availableSizes = getAvailableSizesForSession(session, product, pf.addedSizes || []);
 
     if (!product || !size) {
       await zapi.sendText(phone, '❌ Não consegui identificar o tamanho. Tenta de novo?');
-      if (product) await zapi.sendSizeList(phone, product, pf.interactiveVersion || Date.now(), pf.addedSizes || []);
+      if (product) await sendStockAwareSizeList(phone, session, product, pf.interactiveVersion || Date.now(), pf.addedSizes || []);
       return;
     }
 
-    if (!product.sizes.includes(size)) {
-      await zapi.sendText(phone, `❌ Tamanho "${size}" não disponível. Disponíveis: ${product.sizes.join(' | ')}`);
-      await zapi.sendSizeList(phone, product, pf.interactiveVersion || Date.now(), pf.addedSizes || []);
+    if (!availableSizes.includes(size)) {
+      await zapi.sendText(phone, `❌ Tamanho "${size}" não disponível. Disponíveis: ${availableSizes.join(' | ')}`);
+      await sendStockAwareSizeList(phone, session, product, pf.interactiveVersion || Date.now(), pf.addedSizes || []);
       return;
     }
 
@@ -1493,12 +2047,18 @@ async function handlePurchaseFlowEvent(phone, eventId, session) {
     pf.interactiveVersion = Date.now();
 
     logger.info({ phone, productId: product.id, size }, '[FSM] size_ → awaiting_quantity');
-    await zapi.sendQuantityList(phone, size, pf.interactiveVersion);
+    await sendStockAwareQuantityList(phone, session, size, pf.interactiveVersion, product);
     return;
   }
 
   // ── qty_{qty}_v{version} ──────────────────────────────────────────────
   if (eventId.startsWith('qty_')) {
+    if (isStaleEvent(eventId, session)) {
+      logger.info({ phone, eventId }, '[FSM] qty_ expirado → reenviando menu de quantidade');
+      await zapi.sendText(phone, '⏱️ Esse menu expirou! Enviando as opções de quantidade atualizadas...');
+      if (pf.selectedSize) await sendStockAwareQuantityList(phone, session, pf.selectedSize, pf.interactiveVersion);
+      return;
+    }
     // Formato: qty_3_v1234567890  →  extrai o número antes de '_v'
     const withoutPrefix = eventId.slice('qty_'.length);              // '3_v1234567890'
     const vIdx = withoutPrefix.indexOf('_v');
@@ -1507,7 +2067,7 @@ async function handlePurchaseFlowEvent(phone, eventId, session) {
 
     if (isNaN(qty) || qty < 1) {
       await zapi.sendText(phone, '❌ Quantidade inválida. Escolhe de novo?');
-      if (pf.selectedSize) await zapi.sendQuantityList(phone, pf.selectedSize, pf.interactiveVersion || Date.now());
+      if (pf.selectedSize) await sendStockAwareQuantityList(phone, session, pf.selectedSize, pf.interactiveVersion || Date.now());
       return;
     }
 
@@ -1518,7 +2078,15 @@ async function handlePurchaseFlowEvent(phone, eventId, session) {
 
   // ── add_size_v{version} ───────────────────────────────────────────────
   if (eventId.startsWith('add_size_')) {
-    const product = session.products?.find(p => p.id === pf.productId);
+    if (isStaleEvent(eventId, session)) {
+      const staleProd = await ensureProductStockData(getLoadedProductById(session, pf.productId) || session.currentProduct);
+      const staleRemaining = getAvailableSizesForSession(session, staleProd, pf.addedSizes || []);
+      logger.info({ phone, eventId }, '[FSM] add_size_ expirado → reenviando menu pós-adição');
+      await zapi.sendText(phone, '⏱️ Esse menu expirou! Enviando as opções atualizadas...');
+      await sendPostAddMenu(phone, session, staleRemaining);
+      return;
+    }
+    const product = await ensureProductStockData(getLoadedProductById(session, pf.productId) || session.currentProduct);
     if (!product) {
       await zapi.sendText(phone, '❌ Produto não encontrado. Vamos voltar ao catálogo?');
       return;
@@ -1530,12 +2098,20 @@ async function handlePurchaseFlowEvent(phone, eventId, session) {
     pf.interactiveVersion = Date.now();
 
     logger.info({ phone, productId: product.id, excludeSizes }, '[FSM] add_size_ → sendSizeList');
-    await zapi.sendSizeList(phone, product, pf.interactiveVersion, excludeSizes);
+    await sendStockAwareSizeList(phone, session, product, pf.interactiveVersion, excludeSizes);
     return;
   }
 
   // ── skip_more_v{version} ──────────────────────────────────────────────
   if (eventId.startsWith('skip_more_')) {
+    if (isStaleEvent(eventId, session)) {
+      const staleProd = await ensureProductStockData(getLoadedProductById(session, pf.productId) || session.currentProduct);
+      const staleRemaining = getAvailableSizesForSession(session, staleProd, pf.addedSizes || []);
+      logger.info({ phone, eventId }, '[FSM] skip_more_ expirado → reenviando menu pós-adição');
+      await zapi.sendText(phone, '⏱️ Esse menu expirou! Enviando as opções atualizadas...');
+      await sendPostAddMenu(phone, session, staleRemaining);
+      return;
+    }
     logger.info({ phone }, '[FSM] skip_more_ → processNextInQueue');
     const hadNext = await processNextInQueue(phone, session);
     if (!hadNext) {
@@ -1561,7 +2137,7 @@ async function processNextInQueue(phone, session) {
   if (!pf.buyQueue || pf.buyQueue.length === 0) return false;
 
   const next = pf.buyQueue.shift();
-  const product = session.products?.find(p => p.id === next.productId);
+  const product = await ensureProductStockData(next.productSnapshot || await resolveProductById(session, next.productId));
 
   if (!product) {
     logger.warn({ phone, productId: next.productId }, '[FSM] Produto da fila não encontrado, pulando');
@@ -1571,10 +2147,10 @@ async function processNextInQueue(phone, session) {
 
   const remaining = pf.buyQueue.length;
   const queueMsg = remaining > 0
-    ? `\n📋 Ainda ${remaining === 1 ? 'tem 1 peça' : `tem ${remaining} peças`} na fila!`
+    ? `\n📋 *Ainda na fila:* ${remaining === 1 ? 'mais 1 produto aguardando' : `mais ${remaining} produtos aguardando`}`
     : '';
 
-  await zapi.sendText(phone, `Agora vamos para *${product.name}*! 😊${queueMsg}`);
+  await zapi.sendText(phone, `🎯 *Produto atual:* ${product.name}\nVamos continuar por ele agora 😊${queueMsg}`);
 
   pf.state = 'awaiting_size';
   pf.productId = product.id;
@@ -1588,7 +2164,7 @@ async function processNextInQueue(phone, session) {
   pf.lastClickedProductTimestamp = Date.now();
 
   logger.info({ phone, productId: product.id, queueRemaining: remaining }, '[FSM] Processando próximo da fila');
-  await zapi.sendSizeList(phone, product, pf.interactiveVersion);
+  await sendStockAwareSizeList(phone, session, product, pf.interactiveVersion);
   return true;
 }
 
@@ -1651,14 +2227,61 @@ async function clearCart(phone, session) {
     session.purchaseFlow.buyQueue = [];
   }
   resetPurchaseFlow(session);
+  clearSupportMode(session, 'cart_cleared');
   logger.info({ phone }, '[Cart] Carrinho limpo');
   await zapi.sendText(phone, '🗑️ Carrinho esvaziado! Quer escolher outros produtos?');
   await sendCategoryMenu(phone, 'Qual linha você quer ver agora? 😊');
 }
 
+async function sendContextualFallback(phone, session) {
+  // Sprint 1 — Não reenvia menus automaticamente após handoff humano
+  if (session.supportMode === 'human_pending') {
+    logger.info({ phone }, '[Fallback] supportMode=human_pending — suprimindo menu automático');
+    await zapi.sendText(phone, 'Nossa consultora já vai te atender! Qualquer coisa é só chamar 😊');
+    return;
+  }
+
+  const pf = session.purchaseFlow || createDefaultPurchaseFlow();
+
+  if (pf.state === 'awaiting_size' && pf.productId) {
+    const product = await ensureProductStockData(getLoadedProductById(session, pf.productId) || session.currentProduct);
+    if (product) {
+      await zapi.sendText(phone, `Me confirma o tamanho de *${product.name}* por aqui 😊`);
+      await sendStockAwareSizeList(phone, session, product, pf.interactiveVersion || Date.now(), pf.addedSizes || []);
+      return;
+    }
+  }
+
+  if (pf.state === 'awaiting_quantity' && pf.selectedSize) {
+    await zapi.sendText(phone, `Me diz quantas peças você quer no tamanho *${pf.selectedSize}* 😊`);
+    await sendStockAwareQuantityList(phone, session, pf.selectedSize, pf.interactiveVersion || Date.now());
+    return;
+  }
+
+  if (pf.state === 'awaiting_more_sizes' && pf.productId) {
+    const product = await ensureProductStockData(getLoadedProductById(session, pf.productId) || session.currentProduct);
+    const remainingSizes = getAvailableSizesForSession(session, product, pf.addedSizes || []);
+    await sendPostAddMenu(phone, session, remainingSizes, 'Me confirma aqui como você quer seguir 😊');
+    return;
+  }
+
+  if (session.items?.length > 0) {
+    await sendCartOptions(phone, session, 'Me confirma por aqui se você quer revisar o carrinho, continuar nesta linha, ver outra categoria ou finalizar 😊');
+    return;
+  }
+
+  // Sprint 1 — Fallback mais inteligente: se tem catálogo ativo, oferece continuar
+  if (session.products?.length > 0 && session.activeCategory) {
+    await sendCatalogBrowseOptions(phone, session, 'Não entendi direito 😅 Você quer que eu continue nesta linha ou prefere ver outra categoria?');
+    return;
+  }
+
+  await sendCategoryMenu(phone, 'Me diz qual linha você quer ver que eu te mostro agora 😊');
+}
+
 async function showCart(phone, session) {
   if (!session.items || session.items.length === 0) {
-    await zapi.sendText(phone, '🛒 Seu carrinho está vazio por enquanto. Quer dar uma olhadinha no catálogo?');
+    await sendCategoryMenu(phone, '🛒 Seu carrinho está vazio por enquanto. Qual linha você quer ver agora?');
     return;
   }
   const { summary } = buildCartSummary(session);
@@ -1667,14 +2290,51 @@ async function showCart(phone, session) {
 
 async function sendCartOptions(phone, session, text = 'O que você prefere fazer agora?') {
   const itemLabel = `${session.items.length} ${session.items.length === 1 ? 'item' : 'itens'}`;
+  const categoryLabel = session.activeCategory
+    ? `Trocar de ${session.activeCategory.replace(/-/g, ' ')}`
+    : 'Escolher outra linha';
   const options = [
     { id: 'cart_finalize', title: 'Finalizar Pedido', description: 'Encaminhar para fechamento' },
     { id: 'cart_view', title: 'Ver Carrinho', description: itemLabel },
-    { id: 'cart_more_products', title: 'Ver Mais Produtos', description: 'Continuar comprando' },
+    { id: 'cart_more_products', title: 'Ver Mais Produtos', description: session.activeCategory ? 'Continuar nesta linha' : 'Continuar comprando' },
+    { id: 'cart_other_category', title: 'Ver Outra Categoria', description: categoryLabel },
     { id: 'falar_atendente', title: 'Falar com Humano', description: 'Tirar dúvidas agora' },
   ];
 
   await zapi.sendOptionList(phone, text, 'Próximo Passo', 'Escolher', options);
+}
+
+async function sendCatalogBrowseOptions(phone, session, text = 'O que você prefere fazer agora?') {
+  const currentLineLabel = session.activeCategory
+    ? `Mais de ${session.activeCategory.replace(/-/g, ' ')}`
+    : 'Continuar vendo peças';
+  const options = [
+    { id: 'cart_more_products', title: 'Ver Mais Produtos', description: currentLineLabel },
+    { id: 'cart_other_category', title: 'Ver Outra Categoria', description: 'Trocar de linha agora' },
+    { id: 'falar_atendente', title: 'Falar com Humano', description: 'Tirar dúvidas agora' },
+  ];
+
+  await zapi.sendOptionList(phone, text, 'Próximo Passo', 'Escolher', options);
+}
+
+function buildPurchaseFlowFocusLines(session) {
+  const pf = session.purchaseFlow || createDefaultPurchaseFlow();
+  const queueLength = pf.buyQueue?.length || 0;
+  const lines = [];
+
+  if (pf.productName) {
+    lines.push(`🎯 *Produto atual:* ${pf.productName}`);
+  }
+
+  if (queueLength > 0) {
+    lines.push(`⏭️ *Próximo da fila:* ${pf.buyQueue[0].productName}`);
+    if (queueLength > 1) {
+      const extraPending = queueLength - 1;
+      lines.push(`📋 *Depois disso:* ${extraPending === 1 ? 'mais 1 produto aguardando' : `mais ${extraPending} produtos aguardando`}`);
+    }
+  }
+
+  return lines;
 }
 
 async function sendPostAddMenu(phone, session, remainingSizes, customText = null) {
@@ -1708,22 +2368,22 @@ async function sendPostAddMenu(phone, session, remainingSizes, customText = null
   // Only show "Ver Mais Produtos" when there are no queued items (queue takes priority)
   if (queueLength === 0) {
     options.push({ id: 'cart_more_products', title: 'Ver Mais Produtos', description: 'Continuar comprando' });
+    options.push({ id: 'cart_other_category', title: 'Ver Outra Categoria', description: 'Trocar de linha agora' });
   }
 
-  let menuText = customText;
-  if (!menuText && queueLength > 0) {
-    const queueInfo = queueLength === 1
-      ? `Ainda tem *${pf.buyQueue[0].productName}* na fila!`
-      : `Ainda tem *${queueLength} peças* na fila!`;
-    menuText = remainingSizes.length > 0
-      ? `Perfeito 😊 Quer outro tamanho de *${pf.productName}* ou vamos para o próximo? ${queueInfo}`
-      : `Perfeito 😊 ${queueInfo} Vamos para o próximo produto?`;
-  } else if (!menuText) {
-    menuText = remainingSizes.length > 0
+  const focusLines = buildPurchaseFlowFocusLines(session);
+  let promptText = customText;
+  if (!promptText && queueLength > 0) {
+    promptText = remainingSizes.length > 0
+      ? 'Perfeito 😊 Quer separar outro tamanho do produto atual ou prefere ir para o próximo da fila?'
+      : 'Perfeito 😊 Quer seguir para o próximo da fila ou prefere revisar o carrinho?';
+  } else if (!promptText) {
+    promptText = remainingSizes.length > 0
       ? `Perfeito 😊 Quer separar outro tamanho de *${pf.productName}* ou seguimos?`
-      : 'Perfeito 😊 Quer revisar o carrinho, finalizar ou continuar comprando?';
+      : 'Perfeito 😊 Quer revisar o carrinho, finalizar, ver mais produtos ou trocar de categoria?';
   }
 
+  const menuText = [...focusLines, promptText].filter(Boolean).join('\n\n');
   await zapi.sendOptionList(phone, menuText, 'Próximo Passo', 'Escolher', options);
 }
 
@@ -1733,6 +2393,7 @@ async function startInteractivePurchase(phone, product, session, introText = nul
     return false;
   }
 
+  clearSupportMode(session, 'start_interactive_purchase');
   session.currentProduct = product;
   session.handoffDone = false;        // enable new handoff when starting fresh purchase
   session.purchaseFlow.state = 'awaiting_size';
@@ -1742,23 +2403,131 @@ async function startInteractivePurchase(phone, product, session, introText = nul
   session.purchaseFlow.selectedSize = null;
   session.purchaseFlow.addedSizes = [];
   session.purchaseFlow.interactiveVersion = Date.now();
+  // Sync lastClickedProduct* so quote-reply fallback always resolves the current product
+  session.purchaseFlow.lastClickedProductId = product.id;
+  session.purchaseFlow.lastClickedProductName = product.name;
+  session.purchaseFlow.lastClickedProductTimestamp = Date.now();
 
   if (introText) {
     await zapi.sendText(phone, introText);
   }
 
-  await zapi.sendSizeList(phone, product, session.purchaseFlow.interactiveVersion);
+  await sendStockAwareSizeList(phone, session, await ensureProductStockData(product), session.purchaseFlow.interactiveVersion);
   return true;
 }
 
 // ── Flow Functions ────────────────────────────────────────────────────────
 
+
+async function showProductPhotos(phone, productRef, session) {
+  let product = null;
+
+  if (productRef && typeof productRef === 'object' && productRef.id) {
+    product = productRef;
+  } else if (Number.isInteger(productRef) && productRef >= 1 && session.products?.[productRef - 1]) {
+    product = session.products[productRef - 1];
+  } else if (productRef) {
+    product = await resolveProductById(session, productRef);
+  }
+
+  if (!product) {
+    await zapi.sendText(phone, `❌ Não consegui localizar esse produto agora. Me chama no catálogo que eu te mostro de novo 😊`);
+    return;
+  }
+  
+  if (!product.images || product.images.length === 0) {
+    await zapi.sendText(phone, `😕 Não encontrei fotos adicionais para *${product.name}*.`);
+    return;
+  }
+  
+  try {
+    await zapi.sendText(phone, `📸 Enviando as fotos de *${product.name}*...`);
+    for (const [i, url] of product.images.entries()) {
+      await zapi.sendImage(phone, url, `Foto ${i + 1} de ${product.images.length} - ${product.name}`);
+      await zapi.delay(400);
+    }
+    
+    await startInteractivePurchase(phone, product, session, 'Qualquer coisa é só clicar no botão abaixo, ou me mandar o tamanho!');
+  } catch (err) {
+    logger.error({ err: err.message, productId: product.id }, '[showProductPhotos] Error');
+    await zapi.sendText(phone, '⚠️ Erro ao buscar fotos do produto.');
+  }
+}
+
+async function searchAndShowProducts(phone, query, session) {
+  try {
+    clearSupportMode(session, 'search_products');
+    await sendLoadingMessage(
+      phone,
+      `🔍 Buscando por *${query}*...`,
+      `Só um instante, amor! Vou procurar o que temos de ${query} pra você!`
+    );
+
+    const products = await woocommerce.searchProducts(query, 10);
+    
+    if (!products || products.length === 0) {
+      await zapi.sendText(phone, `😕 Poxa, não encontrei nada buscando por "${query}".`);
+      return;
+    }
+
+    session.products = products;
+    session.currentCategory = null;
+    session.activeCategory = null;
+    session.currentPage = 1;
+    session.totalPages = 1;
+    session.totalProducts = products.length;
+
+    let msg = `✨ *Resultados para: ${query}* ✨\n\n`;
+    products.forEach((p, i) => {
+      msg += `${i + 1}. *${p.name}* — ${woocommerce.formatPrice(p.salePrice || p.price)}\n`;
+    });
+    await zapi.sendText(phone, msg);
+
+    session.purchaseFlow.interactiveVersion = Date.now();
+    for (const [i, product] of products.entries()) {
+      if (product.imageUrl) {
+        try {
+          const scRes = await zapi.sendProductShowcase(phone, product, session.purchaseFlow.interactiveVersion);
+          registerMessageProduct(session, scRes?.data?.zaapId, scRes?.data?.messageId, product);
+        } catch {
+          const imgRes = await zapi.sendImage(phone, product.imageUrl, woocommerce.buildCaption(product, i + 1));
+          registerMessageProduct(session, imgRes?.data?.zaapId, imgRes?.data?.messageId, product);
+        }
+        await zapi.delay(400);
+      }
+    }
+
+    if (products.length > 0) {
+      session.lastViewedProduct = products[products.length - 1];
+      session.lastViewedProductIndex = products.length;
+    }
+
+    const nudge = '[SISTEMA: Você mostrou os resultados da busca. Pergunte se a cliente gostou de alguma peça ou se quer pesquisar outra coisa.]';
+    appendHistory(session, 'system', nudge);
+    conversationMemory.refreshConversationMemory(session, { action: { type: 'BUSCAR', payload: query } });
+
+    const aiRaw = await ai.chat(session.history, buildAiContext(session));
+    const { cleanText } = ai.parseAction(aiRaw);
+    if (cleanText) {
+      appendHistory(session, 'assistant', cleanText);
+      conversationMemory.refreshConversationMemory(session, { assistantText: cleanText });
+      await zapi.sendText(phone, cleanText);
+    }
+  } catch (err) {
+    logger.error({ query, err: err.message }, '[searchAndShowProducts] Error');
+    await zapi.sendText(phone, '⚠️ Erro ao buscar produtos.');
+  }
+}
+
 async function showCategory(phone, slug, session) {
+
   slug = normalizeCategorySlug(slug);
+  clearSupportMode(session, 'show_category');
+  const displayName = getCategoryDisplayName(slug);
   await sendLoadingMessage(
     phone,
-    `🔍 Buscando produtos *${slug.toUpperCase()}*...`,
-    `Um momento, amor! Já estou separando os melhores modelos da linha ${slug} pra você!`
+    `🔍 Buscando os melhores modelos de *${displayName}* pra você...`,
+    `Um momento, amor! Já estou separando os melhores modelos de ${displayName} pra você!`
   );
 
   try {
@@ -1785,10 +2554,12 @@ async function showCategory(phone, slug, session) {
 
 async function showAllCategory(phone, slug, session) {
   slug = normalizeCategorySlug(slug);
+  clearSupportMode(session, 'show_all_category');
+  const displayNameAll = getCategoryDisplayName(slug);
   await sendLoadingMessage(
     phone,
-    `🔍 Buscando os melhores modelos para você...`,
-    `Um momento, amor! Estou te encaminhando todos os nossos modelos dessa linha!`
+    `🔍 Buscando os melhores modelos de *${displayNameAll}* pra você...`,
+    `Um momento, amor! Estou separando todos os modelos de ${displayNameAll} pra você!`
   );
 
   try {
@@ -1814,26 +2585,48 @@ async function showAllCategory(phone, slug, session) {
     session.totalPages = 1; // Já agregamos tudo na sessão.
     session.totalProducts = allProducts.length;
 
-    let msg = `✨ *${slug.toUpperCase()}* ✨\n\n`;
-    
-    allProducts.forEach((p, i) => {
-      const price = woocommerce.formatPrice(p.salePrice || p.price);
-      msg += `${i + 1}. *${p.name}* — ${price}\n`;
-    });
-
-    await zapi.sendText(phone, msg);
-
     // Gera a versão UMA VEZ antes do loop — todos os botões do lote compartilham a mesma versão
     session.purchaseFlow.interactiveVersion = Date.now();
+    let showcaseFailures = 0;
     for (const [i, product] of allProducts.entries()) {
       if (product.imageUrl) {
         try {
-          const scRes = await zapi.sendProductShowcase(phone, product, session.purchaseFlow.interactiveVersion);
-          registerMessageProduct(session, scRes?.data?.zaapId, scRes?.data?.messageId, product);
-        } catch {
-          // Fallback para sendImage se o endpoint de botão não suportar imagem
-          const imgRes = await zapi.sendImage(phone, product.imageUrl, woocommerce.buildCaption(product, i + 1));
-          registerMessageProduct(session, imgRes?.data?.zaapId, imgRes?.data?.messageId, product);
+          let sent = false;
+
+          try {
+            const scRes = await zapi.sendProductShowcase(phone, product, session.purchaseFlow.interactiveVersion);
+            registerMessageProduct(session, scRes?.data?.zaapId, scRes?.data?.messageId, product);
+            sent = true;
+          } catch (showcaseErr) {
+            logger.warn(
+              { productId: product.id, err: showcaseErr?.message || String(showcaseErr) },
+              '[showAllCategory] sendProductShowcase falhou — tentando sendImage'
+            );
+          }
+
+          if (!sent) {
+            try {
+              const imgRes = await zapi.sendImage(phone, product.imageUrl, woocommerce.buildCaption(product, i + 1));
+              registerMessageProduct(session, imgRes?.data?.zaapId, imgRes?.data?.messageId, product);
+              sent = true;
+            } catch (imageErr) {
+              showcaseFailures += 1;
+              logger.error(
+                { productId: product.id, err: imageErr?.message || String(imageErr) },
+                '[showAllCategory] Falha ao enviar vitrine do produto'
+              );
+            }
+          }
+
+          if (!sent) {
+            continue;
+          }
+        } catch (loopErr) {
+          showcaseFailures += 1;
+          logger.error(
+            { productId: product.id, err: loopErr?.message || String(loopErr) },
+            '[showAllCategory] Erro inesperado ao processar produto da vitrine'
+          );
         }
         await zapi.delay(400);
       }
@@ -1844,21 +2637,31 @@ async function showAllCategory(phone, slug, session) {
       session.lastViewedProductIndex = allProducts.length;
     }
 
-    const nudge = `[SISTEMA: Você acabou de mostrar a lista inteira de lançamentos da semana de uma única vez. Pergunte com carisma se a cliente gostou de alguma peça (ela pode dizer o número da peça) ou se prefere ver outras categorias (feminino, masculino ou infantil e se preferir ir além, ver as promoções).]`;
-    appendHistory(session, 'system', nudge);
-    conversationMemory.refreshConversationMemory(session, { action: { type: 'VER_TODOS', payload: slug } });
-    
-    const aiRaw = await ai.chat(session.history, buildAiContext(session));
-    const { cleanText } = ai.parseAction(aiRaw);
-    if (cleanText) {
-      appendHistory(session, 'assistant', cleanText);
-      conversationMemory.refreshConversationMemory(session, { assistantText: cleanText });
-      
+    if (showcaseFailures > 0) {
+      logger.warn({ slug, showcaseFailures }, '[showAllCategory] Alguns produtos falharam na vitrine, mas o fluxo continuou');
+    }
+
+    try {
+      const followUpText = session.items.length > 0
+        ? 'Separei tudo aqui 😊 Se quiser, me fala o número da peça que gostou ou escolhe abaixo se quer revisar o carrinho, finalizar ou ver outra coleção.'
+        : 'Me diz o número da peça que você gostou, ou se preferir escolhe outra coleção aqui embaixo 😊';
+
+      appendHistory(session, 'assistant', followUpText);
+      conversationMemory.refreshConversationMemory(session, {
+        assistantText: followUpText,
+        action: { type: 'VER_TODOS', payload: slug },
+      });
+
       if (session.items.length > 0) {
-        await sendCartOptions(phone, session, cleanText);
+        await sendCartOptions(phone, session, followUpText);
       } else {
-        await sendCategoryMenu(phone, cleanText);
+        await sendCategoryMenu(phone, followUpText);
       }
+    } catch (followUpErr) {
+      logger.error(
+        { slug, err: followUpErr?.message || String(followUpErr) },
+        '[showAllCategory] Falha no follow-up determinístico após vitrine completa'
+      );
     }
   } catch (err) {
     logger.error({ slug, code: err.code, err: err.message }, '[showAllCategory] Error');
@@ -1873,6 +2676,7 @@ async function showNextPage(phone, session) {
   }
 
   try {
+    clearSupportMode(session, 'show_next_page');
     const nextPage = session.currentPage + 1;
     const result = await woocommerce.getProductsByCategory(session.currentCategory, 10, nextPage);
 
@@ -1888,15 +2692,6 @@ async function showNextPage(phone, session) {
 }
 
 async function sendProductPage(phone, result, session, startIdx = 0) {
-  let msg = `📦 *${session.currentCategory.toUpperCase()}* — Produtos ${startIdx + 1}–${session.products.length} de ${result.total}:\n`;
-
-  result.products.forEach((p, i) => {
-    const price = woocommerce.formatPrice(p.salePrice || p.price);
-    msg += `${startIdx + i + 1}. *${p.name}* — ${price}\n`;
-  });
-
-  await zapi.sendText(phone, msg);
-
   session.purchaseFlow.interactiveVersion = Date.now();
   for (const [i, product] of result.products.entries()) {
     if (product.imageUrl) {
@@ -1930,6 +2725,8 @@ async function sendProductPage(phone, result, session, startIdx = 0) {
     conversationMemory.refreshConversationMemory(session, { assistantText: cleanText });
     if (session.items.length > 0) {
       await sendCartOptions(phone, session, cleanText);
+    } else if (hasMore && session.activeCategory) {
+      await sendCatalogBrowseOptions(phone, session, cleanText);
     } else {
       await sendCategoryMenu(phone, cleanText);
     }
@@ -1943,6 +2740,50 @@ async function sendProductPage(phone, result, session, startIdx = 0) {
  * @param {string} phone - Customer phone number
  * @param {object} session - Current session object
  */
+async function handoffToHuman(phone, session) {
+  if (session.supportMode === 'human_pending') {
+    logger.info({ phone }, '[HumanHandoff] Duplicate request while already pending');
+    await zapi.sendText(phone, 'Perfeito 😊 Nossa consultora já foi avisada e vai seguir com você por aqui.');
+    return;
+  }
+
+  const itemCount = session.items?.length || 0;
+  const cartBlock = itemCount > 0
+    ? `\n\n${buildCartSummary(session, '🛒 *CARRINHO ATUAL*').summary}`
+    : '\n\n🛒 *Carrinho atual:* vazio';
+
+  // Sprint 1 — Reseta FSM e buyQueue para impedir que o sistema
+  // continue insistindo em perguntas de tamanho/quantidade após handoff.
+  if (session.purchaseFlow) {
+    session.purchaseFlow.buyQueue = [];
+  }
+  resetPurchaseFlow(session);
+  session.supportMode = 'human_pending';
+
+  await zapi.sendText(
+    phone,
+    'Perfeito 😊 Vou sinalizar nossa consultora aqui para seguir com você no atendimento.'
+  );
+
+  if (!ADMIN_PHONE) {
+    logger.warn({ phone }, '[HumanHandoff] ADMIN_PHONE not configured — skipping admin notification');
+    return;
+  }
+
+  const adminMsg =
+    `🙋 *ATENDIMENTO HUMANO SOLICITADO*\n` +
+    `📱 wa.me/${phone}\n` +
+    (session.customerName ? `👤 ${session.customerName}\n` : '') +
+    `${cartBlock}`;
+
+  try {
+    await zapi.sendText(ADMIN_PHONE, adminMsg);
+    logger.info({ phone, adminPhone: ADMIN_PHONE, itemCount }, '[HumanHandoff] Admin notified');
+  } catch (err) {
+    logger.error({ err: err?.message || String(err), adminPhone: ADMIN_PHONE }, '[HumanHandoff] Failed to notify admin');
+  }
+}
+
 async function handoffToConsultant(phone, session) {
   // Guard: prevent duplicate handoff in the same session
   if (session.handoffDone) {

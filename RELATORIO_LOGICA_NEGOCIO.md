@@ -51,7 +51,7 @@ Nao houve teste automatizado end-to-end neste momento. As conclusoes abaixo sao 
 ### 1. Fallback de produto pode iniciar compra do item errado
 
 Severidade: Alta
-Status: Pendente
+Status: ✅ Resolvido (commit 7efad8c)
 
 Trecho principal:
 
@@ -84,7 +84,7 @@ Recomendacao:
 ### 2. Protecao de fila pendente existe, mas nao esta conectada ao fluxo
 
 Severidade: Alta
-Status: Pendente
+Status: ✅ Resolvido (commit 7efad8c)
 
 Trechos principais:
 
@@ -120,7 +120,7 @@ Recomendacao:
 ### 3. Sessao pode ficar travada para novos handoffs
 
 Severidade: Alta
-Status: Pendente
+Status: ✅ Resolvido (commit 7efad8c)
 
 Trechos principais:
 
@@ -153,7 +153,7 @@ Recomendacao:
 ### 4. IDs versionados nao sao validados
 
 Severidade: Media
-Status: Pendente
+Status: ✅ Resolvido (2026-04-06) — helpers extractEventVersion + isStaleEvent implementados; validacao aplicada em size_, qty_, add_size_, skip_more_
 
 Trechos principais:
 
@@ -189,7 +189,7 @@ Recomendacao:
 ### 5. `clearCart` esta sendo chamado, mas nao foi encontrado no runtime
 
 Severidade: Media
-Status: Pendente
+Status: ✅ Resolvido (commit 7efad8c + fix 2026-04-06) — funcao implementada; duplicata que sobrescrevia a implementacao correta foi removida
 
 Trechos principais:
 
@@ -227,7 +227,7 @@ Recomendacao:
 ### 6. Persistencia de pedido final nao esta sendo usada
 
 Severidade: Media
-Status: Observacao
+Status: ✅ Resolvido (commit 7efad8c) — saveOrder chamado dentro de handoffToConsultant
 
 Trechos principais:
 
@@ -446,3 +446,94 @@ Sugestao de implementacao em 1 lote pequeno e seguro:
 O fluxo principal esta perto de ficar bem robusto, mas ainda ha alguns pontos em que regras de negocio importantes estao delegadas a comportamento implicito ou a IA. O caminho mais seguro e tornar fechamento, fila, limpeza de carrinho e invalidacao de menus completamente deterministicos.
 
 O bug da lista observado no teste foi real e ja foi corrigido. Este documento registra os proximos ajustes recomendados para estabilizar o fluxo comercial.
+
+## Adendo de Review - 2026-04-06
+
+### Finding adicional confirmado
+
+Titulo:
+
+- `saveOrder existe mas nunca e usado`
+
+Referencias:
+
+- `services/supabase.js:101-109`
+- `index.js` -> fluxo de `handoffToConsultant`
+
+Resumo:
+
+- existe uma funcao pronta para persistir pedidos na tabela `orders`
+- nao foi encontrada chamada para `saveOrder(...)` no runtime atual
+- hoje o handoff apenas:
+  - envia resumo ao cliente
+  - envia resumo ao admin
+  - reseta o fluxo
+- com isso, o pedido nao ganha registro estruturado no banco
+
+Impacto de negocio:
+
+- auditoria fraca
+- conciliacao manual
+- dificuldade para rastrear pedidos apos o atendimento
+- dependencia total do historico do WhatsApp
+
+Risco operacional:
+
+- se a conversa for apagada, perdida ou ficar dificil de consultar, nao existe uma trilha formal do pedido
+- isso tambem dificulta integracoes futuras com painel, CRM, financeiro ou status de atendimento
+
+Decisao recomendada:
+
+- tratar o handoff como o momento oficial de persistencia do pedido
+- chamar `saveOrder({ phone, customerName, items, total })` dentro de `handoffToConsultant`
+
+Sequencia tecnica sugerida:
+
+1. montar `summary` e `total` normalmente
+2. antes de resetar o fluxo, executar `db.saveOrder({ phone, customerName: session.customerName, items: session.items, total })`
+3. se a persistencia falhar:
+   - registrar erro
+   - decidir se o handoff segue mesmo assim ou se deve bloquear
+4. so depois marcar `session.handoffDone = true`
+
+Regra de negocio sugerida:
+
+- recomendacao principal: persistencia obrigatoria antes de considerar o pedido concluido
+- fallback aceitavel: se o admin foi notificado mas o banco falhou, marcar isso em log de erro critico para reprocessamento
+
+Teste recomendado:
+
+1. montar um carrinho com pelo menos 2 itens
+2. acionar handoff
+3. validar que o cliente recebeu o resumo
+4. validar que o admin recebeu o resumo
+5. validar que a tabela `orders` recebeu:
+   - `phone`
+   - `customer_name`
+   - `items`
+   - `total`
+   - `status = pending`
+
+Observacao:
+
+- este achado nao quebra o fluxo na hora, mas enfraquece bastante a operacao comercial
+- por isso faz sentido tratar como melhoria importante de robustez, mesmo com severidade menor que bugs de compra errada ou travamento de fluxo
+
+## Adendo de Encerramento - 2026-04-06
+
+Todos os 6 achados foram resolvidos. Resumo final:
+
+| Bug | Descricao | Status |
+|-----|-----------|--------|
+| BUG-1 | Fallback cego para lastViewedProduct em buy_ | ✅ Resolvido |
+| BUG-2 | handleQueueGuard desconectado do webhook | ✅ Resolvido |
+| BUG-3 | handoffDone nao resetado em nova compra | ✅ Resolvido |
+| BUG-4 | interactiveVersion nao validada nos handlers FSM | ✅ Resolvido |
+| BUG-5 | clearCart nao implementado + duplicata sobrescrevia a implementacao | ✅ Resolvido |
+| BUG-6 | saveOrder nunca chamado | ✅ Resolvido |
+
+Proximos riscos a monitorar:
+
+- sessoes antigas persistidas no Supabase com estados de FSM incorretos podem causar comportamento inesperado apos o deploy
+- o campo interactiveVersion pode ser null em sessoes antigas (isStaleEvent ja protege via guard de null)
+- testar os 5 cenarios de teste descritos na secao anterior para validar em producao
