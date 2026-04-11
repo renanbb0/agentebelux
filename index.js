@@ -17,10 +17,21 @@ const TTS_ENABLED = process.env.TTS_ENABLED === 'true';
 const app = express();
 app.use(express.json());
 
+const http = require('http');
+const { Server } = require('socket.io');
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: '*' } });
+global.visualIo = io;
+
 const PORT = process.env.PORT || 3000;
 const ADMIN_PHONE = process.env.ADMIN_PHONE || null;
 const SESSION_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes inactivity
-const MAX_HISTORY_MESSAGES = parseInt(process.env.MAX_HISTORY_MESSAGES || '40', 10);
+const MAX_HISTORY_MESSAGES = parseInt(process.env.MAX_HISTORY_MESSAGES || '80', 10);
+// Janela deslizante de contexto enviada ao Gemini. Turnos mais antigos que
+// CONTEXT_WINDOW_MS são arquivados em conversationMemory.archivedSummary.
+// SESSION_TIMEOUT_MS (30min) continua sendo o TTL do carrinho/FSM — a janela
+// de 20min afeta apenas o que a IA vê no prompt.
+const CONTEXT_WINDOW_MS = parseInt(process.env.CONTEXT_WINDOW_MS || String(20 * 60 * 1000), 10);
 // ── Grade Parser ─────────────────────────────────────────────────────────
 
 /**
@@ -32,6 +43,18 @@ const MAX_HISTORY_MESSAGES = parseInt(process.env.MAX_HISTORY_MESSAGES || '40', 
  */
 function parseGradeText(text, knownSizes) {
   if (!text || !knownSizes?.length) return null;
+
+  // Produto de tamanho único: aceita qualquer número digitado como quantidade
+  // Ex: "5", "5 pacotes", "5 unidades", "quero 5", "5 peças"
+  if (knownSizes.length === 1) {
+    const singleMatch = text.trim().match(/^(?:quero\s+)?(\d{1,3})\s*(?:pe[çc]as?|unidades?|pacotes?|pares?|itens?|pc|pcs|un?)?$/i);
+    if (singleMatch) {
+      const qty = parseInt(singleMatch[1], 10);
+      if (qty > 0 && qty <= 999) {
+        return [{ size: knownSizes[0], qty }];
+      }
+    }
+  }
 
   const knownSizesUpper = new Set(knownSizes.map(size => size.toUpperCase()));
   const sizesPattern = knownSizes
@@ -83,6 +106,8 @@ function parseGradeText(text, knownSizes) {
 
 // ── Sessions ──────────────────────────────────────────────────────────────
 const sessions = {};
+const sessionLoadLocks = new Map();
+const persistQueues = new Map();
 
 const SLUG_MAP = {
   'feminina': 'feminino',
@@ -146,20 +171,75 @@ function createDefaultPurchaseFlow() {
     lastClickedProductId: null,
     lastClickedProductName: null,
     lastClickedProductTimestamp: null,
+    // Fonte do último commit de grade: 'text' (cliente mandou grade textual,
+    // ex.: "3P 2M") ou 'button' (clicou em tamanho+quantidade pelo menu).
+    // Commit textual é tratado como "grade fechada" no switchFsmFocus —
+    // não enfileira o produto antigo, focando direto no novo citado.
+    lastCommitSource: null,
     // Fila de compras: acumula buy_ clicks enquanto FSM está ocupada
     buyQueue: [],
   };
 }
 
+const MAX_HISTORY_BYTES = 30 * 1024; // 30 KB
+
 function trimSessionHistory(session) {
-  if (!Array.isArray(session.history) || session.history.length <= MAX_HISTORY_MESSAGES) return;
-  session.history = session.history.slice(-MAX_HISTORY_MESSAGES);
+  if (!Array.isArray(session.history)) return;
+
+  // Limite por contagem
+  if (session.history.length > MAX_HISTORY_MESSAGES) {
+    session.history = session.history.slice(-MAX_HISTORY_MESSAGES);
+  }
+
+  // Limite secundário por bytes
+  while (session.history.length > 1) {
+    const bytes = Buffer.byteLength(JSON.stringify(session.history), 'utf8');
+    if (bytes <= MAX_HISTORY_BYTES) break;
+    session.history = session.history.slice(1); // remove a mensagem mais antiga
+  }
 }
 
 function appendHistory(session, role, content) {
   if (!content) return;
-  session.history.push({ role, content });
+  session.history.push({ role, content, ts: Date.now() });
   trimSessionHistory(session);
+}
+
+/**
+ * Retorna as mensagens da janela deslizante de CONTEXT_WINDOW_MS.
+ * Turnos mais antigos são movidos para o arquivo resumido (archivedSummary)
+ * via conversationMemory.archiveStaleTurns e REMOVIDOS de session.history
+ * — assim o prompt do Gemini só recebe o que está dentro da janela.
+ *
+ * Entradas legadas sem `ts` são tratadas como recentes (não arquivadas)
+ * para evitar regressão em sessões persistidas antes desta mudança.
+ */
+function getActiveHistoryWindow(session) {
+  if (!Array.isArray(session.history) || session.history.length === 0) return [];
+
+  const cutoff = Date.now() - CONTEXT_WINDOW_MS;
+  const stale = [];
+  const active = [];
+
+  for (const entry of session.history) {
+    // Sem ts (legado) → considera dentro da janela
+    if (!entry.ts || entry.ts >= cutoff) {
+      active.push(entry);
+    } else {
+      stale.push(entry);
+    }
+  }
+
+  if (stale.length > 0) {
+    conversationMemory.archiveStaleTurns(session, stale);
+    session.history = active;
+    logger.info(
+      { archived: stale.length, remaining: active.length },
+      '[ContextWindow] Turnos antigos comprimidos para archivedSummary'
+    );
+  }
+
+  return active;
 }
 
 function buildFsmContext(session) {
@@ -261,11 +341,25 @@ async function cancelCurrentFlow(phone, session, userText = null) {
 }
 
 async function getSession(phone) {
-  if (!sessions[phone]) {
+  if (sessions[phone]) {
+    sessions[phone].previousLastActivity = sessions[phone].lastActivity || null;
+    sessions[phone].lastActivity = Date.now();
+    return sessions[phone];
+  }
+
+  // Se já há um load em andamento para este phone, aguarda para evitar race condition
+  if (sessionLoadLocks.has(phone)) {
+    await sessionLoadLocks.get(phone);
+    return sessions[phone];
+  }
+
+  const loadPromise = (async () => {
     const stored = await db.getSession(phone);
     const defaultPurchaseFlow = createDefaultPurchaseFlow();
     const storedPurchaseFlow = stored?.purchase_flow ? { ...stored.purchase_flow } : null;
-    const storedConversationMemory = storedPurchaseFlow?.contextMemory || null;
+    // Compatibilidade: lê contextMemory de purchase_flow se conversation_memory ainda não existe
+    const storedConversationMemory =
+      stored?.conversation_memory || storedPurchaseFlow?.contextMemory || null;
     if (storedPurchaseFlow?.contextMemory) delete storedPurchaseFlow.contextMemory;
 
     sessions[phone] = stored
@@ -309,18 +403,33 @@ async function getSession(phone) {
           previousLastActivity: null,
           lastActivity: Date.now(),
         };
-  } else {
-    sessions[phone].previousLastActivity = sessions[phone].lastActivity || null;
-    sessions[phone].lastActivity = Date.now();
+  })();
+
+  sessionLoadLocks.set(phone, loadPromise);
+  try {
+    await loadPromise;
+  } finally {
+    sessionLoadLocks.delete(phone);
   }
+
   return sessions[phone];
 }
 
 function persistSession(phone) {
   const session = sessions[phone];
-  if (!session) return;
-  db.upsertSession(phone, session)
+  if (!session) return Promise.resolve();
+
+  const previous = persistQueues.get(phone) || Promise.resolve();
+  const next = previous
+    .catch(() => {})
+    .then(() => db.upsertSession(phone, session))
     .catch(err => logger.error({ err: err.message }, '[Supabase] upsertSession'));
+
+  persistQueues.set(phone, next);
+  next.finally(() => {
+    if (persistQueues.get(phone) === next) persistQueues.delete(phone);
+  });
+  return next;
 }
 
 // Clean up sessions
@@ -403,7 +512,7 @@ function extractTextFromEvent(event) {
     if (typeof event.text === 'string') return event.text;
     if (event.text && typeof event.text.message === 'string') return event.text.message;
     if (event.content && typeof event.content === 'string') return event.content;
-    if (event.audio) return '[Áudio_STT]';
+    if (event.audio || event?.message?.audio) return '[Áudio_STT]';
     if (event.image?.caption) return event.image.caption.trim();
     if (event.sticker) return '[Sticker]';
 
@@ -419,6 +528,8 @@ function extractAudioUrl(event) {
     || event?.audio?.url
     || event?.audioUrl
     || event?.message?.audioUrl
+    || event?.message?.audio?.audioUrl
+    || event?.message?.audio?.url
     || null;
 }
 
@@ -452,12 +563,45 @@ app.post('/webhook', async (req, res) => {
     }
     // ─────────────────────────────────────────────────────────────────────
 
+    if (!body.text && !body.listResponseMessage && !body.buttonsResponseMessage) {
+      logger.info({
+        bodyKeys: Object.keys(body),
+        hasAudio: Boolean(body.audio),
+        hasMessageAudio: Boolean(body?.message?.audio),
+      }, '[Webhook] Payload sem texto — inspecionando tipo');
+    }
+
     let text = extractTextFromEvent(body);
     if (!text) return;
+
+    // Fallbacks de áudio/sticker que NÃO precisam de sessão (respondem direto)
+    if (text === '[Áudio]') {
+      logger.info({ from }, '[Intercept] Áudio recebido — fallback humano');
+      await zapi.replyText(from, 'Puts amada, tô sem fone aqui no depósito 😅. Consegue me digitar rapidinho o que precisa?', messageId);
+      return;
+    }
+    if (text === '[Sticker]') {
+      logger.info({ from }, '[Intercept] Sticker recebido — ignorando');
+      return;
+    }
+
+    if (text.includes('CONTA EM TRIAL') || text.includes('MENSAGEM DE TESTE')) return;
+
+    logger.info({ phone: from, text }, '[MSG] Received');
+    if (messageId) zapi.readMessage(from, messageId);
+
+    // Carrega sessão ANTES do bloco de STT — o log de FSM ativa durante
+    // transcrição precisa acessar session.purchaseFlow (ADR-026).
+    const session = await getSession(from);
 
     if (/^\[.*udio_STT\]$/i.test(text)) {
       const audioUrl = extractAudioUrl(body);
       logger.info({ from, hasAudioUrl: Boolean(audioUrl) }, '[Intercept] Áudio recebido — iniciando STT');
+      if (!audioUrl) {
+        logger.warn({ from, bodyKeys: Object.keys(body) }, '[STT] audioUrl não encontrado em nenhum campo esperado');
+        await zapi.replyText(from, 'Puts amada, não recebi o áudio direitinho 😅. Consegue mandar de novo ou em texto?', messageId);
+        return;
+      }
       const transcription = await stt.transcribe(audioUrl);
       if (!transcription) {
         await zapi.replyText(from, 'Puts amada, não consegui entender o áudio direitinho 😅. Consegue me mandar em texto rapidinho?', messageId);
@@ -474,22 +618,6 @@ app.post('/webhook', async (req, res) => {
       }
     }
 
-    if (text === '[Áudio]') {
-      logger.info({ from }, '[Intercept] Áudio recebido — fallback humano');
-      await zapi.replyText(from, 'Puts amada, tô sem fone aqui no depósito 😅. Consegue me digitar rapidinho o que precisa?', messageId);
-      return;
-    }
-    if (text === '[Sticker]') {
-      logger.info({ from }, '[Intercept] Sticker recebido — ignorando');
-      return;
-    }
-
-    if (text.includes('CONTA EM TRIAL') || text.includes('MENSAGEM DE TESTE')) return;
-
-    logger.info({ phone: from, text }, '[MSG] Received');
-    if (messageId) zapi.readMessage(from, messageId);
-
-    const session = await getSession(from);
     const inactivityMs = session.previousLastActivity
       ? Date.now() - session.previousLastActivity
       : 0;
@@ -585,7 +713,7 @@ app.post('/webhook', async (req, res) => {
       logger.info({ phone: from, sentinel: text, slug }, '[Intercept] Seleção de categoria determinística');
       appendHistory(session, 'user', `quero ver a linha ${getCategoryDisplayName(slug)}`);
       conversationMemory.refreshConversationMemory(session, { userText: text });
-      await showAllCategory(from, slug, session);
+      await showCategory(from, slug, session);
       persistSession(from);
       return;
     }
@@ -629,33 +757,48 @@ app.post('/webhook', async (req, res) => {
     // Processa toda a grade em batch (pushCartItem) e envia confirmação única.
     const pfGrade = session.purchaseFlow;
     if (pfGrade.state !== 'idle' && pfGrade.productId) {
-      // Se o cliente citou um produto diferente do que está em foco, migrar o foco
-      const quoteRefId = body?.referenceMessageId
+      // R1: Quote resolve o alvo ANTES da FSM.
+      // Usa resolveQuotedProduct (map → caption:ref → caption:name) pra encontrar
+      // o produto citado; se diferente do foco, troca via switchFsmFocus.
+      const hasQuote = Boolean(
+        body?.referenceMessageId
         || body?.quotedMessage?.messageId
         || body?.quotedMessage?.stanzaId
-        || body?.quotedMessage?.id;
-      if (quoteRefId && session.messageProductMap?.[quoteRefId]) {
-        const mapped = session.messageProductMap[quoteRefId];
-        if (mapped.productId !== pfGrade.productId) {
-          const productStillLoaded = session.products?.some(p => p.id === mapped.productId);
-          if (productStillLoaded) {
-            const quotedProd = session.products.find(p => p.id === mapped.productId);
-            logger.info(
-              { prev: pfGrade.productId, next: mapped.productId, prevName: pfGrade.productName, nextName: quotedProd?.name },
-              '[Grade] Migrando foco do produto via quote reply'
-            );
-            pfGrade.productId = mapped.productId;
-            pfGrade.productName = quotedProd?.name || pfGrade.productName;
-            pfGrade.unitPrice = parseFloat(quotedProd?.salePrice || quotedProd?.price);
-            pfGrade.addedSizes = [];
-          }
+        || body?.quotedMessage?.id
+      );
+      if (hasQuote) {
+        const resolved = await resolveQuotedProduct(session, body);
+        if (resolved?.product && String(resolved.product.id) !== String(pfGrade.productId)) {
+          logger.info(
+            {
+              prev: pfGrade.productId,
+              next: resolved.product.id,
+              prevName: pfGrade.productName,
+              nextName: resolved.product.name,
+              strategy: resolved.strategy,
+            },
+            '[Grade] switchFsmFocus via quote reply'
+          );
+          switchFsmFocus(session, resolved.product);
         }
       }
 
-      const focusedProduct = await ensureProductStockData(session.products?.find(p => p.id === pfGrade.productId));
+      const focusedProduct = await ensureProductStockData(
+        session.products?.find(p => String(p.id) === String(pfGrade.productId))
+        || await resolveProductById(session, pfGrade.productId)
+      );
 
-      if (focusedProduct?.sizes?.length) {
-        const allSizes = buildSessionSizeDetails(session, focusedProduct).map(d => d.size);
+      // Suporte a tamanho único: produto sem variações usa ['ÚNICO'] como sizes
+      const effectiveSizes = focusedProduct
+        ? (() => {
+            const rawSizes = (focusedProduct.sizes || []).filter(Boolean);
+            if (rawSizes.length === 0) return ['ÚNICO'];
+            return buildSessionSizeDetails(session, focusedProduct).map(d => d.size);
+          })()
+        : [];
+
+      if (effectiveSizes.length > 0) {
+        const allSizes = effectiveSizes;
         const availableSizes = getAvailableSizesForSession(session, focusedProduct);
         const grade = parseGradeText(text, allSizes);
 
@@ -697,7 +840,6 @@ app.post('/webhook', async (req, res) => {
             from,
             product: pfGrade.productName,
             allSizes,
-            availableSizes,
             gradeRequested: grade,
             addable,
             unavailable,
@@ -749,6 +891,9 @@ app.post('/webhook', async (req, res) => {
             pfGrade.state = 'awaiting_more_sizes';
             pfGrade.selectedSize = null;
             if (!Array.isArray(pfGrade.addedSizes)) pfGrade.addedSizes = [];
+            // Marca grade como "commit explícito via texto" — se cliente citar
+            // outro produto depois, switchFsmFocus NÃO enfileira este.
+            pfGrade.lastCommitSource = 'text';
             session.currentProduct = focusedProduct;
             const remainingSizes = getAvailableSizesForSession(session, focusedProduct, pfGrade.addedSizes || []);
             await sendPostAddMenu(from, session, remainingSizes, confirmMsg);
@@ -995,6 +1140,23 @@ app.post('/webhook', async (req, res) => {
         }
       }
 
+      // Tentativa 3.5 (caption:ref): extrai "Ref XXX" da caption do quote.
+      // Cobre o caso em que o card é muito antigo (fora do messageProductMap)
+      // mas ainda está carregado em session.products.
+      if (!extractedIdx && session.products?.length > 0 && quotedText) {
+        const refMatch = quotedText.match(/ref\s*([0-9]+[a-z]?)/i);
+        if (refMatch) {
+          const refCode = refMatch[1];
+          const refRegex = new RegExp(`ref\\s*${refCode}\\b`, 'i');
+          const byRef = session.products.findIndex(p => refRegex.test(p.name || ''));
+          if (byRef >= 0) {
+            extractedIdx = byRef + 1;
+            quotedProduct = session.products[byRef];
+            logger.info({ refCode, productName: quotedProduct.name, productIdx: extractedIdx }, '[QuotedProduct] Resolvido via caption:ref ✓');
+          }
+        }
+      }
+
       // Tentativa 4 (nome do produto no texto citado)
       if (!extractedIdx && session.products?.length > 0 && quotedText) {
         const matchByName = session.products.findIndex(p =>
@@ -1101,9 +1263,12 @@ app.post('/webhook', async (req, res) => {
     );
 
     if (quotedProductRef && session.purchaseFlow?.state === 'idle') {
-      if (quotedProductRef?.sizes?.length) {
-        const allSizesQuote = buildSessionSizeDetails(session, quotedProductRef).map(d => d.size);
-        const availableSizesQuote = getAvailableSizesForSession(session, quotedProductRef);
+      // Suporte a tamanho único: produtos sem sizes[] também entram no grade parser
+      const rawSizesQuote = (quotedProductRef?.sizes || []).filter(Boolean);
+      const allSizesQuote = rawSizesQuote.length > 0
+        ? buildSessionSizeDetails(session, quotedProductRef).map(d => d.size)
+        : ['ÚNICO'];
+      if (allSizesQuote.length > 0) {
         const gradeFromQuote = parseGradeText(text, allSizesQuote);
         if (gradeFromQuote) {
           logger.info({ from, grade: gradeFromQuote, product: quotedProductRef.name }, '[Grade] Grade via produto citado (FSM idle)');
@@ -1145,7 +1310,6 @@ app.post('/webhook', async (req, res) => {
             from,
             product: quotedProductRef.name,
             allSizes: allSizesQuote,
-            availableSizes: availableSizesQuote,
             gradeRequested: gradeFromQuote,
             addable: addableQuote,
             unavailable: unavailableQuote,
@@ -1257,7 +1421,11 @@ app.post('/webhook', async (req, res) => {
     const quotedIsTrialArtifact = /CONTA EM TRIAL|MENSAGEM DE TESTE/i.test(quotedRaw);
     const hasQuotedMessage = !!body?.quotedMessage;
     const canUseLastViewedFallback = !hasQuotedMessage || quotedIsTrialArtifact;
-    if ((EFFECTIVE_PHOTO_REQUEST || (quotedHasImage && isShortMessage)) && !quotedProductIdx && canUseLastViewedFallback && session.lastViewedProduct) {
+    // Se o cliente menciona categoria/linha/coleção/todos/tudo, NÃO é pedido de fotos
+    // de um produto específico — é intenção de ver a categoria inteira. Libera a mensagem
+    // para o roteador determinístico "ver todos" ou para a IA resolver.
+    const CATEGORY_INTENT = /\b(categoria|linha|cole[çc][ãa]o|todos|todas|tudo|modelos)\b/i.test(text);
+    if (!CATEGORY_INTENT && (EFFECTIVE_PHOTO_REQUEST || (quotedHasImage && isShortMessage)) && !quotedProductIdx && canUseLastViewedFallback && session.lastViewedProduct) {
       const idx = session.lastViewedProductIndex || 1;
       logger.info({ productIdx: idx, name: session.lastViewedProduct.name }, '[LastViewed] Usando último produto visto');
       await showProductPhotos(from, idx, session);
@@ -1282,15 +1450,34 @@ app.post('/webhook', async (req, res) => {
       return;
     }
 
-    let systemNudge = null;
-    if (isFirstContact) {
-      systemNudge = `[BOAS-VINDAS: Este é o início do atendimento. Dê uma saudação rápida e carinhosa, e NÃO faça perguntas sobre o que o lojista procura. O sistema vai disparar os lançamentos logo após sua fala por meio do token [VER_TODOS:lancamento-da-semana].]`;
+    // Roteamento determinístico: "ver todos/todas/tudo" + categoria ativa → showAllCategory.
+    // Evita dependência do Gemini nesse caminho crítico — se a API falhar ou a IA
+    // interpretar errado, o cliente já fica em silêncio ou recebe produto errado.
+    const WANTS_ALL = /\b(ver\s+todos|ver\s+todas|todas?\s+as\s+fotos|mostra(?:r)?\s+tudo|quero\s+ver\s+tudo|quero\s+ver\s+todos|quero\s+ver\s+todas)\b/i.test(text);
+    if (WANTS_ALL && session.activeCategory) {
+      logger.info({ phone: from, category: session.activeCategory }, '[Intercept] "Ver todos" determinístico — bypass IA');
+      appendHistory(session, 'user', text);
+      conversationMemory.refreshConversationMemory(session, { userText: text });
+      await showAllCategory(from, session.activeCategory, session);
+      persistSession(from);
+      return;
     }
 
+    let systemNudge = null;
+    if (isFirstContact) {
+      const hour = new Date().getHours();
+      const greeting = hour < 12 ? 'bom dia' : hour < 18 ? 'boa tarde' : 'boa noite';
+      systemNudge = `[BOAS-VINDAS: Primeiro contato do dia (${greeting}). 1 linha curta e carinhosa no ritmo de zap. Os lançamentos vão aparecer logo em seguida pelo token [VER_TODOS:lancamento-da-semana] — não precisa perguntar nada.]`;
+    }
+
+    // Janela deslizante de 20min: mensagens antigas são movidas para
+    // archivedSummary ANTES de montar o prompt — assim buildAiContext já
+    // reflete o estado pós-compressão.
+    const activeHistory = getActiveHistoryWindow(session);
     const promptContext = buildAiContext(session, [semanticHint]);
     let aiRaw = '';
     try {
-      aiRaw = await ai.chat(session.history, promptContext, systemNudge);
+      aiRaw = await ai.chat(activeHistory, promptContext, systemNudge);
     } catch (err) {
       logger.error(
         { err: err?.message || String(err), stack: err?.stack || null, isFirstContact, text },
@@ -1426,7 +1613,7 @@ app.post('/webhook', async (req, res) => {
     }
 
     if (action) {
-      await executeAction(from, action, session);
+      await executeAction(from, action, session, { isFirstContact });
     }
 
     if (!cleanText && !action) {
@@ -1447,10 +1634,10 @@ app.post('/webhook', async (req, res) => {
 
 // ── Action Executor ───────────────────────────────────────────────────────
 
-async function executeAction(phone, action, session) {
+async function executeAction(phone, action, session, opts = {}) {
   switch (action.type) {
     case 'VER_TODOS':
-      await showAllCategory(phone, action.payload, session);
+      await showAllCategory(phone, action.payload, session, opts);
       break;
 
     case 'VER':
@@ -1616,6 +1803,138 @@ async function sendLoadingMessage(phone, textFallback, ttsPhrase) {
   await zapi.sendText(phone, textFallback);
 }
 
+/**
+ * Mensagens humanas para o momento em que a Bela vai carregar produtos.
+ * Substitui o antigo "🔍 Buscando os melhores modelos de X pra você..."
+ * que o lojista achava robótico demais.
+ *
+ * @param {string} displayName — nome da categoria ("Feminino", "Lançamentos da Semana")
+ * @param {object} opts
+ * @param {boolean} opts.isFirstContact — se é o primeiro turno da conversa
+ * @returns {{ text: string, tts: string }}
+ */
+function pickLoadingPhrase(displayName, { isFirstContact = false } = {}) {
+  if (isFirstContact) {
+    const text = `Vou começar te mostrando nossos *${displayName}* 😊 já já você vê por aqui.`;
+    const tts  = `Amor, vou começar te mostrando nossos ${displayName}. Já já você vê por aqui.`;
+    return { text, tts };
+  }
+
+  const variants = [
+    {
+      text: `Fica comigo um instantinho que eu separo *${displayName}* pra você 😊`,
+      tts:  `Fica comigo um instantinho que eu separo ${displayName} pra você!`,
+    },
+    {
+      text: `Já te mostro as peças de *${displayName}* 😉`,
+      tts:  `Já te mostro as peças de ${displayName}!`,
+    },
+    {
+      text: `Peraí que eu vou te trazer *${displayName}* agora 💛`,
+      tts:  `Peraí que eu vou te trazer ${displayName} agora!`,
+    },
+    {
+      text: `Deixa eu dar uma olhadinha em *${displayName}* pra você 😊`,
+      tts:  `Deixa eu dar uma olhadinha em ${displayName} pra você!`,
+    },
+  ];
+
+  return variants[Math.floor(Math.random() * variants.length)];
+}
+
+function pickSearchLoadingPhrase(query) {
+  const variants = [
+    {
+      text: `Deixa eu procurar *${query}* aqui no nosso estoque 😊`,
+      tts:  `Deixa eu procurar ${query} aqui no nosso estoque!`,
+    },
+    {
+      text: `Vou dar uma olhadinha em *${query}* pra você 💛`,
+      tts:  `Vou dar uma olhadinha em ${query} pra você!`,
+    },
+    {
+      text: `Peraí que eu já te trago o que temos de *${query}* 😉`,
+      tts:  `Peraí que eu já te trago o que temos de ${query}!`,
+    },
+  ];
+  return variants[Math.floor(Math.random() * variants.length)];
+}
+
+/**
+ * Resolve o produto citado num quote/reply usando 4 estratégias em ordem:
+ *   1. messageProductMap via referenceMessageId
+ *   2. messageProductMap via quotedMessage.messageId / stanzaId / id
+ *   3. Fallback textual por "Ref XXX" na caption do quote
+ *   4. Fallback textual por nome aproximado no caption do quote
+ *
+ * Retorna { product, strategy } ou null. A strategy vira log estruturado
+ * pra rastrear qual caminho resolveu (ou por que tudo falhou).
+ */
+async function resolveQuotedProduct(session, body) {
+  if (!body) return null;
+
+  // Coleta todos os IDs candidatos do payload Z-API
+  const candidateIds = [
+    body.referenceMessageId,
+    body.quotedMessage?.messageId,
+    body.quotedMessage?.stanzaId,
+    body.quotedMessage?.id,
+  ].filter(Boolean);
+
+  // Estratégia 1+2: lookup direto no map
+  for (const id of candidateIds) {
+    const mapped = session.messageProductMap?.[id];
+    if (mapped?.productId) {
+      const product =
+        session.products?.find(p => String(p.id) === String(mapped.productId))
+        || await resolveProductById(session, mapped.productId);
+      if (product) return { product, strategy: `map:${id === body.referenceMessageId ? 'refId' : 'quoteId'}` };
+    }
+  }
+
+  // Estratégia 3+4: fallback textual via caption do quote
+  const caption =
+    body.quotedMessage?.caption
+    || body.quotedMessage?.imageMessage?.caption
+    || body.quotedMessage?.text
+    || '';
+
+  if (caption) {
+    // Estratégia 3: match por "Ref XXX" (ex: "Ref 414L", "Ref 501S")
+    const refMatch = caption.match(/ref\s*([0-9]+[a-z]?)/i);
+    if (refMatch) {
+      const refCode = refMatch[1];
+      const refRegex = new RegExp(`ref\\s*${refCode}\\b`, 'i');
+      const found = session.products?.find(p => refRegex.test(p.name || ''));
+      if (found) return { product: found, strategy: `caption:ref:${refCode}` };
+    }
+
+    // Estratégia 4: match por nome aproximado (primeiras 3 palavras do caption)
+    const captionWords = caption
+      .replace(/[^a-záàâãéèêíïóôõöúçñ\s]/gi, ' ')
+      .split(/\s+/)
+      .filter(w => w.length >= 3)
+      .slice(0, 3);
+    if (captionWords.length >= 2) {
+      const found = session.products?.find(p => {
+        const name = (p.name || '').toLowerCase();
+        return captionWords.every(w => name.includes(w.toLowerCase()));
+      });
+      if (found) return { product: found, strategy: `caption:name` };
+    }
+  }
+
+  // Auditoria: nada resolveu
+  logger.warn({
+    candidateIds,
+    mapSize: Object.keys(session.messageProductMap || {}).length,
+    mapKeys: Object.keys(session.messageProductMap || {}).slice(-5),
+    caption: caption?.slice(0, 120),
+  }, '[QuoteReply] Resolução falhou — nenhuma estratégia pegou');
+
+  return null;
+}
+
 function registerMessageProduct(session, zaapId, messageId, product) {
   if (!product || !session.messageProductMap) return;
   const idx = session.products?.indexOf(product);
@@ -1625,7 +1944,9 @@ function registerMessageProduct(session, zaapId, messageId, product) {
   // Também pelo zaapId como fallback de compatibilidade
   if (zaapId) session.messageProductMap[zaapId] = entry;
   const keys = Object.keys(session.messageProductMap);
-  if (keys.length > 50) keys.slice(0, 25).forEach(k => delete session.messageProductMap[k]);
+  // Aumentado para 200 (antes 50) — cobre sessões B2B longas onde o lojista
+  // cita cards antigos após 60+ mensagens. Purga os 50 mais antigos.
+  if (keys.length > 200) keys.slice(0, 50).forEach(k => delete session.messageProductMap[k]);
   // Auditoria estrutural: registra os IDs exatos persistidos para rastrear
   // o caminho ida→volta com o reply do webhook.
   logger.info({
@@ -1780,8 +2101,22 @@ async function sendStockAwareQuantityList(phone, session, size, version, product
  */
 function pushCartItem(session, productId, productName, size, qty, unitPrice, imageUrl = null) {
   if (!productId || !size || !qty || qty < 1) return;
-  const price = unitPrice * qty;
-  session.items.push({ productId, productName, size, quantity: qty, unitPrice, price, imageUrl });
+
+  const existingIdx = session.items.findIndex(
+    it => it.productId === productId && it.size === size
+  );
+  if (existingIdx >= 0) {
+    const existing = session.items[existingIdx];
+    existing.quantity += qty;
+    const resolvedUnitPrice = existing.unitPrice || unitPrice || 0;
+    existing.unitPrice = resolvedUnitPrice;
+    existing.price = resolvedUnitPrice * existing.quantity;
+    if (imageUrl && !existing.imageUrl) existing.imageUrl = imageUrl;
+  } else {
+    session.items.push({ productId, productName, size, quantity: qty, unitPrice, price: unitPrice * qty, imageUrl });
+  }
+  session.handoffDone = false;
+
   const pf = session.purchaseFlow;
   if (Array.isArray(pf.addedSizes) && !pf.addedSizes.includes(size)) {
     pf.addedSizes.push(size);
@@ -1839,15 +2174,27 @@ async function addToCart(phone, qty, session) {
   const price = unitPrice * qty;
   const imageUrl = productRef?.imageUrl || null;
 
-  session.items.push({
-    productId: pf.productId,
-    productName: pf.productName,
-    size: selectedSize,
-    quantity: qty,
-    unitPrice,
-    price,
-    imageUrl,
-  });
+  const existingIdx = session.items.findIndex(
+    it => it.productId === pf.productId && it.size === selectedSize
+  );
+  if (existingIdx >= 0) {
+    const existing = session.items[existingIdx];
+    existing.quantity += qty;
+    const resolvedUnitPrice = existing.unitPrice || unitPrice || 0;
+    existing.unitPrice = resolvedUnitPrice;
+    existing.price = resolvedUnitPrice * existing.quantity;
+    if (imageUrl && !existing.imageUrl) existing.imageUrl = imageUrl;
+  } else {
+    session.items.push({
+      productId: pf.productId,
+      productName: pf.productName,
+      size: selectedSize,
+      quantity: qty,
+      unitPrice,
+      price,
+      imageUrl,
+    });
+  }
   session.handoffDone = false;
 
   if (!Array.isArray(pf.addedSizes)) pf.addedSizes = [];
@@ -1868,6 +2215,9 @@ async function addToCart(phone, qty, session) {
   pf.state = 'awaiting_more_sizes';
   pf.selectedSize = null;
   pf.interactiveVersion = Date.now();
+  // Commit via menu interativo — grade considerada "em progresso", mantém
+  // comportamento de enfileirar o produto no switchFsmFocus (ADR-022).
+  pf.lastCommitSource = 'button';
 
   logger.info({ phone, productId: pf.productId, qty, cartItems: session.items.length }, '[addToCart] Item adicionado');
 
@@ -2157,14 +2507,15 @@ async function processNextInQueue(phone, session) {
   pf.productName = product.name;
   pf.price = parseFloat(product.salePrice || product.price);
   pf.selectedSize = null;
-  pf.addedSizes = [];
+  // Restaura tamanhos já adicionados do snapshot (lojista pode ter adicionado alguns antes de ser interrompido)
+  pf.addedSizes = Array.isArray(next.addedSizes) ? [...next.addedSizes] : [];
   pf.interactiveVersion = Date.now();
   pf.lastClickedProductId = product.id;
   pf.lastClickedProductName = product.name;
   pf.lastClickedProductTimestamp = Date.now();
 
-  logger.info({ phone, productId: product.id, queueRemaining: remaining }, '[FSM] Processando próximo da fila');
-  await sendStockAwareSizeList(phone, session, product, pf.interactiveVersion);
+  logger.info({ phone, productId: product.id, queueRemaining: remaining, restoredSizes: pf.addedSizes }, '[FSM] Processando próximo da fila');
+  await sendStockAwareSizeList(phone, session, product, pf.interactiveVersion, pf.addedSizes);
   return true;
 }
 
@@ -2288,6 +2639,32 @@ async function showCart(phone, session) {
   await sendCartOptions(phone, session, summary);
 }
 
+/**
+ * Monta a descrição dinâmica do botão "Ver Mais Produtos" mostrando
+ * quantos produtos ainda restam na categoria atual.
+ * - Se há categoria ativa e sabemos o total → "Mais N produtos de <linha>"
+ * - Se não há contagem disponível → fallback textual estático
+ */
+function buildMoreProductsDescription(session, { fallback = 'Continuar comprando' } = {}) {
+  const total = Number(session.totalProducts) || 0;
+  const shown = Array.isArray(session.products) ? session.products.length : 0;
+  const remaining = Math.max(0, total - shown);
+  const displayName = session.activeCategory ? getCategoryDisplayName(session.activeCategory) : null;
+
+  if (remaining > 0 && displayName) {
+    const plural = remaining === 1 ? 'produto' : 'produtos';
+    return `Mais ${remaining} ${plural} de ${displayName}`;
+  }
+  if (remaining > 0) {
+    const plural = remaining === 1 ? 'produto' : 'produtos';
+    return `Mais ${remaining} ${plural} pra ver`;
+  }
+  if (displayName) {
+    return `Continuar em ${displayName}`;
+  }
+  return fallback;
+}
+
 async function sendCartOptions(phone, session, text = 'O que você prefere fazer agora?') {
   const itemLabel = `${session.items.length} ${session.items.length === 1 ? 'item' : 'itens'}`;
   const categoryLabel = session.activeCategory
@@ -2296,7 +2673,7 @@ async function sendCartOptions(phone, session, text = 'O que você prefere fazer
   const options = [
     { id: 'cart_finalize', title: 'Finalizar Pedido', description: 'Encaminhar para fechamento' },
     { id: 'cart_view', title: 'Ver Carrinho', description: itemLabel },
-    { id: 'cart_more_products', title: 'Ver Mais Produtos', description: session.activeCategory ? 'Continuar nesta linha' : 'Continuar comprando' },
+    { id: 'cart_more_products', title: 'Ver Mais Produtos', description: buildMoreProductsDescription(session) },
     { id: 'cart_other_category', title: 'Ver Outra Categoria', description: categoryLabel },
     { id: 'falar_atendente', title: 'Falar com Humano', description: 'Tirar dúvidas agora' },
   ];
@@ -2305,14 +2682,22 @@ async function sendCartOptions(phone, session, text = 'O que você prefere fazer
 }
 
 async function sendCatalogBrowseOptions(phone, session, text = 'O que você prefere fazer agora?') {
-  const currentLineLabel = session.activeCategory
-    ? `Mais de ${session.activeCategory.replace(/-/g, ' ')}`
-    : 'Continuar vendo peças';
-  const options = [
-    { id: 'cart_more_products', title: 'Ver Mais Produtos', description: currentLineLabel },
+  const displayName = session.activeCategory ? getCategoryDisplayName(session.activeCategory) : null;
+  const options = [];
+
+  if (session.activeCategory) {
+    options.push({
+      id: 'btn_ver_todos',
+      title: 'Ver Todos',
+      description: `Todos os modelos de ${displayName}`,
+    });
+  }
+
+  options.push(
+    { id: 'cart_more_products', title: 'Ver Mais Produtos', description: buildMoreProductsDescription(session, { fallback: 'Continuar vendo peças' }) },
     { id: 'cart_other_category', title: 'Ver Outra Categoria', description: 'Trocar de linha agora' },
     { id: 'falar_atendente', title: 'Falar com Humano', description: 'Tirar dúvidas agora' },
-  ];
+  );
 
   await zapi.sendOptionList(phone, text, 'Próximo Passo', 'Escolher', options);
 }
@@ -2367,7 +2752,7 @@ async function sendPostAddMenu(phone, session, remainingSizes, customText = null
 
   // Only show "Ver Mais Produtos" when there are no queued items (queue takes priority)
   if (queueLength === 0) {
-    options.push({ id: 'cart_more_products', title: 'Ver Mais Produtos', description: 'Continuar comprando' });
+    options.push({ id: 'cart_more_products', title: 'Ver Mais Produtos', description: buildMoreProductsDescription(session) });
     options.push({ id: 'cart_other_category', title: 'Ver Outra Categoria', description: 'Trocar de linha agora' });
   }
 
@@ -2385,6 +2770,65 @@ async function sendPostAddMenu(phone, session, remainingSizes, customText = null
 
   const menuText = [...focusLines, promptText].filter(Boolean).join('\n\n');
   await zapi.sendOptionList(phone, menuText, 'Próximo Passo', 'Escolher', options);
+}
+
+/**
+ * Troca o foco da FSM para um novo produto, preservando o produto antigo na buyQueue
+ * se ele ainda tiver tamanhos pendentes.
+ * Chamado quando o lojista dá reply em um card diferente do produto em foco.
+ */
+function switchFsmFocus(session, newProduct) {
+  const pf = session.purchaseFlow;
+
+  // Se havia produto em foco, decidir se enfileira.
+  // Regra (ADR-024): commit textual explícito (lastCommitSource === 'text')
+  // é tratado como "grade fechada" — NÃO enfileira. O cliente já expressou
+  // a quantidade desejada; preservar na fila geraria UX confusa.
+  // Commit via botão continua enfileirando se ainda restam tamanhos (ADR-022).
+  if (pf.productId && String(pf.productId) !== String(newProduct.id) && pf.state !== 'idle') {
+    const oldProduct = getLoadedProductById(session, pf.productId) || session.currentProduct;
+    if (oldProduct) {
+      const isExplicitTextCommit =
+        pf.lastCommitSource === 'text' && (pf.addedSizes?.length || 0) > 0;
+
+      if (isExplicitTextCommit) {
+        logger.info(
+          { oldProduct: oldProduct.id, oldName: oldProduct.name, newProduct: newProduct.id, addedSizes: pf.addedSizes },
+          '[FSM] switchFsmFocus: grade textual explícita — produto fechado, NÃO enfileira'
+        );
+      } else {
+        const remaining = getAvailableSizesForSession(session, oldProduct, pf.addedSizes || []);
+        const alreadyQueued = (pf.buyQueue || []).some(q => String(q.productId) === String(oldProduct.id));
+        if (remaining.length > 0 && !alreadyQueued) {
+          if (!Array.isArray(pf.buyQueue)) pf.buyQueue = [];
+          pf.buyQueue.unshift({
+            productId: oldProduct.id,
+            productName: oldProduct.name,
+            productSnapshot: oldProduct,
+            addedSizes: [...(pf.addedSizes || [])],
+          });
+          logger.info(
+            { oldProduct: oldProduct.id, newProduct: newProduct.id, queueSize: pf.buyQueue.length },
+            '[FSM] switchFsmFocus: produto anterior enfileirado no topo'
+          );
+        }
+      }
+    }
+  }
+
+  pf.productId   = newProduct.id;
+  pf.productName = newProduct.name;
+  pf.price       = parseFloat(newProduct.salePrice || newProduct.price) || 0;
+  pf.addedSizes  = [];
+  pf.selectedSize = null;
+  pf.state       = 'awaiting_size';
+  pf.interactiveVersion = Date.now();
+  // Reset do commit source — novo produto começa sem histórico de commit
+  pf.lastCommitSource = null;
+  pf.lastClickedProductId = newProduct.id;
+  pf.lastClickedProductName = newProduct.name;
+  pf.lastClickedProductTimestamp = Date.now();
+  session.currentProduct = newProduct;
 }
 
 async function startInteractivePurchase(phone, product, session, introText = null) {
@@ -2412,7 +2856,30 @@ async function startInteractivePurchase(phone, product, session, introText = nul
     await zapi.sendText(phone, introText);
   }
 
-  await sendStockAwareSizeList(phone, session, await ensureProductStockData(product), session.purchaseFlow.interactiveVersion);
+  // Short-circuit para produtos com 0 ou 1 tamanho — pula awaiting_size
+  const productWithStock = await ensureProductStockData(product);
+  const productSizes = (productWithStock?.sizes || []).filter(Boolean);
+
+  if (productSizes.length === 0) {
+    // Produto sem variação de tamanho — usar 'ÚNICO' como tamanho padrão
+    session.purchaseFlow.selectedSize = 'ÚNICO';
+    session.purchaseFlow.state = 'awaiting_quantity';
+    await zapi.sendText(phone, `📦 *${product.name}* — produto sem variação de tamanho. Quantas unidades você quer?`);
+    await sendStockAwareQuantityList(phone, session, 'ÚNICO', session.purchaseFlow.interactiveVersion, productWithStock);
+    return true;
+  }
+
+  if (productSizes.length === 1) {
+    // Produto com único tamanho — seleciona automaticamente e pede quantidade
+    const singleSize = productSizes[0];
+    session.purchaseFlow.selectedSize = singleSize;
+    session.purchaseFlow.state = 'awaiting_quantity';
+    await zapi.sendText(phone, `📦 *${product.name}* vem em *${singleSize}*. Quantas unidades você quer?`);
+    await sendStockAwareQuantityList(phone, session, singleSize, session.purchaseFlow.interactiveVersion, productWithStock);
+    return true;
+  }
+
+  await sendStockAwareSizeList(phone, session, productWithStock, session.purchaseFlow.interactiveVersion);
   return true;
 }
 
@@ -2422,12 +2889,32 @@ async function startInteractivePurchase(phone, product, session, introText = nul
 async function showProductPhotos(phone, productRef, session) {
   let product = null;
 
-  if (productRef && typeof productRef === 'object' && productRef.id) {
-    product = productRef;
-  } else if (Number.isInteger(productRef) && productRef >= 1 && session.products?.[productRef - 1]) {
-    product = session.products[productRef - 1];
-  } else if (productRef) {
-    product = await resolveProductById(session, productRef);
+  // PRIORIDADE 1 (ADR-026): se a FSM está ativa, o produto em foco é a
+  // resposta correta para "tem foto dele?" / "manda a foto". A IA pode
+  // emitir [FOTOS:N] baseada em posição de session.products[] que ainda
+  // contém uma lista anterior — ignorar o N quando há produto em foco.
+  const pf = session.purchaseFlow;
+  const fsmActive = pf && pf.state !== 'idle' && pf.productId;
+  if (fsmActive) {
+    product = getLoadedProductById(session, pf.productId)
+      || session.currentProduct
+      || await resolveProductById(session, pf.productId);
+    if (product) {
+      logger.info(
+        { productId: product.id, productName: product.name, fsmState: pf.state, ignoredRef: productRef },
+        '[showProductPhotos] FSM ativa — priorizando produto em foco'
+      );
+    }
+  }
+
+  if (!product) {
+    if (productRef && typeof productRef === 'object' && productRef.id) {
+      product = productRef;
+    } else if (Number.isInteger(productRef) && productRef >= 1 && session.products?.[productRef - 1]) {
+      product = session.products[productRef - 1];
+    } else if (productRef) {
+      product = await resolveProductById(session, productRef);
+    }
   }
 
   if (!product) {
@@ -2455,67 +2942,84 @@ async function showProductPhotos(phone, productRef, session) {
 }
 
 async function searchAndShowProducts(phone, query, session) {
+  clearSupportMode(session, 'search_products');
+  const phrase = pickSearchLoadingPhrase(query);
+  await sendLoadingMessage(phone, phrase.text, phrase.tts);
+
+  let searchResult;
   try {
-    clearSupportMode(session, 'search_products');
-    await sendLoadingMessage(
-      phone,
-      `🔍 Buscando por *${query}*...`,
-      `Só um instante, amor! Vou procurar o que temos de ${query} pra você!`
-    );
+    searchResult = await woocommerce.searchProducts(query, 10, 1);
+  } catch (err) {
+    logger.error({ query, err: err.message }, '[searchAndShowProducts] Erro na busca WooCommerce');
+    await zapi.sendText(phone, `⚠️ Não consegui buscar "${query}" agora. Tenta de novo em instantes? 😊`);
+    return;
+  }
 
-    const products = await woocommerce.searchProducts(query, 10);
-    
-    if (!products || products.length === 0) {
-      await zapi.sendText(phone, `😕 Poxa, não encontrei nada buscando por "${query}".`);
-      return;
-    }
+  const products = searchResult.products;
+  if (!products || products.length === 0) {
+    await zapi.sendText(phone, `😕 Poxa, não encontrei nada buscando por "${query}".`);
+    return;
+  }
 
-    session.products = products;
-    session.currentCategory = null;
-    session.activeCategory = null;
-    session.currentPage = 1;
-    session.totalPages = 1;
-    session.totalProducts = products.length;
+  session.products = products;
+  session.currentCategory = null;
+  session.activeCategory = null;
+  session.currentPage = 1;
+  session.totalPages = 1; // Paginação de search ainda não encadeada em showNextPage — preserva comportamento antigo
+  session.totalProducts = products.length;
 
-    let msg = `✨ *Resultados para: ${query}* ✨\n\n`;
-    products.forEach((p, i) => {
-      msg += `${i + 1}. *${p.name}* — ${woocommerce.formatPrice(p.salePrice || p.price)}\n`;
-    });
-    await zapi.sendText(phone, msg);
-
-    session.purchaseFlow.interactiveVersion = Date.now();
-    for (const [i, product] of products.entries()) {
-      if (product.imageUrl) {
+  // Enviar cards (sem lista de texto redundante)
+  session.purchaseFlow.interactiveVersion = Date.now();
+  for (const [i, product] of products.entries()) {
+    if (product.imageUrl) {
+      try {
+        const scRes = await zapi.sendProductShowcase(phone, product, session.purchaseFlow.interactiveVersion);
+        registerMessageProduct(session, scRes?.data?.zaapId, scRes?.data?.messageId, product);
+      } catch {
         try {
-          const scRes = await zapi.sendProductShowcase(phone, product, session.purchaseFlow.interactiveVersion);
-          registerMessageProduct(session, scRes?.data?.zaapId, scRes?.data?.messageId, product);
-        } catch {
           const imgRes = await zapi.sendImage(phone, product.imageUrl, woocommerce.buildCaption(product, i + 1));
           registerMessageProduct(session, imgRes?.data?.zaapId, imgRes?.data?.messageId, product);
+        } catch (imgErr) {
+          logger.warn({ productId: product.id, err: imgErr?.message }, '[searchAndShowProducts] Falha ao enviar imagem');
         }
-        await zapi.delay(400);
       }
+      await zapi.delay(400);
     }
+  }
 
-    if (products.length > 0) {
-      session.lastViewedProduct = products[products.length - 1];
-      session.lastViewedProductIndex = products.length;
-    }
+  if (products.length > 0) {
+    session.lastViewedProduct = products[products.length - 1];
+    session.lastViewedProductIndex = products.length;
+  }
 
-    const nudge = '[SISTEMA: Você mostrou os resultados da busca. Pergunte se a cliente gostou de alguma peça ou se quer pesquisar outra coisa.]';
+  // Follow-up da IA — try/catch separado: falha da IA não mata o fluxo nem mostra "Erro ao buscar"
+  try {
+    const nudge = '[SISTEMA: Os produtos da busca foram exibidos. Reagir naturalmente — pode ser curto, tipo "gostou?" ou "tem mais coisa?". NÃO liste produtos, NÃO dê instruções de número. Mantenha o ritmo de WhatsApp.]';
     appendHistory(session, 'system', nudge);
     conversationMemory.refreshConversationMemory(session, { action: { type: 'BUSCAR', payload: query } });
 
-    const aiRaw = await ai.chat(session.history, buildAiContext(session));
+    const aiRaw = await ai.chat(getActiveHistoryWindow(session), buildAiContext(session));
     const { cleanText } = ai.parseAction(aiRaw);
     if (cleanText) {
       appendHistory(session, 'assistant', cleanText);
       conversationMemory.refreshConversationMemory(session, { assistantText: cleanText });
-      await zapi.sendText(phone, cleanText);
+      if (session.items.length > 0) {
+        await sendCartOptions(phone, session, cleanText);
+      } else {
+        // Após busca: só texto da IA, sem menu forçado.
+        // O menu de categorias só aparece se o cliente pedir explicitamente.
+        await zapi.sendText(phone, cleanText);
+      }
     }
-  } catch (err) {
-    logger.error({ query, err: err.message }, '[searchAndShowProducts] Error');
-    await zapi.sendText(phone, '⚠️ Erro ao buscar produtos.');
+  } catch (aiErr) {
+    logger.error({ query, err: aiErr.message }, '[searchAndShowProducts] Erro na IA — usando fallback');
+    const fallbacks = [
+      'Gostou de alguma? Me manda o número pra eu separar o tamanho 😊',
+      'Achou o que procurava? É só me dizer o número da peça!',
+      'Quer saber mais sobre alguma dessas? Só falar 😄',
+    ];
+    const fallback = fallbacks[Math.floor(Math.random() * fallbacks.length)];
+    await zapi.sendText(phone, fallback);
   }
 }
 
@@ -2524,11 +3028,8 @@ async function showCategory(phone, slug, session) {
   slug = normalizeCategorySlug(slug);
   clearSupportMode(session, 'show_category');
   const displayName = getCategoryDisplayName(slug);
-  await sendLoadingMessage(
-    phone,
-    `🔍 Buscando os melhores modelos de *${displayName}* pra você...`,
-    `Um momento, amor! Já estou separando os melhores modelos de ${displayName} pra você!`
-  );
+  const phrase = pickLoadingPhrase(displayName);
+  await sendLoadingMessage(phone, phrase.text, phrase.tts);
 
   try {
     const result = await woocommerce.getProductsByCategory(slug, 10, 1);
@@ -2552,15 +3053,12 @@ async function showCategory(phone, slug, session) {
   }
 }
 
-async function showAllCategory(phone, slug, session) {
+async function showAllCategory(phone, slug, session, opts = {}) {
   slug = normalizeCategorySlug(slug);
   clearSupportMode(session, 'show_all_category');
   const displayNameAll = getCategoryDisplayName(slug);
-  await sendLoadingMessage(
-    phone,
-    `🔍 Buscando os melhores modelos de *${displayNameAll}* pra você...`,
-    `Um momento, amor! Estou separando todos os modelos de ${displayNameAll} pra você!`
-  );
+  const phrase = pickLoadingPhrase(displayNameAll, { isFirstContact: !!opts.isFirstContact });
+  await sendLoadingMessage(phone, phrase.text, phrase.tts);
 
   try {
     // Busca em blocos de 100 e agrega todas as páginas para realmente exibir "todos".
@@ -2669,6 +3167,18 @@ async function showAllCategory(phone, slug, session) {
   }
 }
 
+function mergeProductsUnique(existing, incoming) {
+  const seen = new Set(existing.map(p => p.id));
+  const merged = [...existing];
+  for (const p of incoming) {
+    if (!seen.has(p.id)) {
+      seen.add(p.id);
+      merged.push(p);
+    }
+  }
+  return merged;
+}
+
 async function showNextPage(phone, session) {
   if (!session.currentCategory || session.currentPage >= session.totalPages) {
     await zapi.sendText(phone, '✅ Todos os produtos já foram mostrados.');
@@ -2681,10 +3191,13 @@ async function showNextPage(phone, session) {
     const result = await woocommerce.getProductsByCategory(session.currentCategory, 10, nextPage);
 
     const startIdx = session.products.length;
-    session.products = [...session.products, ...result.products];
+    const mergedProducts = mergeProductsUnique(session.products, result.products);
+    const newlyAdded = mergedProducts.slice(startIdx);
+    session.products = mergedProducts;
     session.currentPage = result.page;
 
-    await sendProductPage(phone, result, session, startIdx);
+    // Enviar apenas os produtos recém-adicionados (únicos), preservando indexação do carrinho
+    await sendProductPage(phone, { ...result, products: newlyAdded }, session, startIdx);
   } catch (err) {
     logger.error({ err: err.message }, '[showNextPage] Error');
     await zapi.sendText(phone, '⚠️ Erro ao carregar mais produtos.');
@@ -2696,11 +3209,35 @@ async function sendProductPage(phone, result, session, startIdx = 0) {
   for (const [i, product] of result.products.entries()) {
     if (product.imageUrl) {
       try {
-        const scRes = await zapi.sendProductShowcase(phone, product, session.purchaseFlow.interactiveVersion);
-        registerMessageProduct(session, scRes?.data?.zaapId, scRes?.data?.messageId, product);
-      } catch {
-        const imgRes = await zapi.sendImage(phone, product.imageUrl, woocommerce.buildCaption(product, startIdx + i + 1));
-        registerMessageProduct(session, imgRes?.data?.zaapId, imgRes?.data?.messageId, product);
+        let sent = false;
+
+        try {
+          const scRes = await zapi.sendProductShowcase(phone, product, session.purchaseFlow.interactiveVersion);
+          registerMessageProduct(session, scRes?.data?.zaapId, scRes?.data?.messageId, product);
+          sent = true;
+        } catch (showcaseErr) {
+          logger.warn(
+            { productId: product.id, err: showcaseErr?.message || String(showcaseErr) },
+            '[sendProductPage] sendProductShowcase falhou — tentando sendImage'
+          );
+        }
+
+        if (!sent) {
+          try {
+            const imgRes = await zapi.sendImage(phone, product.imageUrl, woocommerce.buildCaption(product, startIdx + i + 1));
+            registerMessageProduct(session, imgRes?.data?.zaapId, imgRes?.data?.messageId, product);
+          } catch (imageErr) {
+            logger.error(
+              { productId: product.id, err: imageErr?.message || String(imageErr) },
+              '[sendProductPage] Falha ao enviar imagem fallback — produto pulado'
+            );
+          }
+        }
+      } catch (loopErr) {
+        logger.error(
+          { productId: product.id, err: loopErr?.message || String(loopErr) },
+          '[sendProductPage] Erro inesperado ao processar produto'
+        );
       }
       await zapi.delay(400);
     }
@@ -2713,23 +3250,46 @@ async function sendProductPage(phone, result, session, startIdx = 0) {
 
   const hasMore = session.currentPage < session.totalPages;
   const nudge = hasMore
-    ? `[SISTEMA: Você mostrou a página ${session.currentPage} de ${session.totalPages}. Pergunte se a cliente gostou de alguma peça ou se quer ver mais produtos (ação PROXIMOS).]`
-    : `[SISTEMA: Você mostrou todos os produtos disponíveis. Pergunte se a cliente gostou de alguma peça ou quer ver outra categoria.]`;
+    ? `[SISTEMA: Página ${session.currentPage} de ${session.totalPages} exibida. Papo fluindo — próxima pode ser "PROXIMOS" se ela quiser. Reação curta no ritmo de zap, sem listar nada.]`
+    : `[SISTEMA: Todos os produtos da categoria já foram exibidos. Conversa aberta — reação curta e natural, sem listar, sem menu.]`;
   appendHistory(session, 'system', nudge);
   conversationMemory.refreshConversationMemory(session, { action: { type: 'VER_CATEGORIA', payload: session.currentCategory } });
 
-  const aiRaw = await ai.chat(session.history, buildAiContext(session));
-  const { cleanText } = ai.parseAction(aiRaw);
-  if (cleanText) {
-    appendHistory(session, 'assistant', cleanText);
-    conversationMemory.refreshConversationMemory(session, { assistantText: cleanText });
-    if (session.items.length > 0) {
-      await sendCartOptions(phone, session, cleanText);
-    } else if (hasMore && session.activeCategory) {
-      await sendCatalogBrowseOptions(phone, session, cleanText);
+  // Follow-up da IA — try/catch separado: falha da IA não mata o fluxo nem gera "Erro ao buscar produtos"
+  let followUpText = '';
+  try {
+    const aiRaw = await ai.chat(getActiveHistoryWindow(session), buildAiContext(session));
+    const parsed = ai.parseAction(aiRaw);
+    followUpText = parsed.cleanText || '';
+    if (followUpText) {
+      appendHistory(session, 'assistant', followUpText);
+      conversationMemory.refreshConversationMemory(session, { assistantText: followUpText });
     } else {
-      await sendCategoryMenu(phone, cleanText);
+      logger.warn({ category: session.currentCategory, aiRawLen: aiRaw?.length || 0 }, '[sendProductPage] IA retornou texto vazio — usando fallback');
     }
+  } catch (aiErr) {
+    logger.error({ err: aiErr.message, category: session.currentCategory }, '[sendProductPage] Erro na IA — produtos já exibidos');
+  }
+
+  // Fallback determinístico: garante que o menu SEMPRE é enviado após os produtos,
+  // mesmo que a IA tenha falhado ou retornado vazio. Nunca deixa a conversa morrer.
+  if (!followUpText) {
+    const fallbacks = [
+      'Gostou de alguma? 😊 Me diz o número pra gente seguir!',
+      'Achou algo que curtiu? Só falar qual 😄',
+      'Alguma dessas te chamou atenção? Me conta!',
+    ];
+    followUpText = fallbacks[Math.floor(Math.random() * fallbacks.length)];
+    appendHistory(session, 'assistant', followUpText);
+    conversationMemory.refreshConversationMemory(session, { assistantText: followUpText });
+  }
+
+  if (session.items.length > 0) {
+    await sendCartOptions(phone, session, followUpText);
+  } else if (hasMore && session.activeCategory) {
+    await sendCatalogBrowseOptions(phone, session, followUpText);
+  } else {
+    await sendCategoryMenu(phone, followUpText);
   }
 }
 
@@ -2878,11 +3438,12 @@ async function handoffToConsultant(phone, session) {
   resetPurchaseFlow(session);
   session.handoffDone = true;
 
+  await persistSession(phone);
   logger.info({ phone }, '[Handoff] Session handed off successfully');
 }
 
 app.get('/', (_req, res) => res.json({ status: 'online', activeSessions: Object.keys(sessions).length }));
 
-app.listen(PORT, () => {
+server.listen(PORT, () => {
   logger.info({ port: PORT }, '🚀 Agente Belux running');
 });

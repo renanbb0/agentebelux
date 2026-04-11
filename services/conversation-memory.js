@@ -7,12 +7,54 @@ function createDefaultConversationMemory() {
     discussedTopics: [],
     pendingFollowUp: '',
     summary: '',
+    // Resumo cumulativo de turnos que saíram da janela deslizante de contexto
+    // (turnos com mais de 20 min). Mantido curto (800 chars) pra não inflar o prompt.
+    archivedSummary: '',
     lastUserMessage: '',
     lastAssistantMessage: '',
     lastSystemAction: '',
     turnCount: 0,
     updatedAt: null,
   };
+}
+
+const ARCHIVED_SUMMARY_MAX = 800;
+
+/**
+ * Comprime turnos antigos (fora da janela deslizante) num resumo textual
+ * acumulativo em memory.archivedSummary. Mantém o tamanho limitado
+ * descartando o início quando passa de ARCHIVED_SUMMARY_MAX chars.
+ *
+ * @param {object} session
+ * @param {Array<{role, content, ts}>} staleEntries - mensagens a arquivar
+ */
+function archiveStaleTurns(session, staleEntries) {
+  if (!Array.isArray(staleEntries) || staleEntries.length === 0) return;
+  const memory = session.conversationMemory || createDefaultConversationMemory();
+
+  const fragments = staleEntries
+    .map(entry => {
+      const roleTag = entry.role === 'user' ? 'cliente' : entry.role === 'assistant' ? 'bela' : entry.role;
+      const snippet = sanitizeSnippet(entry.content, 80);
+      return snippet ? `${roleTag}: ${snippet}` : '';
+    })
+    .filter(Boolean);
+
+  if (fragments.length === 0) return;
+
+  const addition = fragments.join(' | ');
+  let next = memory.archivedSummary
+    ? `${memory.archivedSummary} | ${addition}`
+    : addition;
+
+  // Mantém os chars mais recentes quando ultrapassa o limite
+  if (next.length > ARCHIVED_SUMMARY_MAX) {
+    next = '...' + next.slice(next.length - ARCHIVED_SUMMARY_MAX + 3);
+  }
+
+  memory.archivedSummary = next;
+  memory.updatedAt = Date.now();
+  session.conversationMemory = memory;
 }
 
 function sanitizeSnippet(text, maxLen = 180) {
@@ -293,6 +335,10 @@ function buildConversationContext(session) {
     lines.push(`- Resumo vivo: ${memory.summary}`);
   }
 
+  if (memory.archivedSummary) {
+    lines.push(`- Historico comprimido (turnos fora da janela de 20min): ${memory.archivedSummary}`);
+  }
+
   lines.push('- Regra de continuidade: trate a conversa como CONTINUA dentro da janela ativa da sessao; nao reinicie o atendimento por causa de uma saudacao curta.');
 
   return lines.join('\n');
@@ -302,4 +348,5 @@ module.exports = {
   buildConversationContext,
   createDefaultConversationMemory,
   refreshConversationMemory,
+  archiveStaleTurns,
 };
