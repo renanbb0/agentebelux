@@ -31,6 +31,11 @@
       "sourceType": "github",
       "computedHash": "246e65cd72a7e360987d94e6c61564ce6d71c6361d1784d529d70e4cbbe8522d"
     },
+    "senior-backend": {
+      "source": "davila7/claude-code-templates",
+      "sourceType": "github",
+      "computedHash": "c15972382ed35ec141f419c3caec031156721d85b26c29fd22cd4cf9991acd7b"
+    },
     "subagent-driven-development": {
       "source": "obra/superpowers",
       "sourceType": "github",

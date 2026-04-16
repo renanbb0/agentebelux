@@ -119,7 +119,7 @@ graph TD;
   D -->|TAMANHO| H[item adicionado + currentProduct null];
   D -->|NOME| I[customerName setado];
   D -->|REMOVER| J[item removido do carrinho];
-  D -->|FINALIZAR| K[Sessão deletada];
+  D -->|FINALIZAR| K[handoffDone=true — sessão preservada];
   D -->|30min sem mensagem| L[TTL: sessão limpa pelo setInterval];
 ```
 
@@ -228,7 +228,7 @@ async function executeAction(phone, action, session) {
 | `NOME` | string | Registra `session.customerName` | Nenhum output |
 | `CARRINHO` | — | Lê `session.items` | Resumo do carrinho |
 | `REMOVER` | índice (1-based) | Remove item de `session.items` | Confirmação + carrinho |
-| `FINALIZAR` | — | Gera pedido, notifica admin, deleta sessão | Confirmação |
+| `FINALIZAR` | — | Gera pedido, notifica admin, seta `handoffDone=true` (sessão preservada) | Confirmação |
 
 ---
 
@@ -350,6 +350,14 @@ app.get('/', (_req, res) => {
 - ✅ TTL evita memory leak
 - ❌ Perde tudo no restart do servidor
 - ❌ Não escala para múltiplas instâncias
+
+### ADR-022: Reply como Cursor de Seleção B2B + Tamanho Único (2026-04-11)
+
+**Contexto:** Lojistas B2B dão reply em cards antigos digitando grades ("3P 5M 2G") enquanto a FSM está ocupada com outro produto. O bot ignorava o reply e adicionava ao produto errado.
+
+**Decisão:** Quote resolve o alvo ANTES da FSM. Novo helper `switchFsmFocus(session, newProduct)` troca o foco e preserva o produto antigo via `pf.buyQueue.unshift(snapshot)` (topo, não fim). Produto de tamanho único pula `awaiting_size` e vai direto para `awaiting_quantity`. `normalizeSizeLabel` colapsa variantes ("Tam único - pct com 5 unidades") para `'ÚNICO'`. Ver [[quote-reply-logic]] para detalhe completo.
+
+**⚠️ Isto é feature, não bug.** Não remova esta lógica.
 
 ### ADR-005: FSM de Compra Interativa com buyQueue (2026-04-03)
 

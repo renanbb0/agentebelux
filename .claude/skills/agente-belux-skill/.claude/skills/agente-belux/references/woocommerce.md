@@ -52,21 +52,28 @@ const wooApi = axios.create({
 IDs de categoria são cacheados em memória para evitar chamadas redundantes à API:
 
 ```javascript
-const categoryCache = {};
+// TTL de 10 minutos — evita usar IDs de categorias deletadas/renomeadas
+const categoryCache = new Map();
+const CATEGORY_CACHE_TTL_MS = 10 * 60 * 1000;
 
 async function getCategoryIdBySlug(slug) {
-  if (categoryCache[slug]) return categoryCache[slug];
-  // ... busca na API e armazena no cache
+  const cached = categoryCache.get(slug);
+  if (cached && (Date.now() - cached.loadedAt) < CATEGORY_CACHE_TTL_MS) return cached.id;
+  // ... busca na API
+  if (id) categoryCache.set(slug, { id, loadedAt: Date.now() });
 }
 ```
 
 ### Mapa de Categorias
 
 ```javascript
+// 5 categorias ativas no WooCommerce da Belux (2026-04)
 const CATEGORY_MAP = {
-  feminino: 'feminino',
-  masculino: 'masculino',
-  infantil: 'infantil',
+  feminino:           'feminino',
+  femininoinfantil:   'femininoinfantil',
+  masculino:          'masculino',
+  masculinoinfantil:  'masculinoinfantil',
+  'lancamento-da-semana': 'lancamento-da-semana',
 };
 ```
 
@@ -134,16 +141,14 @@ function formatProduct(product) {
 ## Busca Livre
 
 ```javascript
-async function searchProducts(query, perPage = 10) {
-  const { data: products } = await wooApi.get('/products', {
-    params: {
-      search: query,
-      per_page: perPage,
-      status: 'publish',
-      stock_status: 'instock',
-    },
+// Retorna o mesmo shape de getProductsByCategory: { products, page, totalPages, total, hasMore }
+async function searchProducts(query, perPage = 20, page = 1) {
+  const response = await wooApi.get('/products', {
+    params: { search: query, per_page: perPage, page, status: 'publish', stock_status: 'instock' },
   });
-  return products.map(formatProduct);
+  const total = parseInt(response.headers['x-wp-total'] || '0', 10);
+  const totalPages = parseInt(response.headers['x-wp-totalpages'] || '1', 10);
+  return { products: deduplicateProducts(response.data.map(formatProduct)), page, totalPages, total, hasMore: page < totalPages };
 }
 ```
 

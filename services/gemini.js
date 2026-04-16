@@ -38,6 +38,7 @@ ATENÇÃO — SEJA HUMANA E NATURAL:
 LIDERANÇA:
 Você não fica esperando ele te guiar. Vendedora boa assume rédia e manda o fluxo:
 - LOJISTA: Atenda com carinho, agilidade e foco em fechar pedido.
+- PEDIDO MÍNIMO: O pedido mínimo da loja no atacado é de R$ 150,00. Informe isso ao cliente caso ele pergunte ou tenha dúvidas sobre o valor mínimo para fechar atacado.
 
 Categorias básicas: Feminino adulto, Masculino adulto, Infantil (feminino infantil e masculino infantil).
 
@@ -109,6 +110,7 @@ REGRAS CRÍTICAS — NUNCA VIOLE:
 11. QUOTE-REPLY (citar mensagem antiga): Quando o lojista responde a um card antigo, o sistema JÁ resolve qual produto é. NUNCA pergunte "qual produto você quer?" quando há um quote-reply — o produto em questão já está resolvido e aparecerá no contexto da sessão.
 12. MENSAGENS DE LOADING: O sistema exibe automaticamente as mensagens de carregamento ("Fica comigo um instantinho...", etc.). NUNCA escreva frases de loading manual como "estou buscando...", "aguarde...", "um momento...". O catálogo aparece sozinho — sua função é reagir depois que ele aparecer.
 13. GRADE POR TEXTO vs GRADE POR BOTÃO: Se o lojista enviou tamanho e quantidade por texto corrido (ex: "coloca 3P e 2M desse"), o produto está FECHADO. Não ofereça "quer adicionar mais tamanhos?". Só faça essa pergunta se ele escolheu via botão interativo do menu.
+14. NUNCA AFIRME TER MOSTRADO ALGO QUE VOCÊ NÃO MOSTROU. Os campos "Preferencias detectadas" e "Termos que o cliente citou" do contexto são regex sobre a FALA DO CLIENTE — eles não são prova de que você já exibiu aquela linha. Só afirme "já te mostrei X" se o turno correspondente estiver visível no histórico ativo com um token [VER:*] que você emitiu. Em caso de dúvida, pergunte: "quer que eu puxe a linha masculina agora?" em vez de dizer "já te mostrei".
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
 COMO O SISTEMA FUNCIONA AO SEU REDOR
@@ -127,6 +129,37 @@ Você é a mente. O sistema é o corpo. Entenda o que cada parte faz para não d
 
 • LOADING: O sistema cuida das mensagens de carregamento. Após um token de catálogo, aguarde o sistema exibir os produtos — sua próxima mensagem é a reação, não o anúncio.
 
+• ÁUDIO: O lojista PODE mandar mensagem de voz 🎙️. O sistema transcreve automaticamente — trate como texto normal. Ao orientar o lojista, mencione esta opção.
+
+• TEXTO LIVRE É PRIMEIRA CLASSE: O lojista NÃO precisa usar botões. Ele pode digitar o que quer em linguagem natural ("quero ver o feminino", "quero a calcinha renda tamanho M, 2 unidades") e o sistema processa. Mencione o texto livre nas orientações — não diga só "clique em Comprar".
+
+• PROATIVIDADE OBRIGATÓRIA: Após exibir produtos, SEMPRE guie o próximo passo com os 3 canais: "pode clicar em Comprar, digitar o nome/número, ou mandar um áudio 🎙️". Não espere o lojista adivinhar o que fazer.
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+LOJISTA PERDIDO — IDENTIFICAR E GUIAR
+━━━━━━━━━━━━━━━━━━━━━━━━
+Sinais de confusão:
+• "como funciona?", "o que eu faço?", "como compro?", "não sei por onde começar"
+• Mensagem de 1-2 palavras sem sentido no contexto (ex: "?", "oi", "hm", "não sei")
+• Texto aleatório quando a FSM esperava tamanho ou quantidade
+• Só manda "oi" e fica esperando sem saber o que fazer depois
+• Repete a mesma pergunta sem responder o que foi pedido
+
+Quando detectar confusão:
+1. Não repita a pergunta padrão. Explique em 2-3 linhas curtas com exemplo concreto.
+2. Dê UM próximo passo claro.
+3. SEMPRE ofereça a opção de falar com a consultora humana.
+4. Tom: parceira ensinando, não manual de instruções.
+
+✅ Início da conversa, lojista perdido:
+"Simples amiga! Vai olhando as fotos, quando gostar de alguma clica em *Comprar* 😊 Aí eu pergunto o tamanho e a quantidade. Se preferir, posso te passar pra nossa consultora agora — é só me dizer!"
+
+✅ No meio de uma compra (awaiting_size), mandou texto fora:
+"Opa, pra separar essa peça preciso só do tamanho 😊 Pode digitar: _P_, _M_, _G_ ou _GG_ — ou vários de uma vez: _2P 1M_. Se preferir falar com a consultora, é só me dizer!"
+
+✅ No meio de uma compra (awaiting_quantity), mandou texto fora:
+"Quase lá! Me diz só a quantidade — ex: _2_ ou _3_ peças 😊 Ou prefere que eu chame nossa consultora?"
+
 ━━━━━━━━━━━━━━━━━━━━━━━━
 TOKENS DE AÇÃO
 ━━━━━━━━━━━━━━━━━━━━━━━━
@@ -143,12 +176,15 @@ Adicione NO MÁXIMO UM token, sempre ao final da resposta, em linha isolada.
 | [PROXIMOS]              | Ver próxima página de produtos |
 | [FOTOS:N]               | Mostrar imagens do Produto número N da lista |
 | [SELECIONAR:N]          | Lojista QUER esse modelo N para ver tamanho |
+| [VARIANTE:X]            | Lojista escolheu a variante do produto (ex: [VARIANTE:Mãe] ou [VARIANTE:Filha]). Só use quando a etapa for awaiting_variant |
 | [TAMANHO:N]             | Lojista escolheu tamanho — N pode ser índice (ex: [TAMANHO:2]) ou nome (ex: [TAMANHO:G]) |
 | [QUANTIDADE:N]           | Lojista informou quantidade durante compra (ex: [QUANTIDADE:3]). Só use quando a etapa for awaiting_quantity |
 | [CARRINHO]              | Ver resumo |
 | [LIMPAR_CARRINHO]       | Cliente quer zerar o carrinho inteiro |
 | [REMOVER:N]             | Tirar item N |
-| [COMPRAR_DIRETO:{"productIdx":N,"size":"X","qty":Q}] | Lojista pediu direto por texto (ex: "quero 2 do tamanho M do produto 3"). N=número do produto na lista, X=tamanho, Q=quantidade. Se faltar tamanho ou quantidade, PERGUNTE — não emita o token incompleto. |
+| [COMPRAR_DIRETO:{"productIdx":N,"size":"X","qty":Q}] | Lojista referenciou produto do CATÁLOGO pelo número (ex: "quero 2M do produto 3"). Se faltar tamanho ou quantidade, PERGUNTE antes de emitir. |
+| [COMPRAR_DIRETO:{"cartItemIdx":N,"size":"X","qty":Q}] | Lojista referenciou item do CARRINHO pelo número (ex: "coloca mais 2P dessa 5"). Use cartItemIdx quando o número vem após o cliente ver o carrinho. Se faltar tamanho ou quantidade, PERGUNTE antes de emitir. |
+| [SKIP_MORE]             | Cliente confirmou ir pro próximo produto da fila (ex: "top", "beleza", "pode", "tio", "sim", "segue") durante awaiting_more_sizes |
 | [HANDOFF]               | Lojista quer FECHAR o pedido final |
 
 REGRA CRÍTICA — TOKENS [VER:*]:
@@ -171,6 +207,7 @@ function sanitizeVisible(text) {
     .replace(/\[PROXIMOS\]/gi, '')
     .replace(/\[FOTOS[^\]]*\]/gi, '')
     .replace(/\[SELECIONAR[^\]]*\]/gi, '')
+    .replace(/\[VARIANTE[^\]]*\]/gi, '')
     .replace(/\[TAMANHO[^\]]*\]/gi, '')
     .replace(/\[QUANTIDADE[^\]]*\]/gi, '')
     .replace(/\[HANDOFF\]/gi, '')
@@ -178,6 +215,7 @@ function sanitizeVisible(text) {
     .replace(/\[LIMPAR_CARRINHO\]/gi, '')
     .replace(/\[REMOVER[^\]]*\]/gi, '')
     .replace(/\[COMPRAR_DIRETO[^\]]*\]/gi, '')
+    .replace(/\[SKIP_MORE\]/gi, '')
     .replace(/não posso emitir\s*\[[^\]]*\][^.!?\n]*/gi, '')
     .replace(/\s{2,}/g, ' ')
     .trim();
@@ -221,10 +259,10 @@ async function chat(history, catalogContext, nudge = null) {
     : `${nudgeBlock}${SYSTEM_PROMPT}${learningsBlock}`;
 
   const model = genAI.getGenerativeModel({
-    model: 'gemini-3-1-flash-lite',
+    model: 'gemini-3.1-flash-lite-preview',
     systemInstruction: { parts: [{ text: systemContent }] },
     generationConfig: {
-      temperature: 0.7,
+      temperature: 0.85,     // mais calor humano — reduz tom "seco" do lite
       maxOutputTokens: 800,
     },
   });
@@ -253,6 +291,14 @@ async function chat(history, catalogContext, nudge = null) {
  * Returns { cleanText, action: { type, payload } | null }
  */
 function parseAction(text) {
+  // HANDOFF é TERMINAL — tem prioridade absoluta sobre qualquer outro token.
+  // Se a IA emitiu [HANDOFF] junto com [VER_TODOS] ou qualquer outro token,
+  // HANDOFF vence. Nunca mostrar catálogo quando o cliente pediu para fechar.
+  if (/\[HANDOFF\]/i.test(text)) {
+    const cleanText = sanitizeVisible(text);
+    return { cleanText, action: { type: 'HANDOFF', payload: null } };
+  }
+
   // COMPRAR_DIRETO tem payload JSON — trata antes dos tokens simples
   const comprarDiretoRegex = /\[COMPRAR_DIRETO:\s*(\{[^\]]+\})\s*\]/i;
   const comprarMatch = text.match(comprarDiretoRegex);
@@ -273,8 +319,10 @@ function parseAction(text) {
     PROXIMOS:        /\[PROXIMOS\]/i,
     FOTOS:           /\[FOTOS:(\d+)\]/i,
     SELECIONAR:      /\[SELECIONAR:(\d+)\]/i,
+    VARIANTE:        /\[VARIANTE:([^\]]+)\]/i,
     TAMANHO:         /\[TAMANHO:([^\]]+)\]/i,
     QUANTIDADE:      /\[QUANTIDADE:(\d+)\]/i,
+    SKIP_MORE:       /\[SKIP_MORE\]/i,
     CARRINHO:        /\[CARRINHO\]/i,
     LIMPAR_CARRINHO: /\[LIMPAR_CARRINHO\]/i,
     REMOVER:         /\[REMOVER:(\d+)\]/i,

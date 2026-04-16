@@ -132,6 +132,13 @@ function analyzeUserMessage(text) {
     /\brevisar pedido\b/,
     /\bver pedido\b/,
     /\bmostra meu pedido\b/,
+    // Perguntas de valor/total — não devem ser interceptadas pelo FSM de tamanhos
+    /\bquanto (deu|ficou|ta|tá|fica|é|foi)\b/,
+    /\bdeu quanto\b/,
+    /\bqual.*(total|valor)\b/,
+    /\b(total|valor).*(pedido|compra|carrinho)\b/,
+    /\bme manda.*(paguei|pedido|comprei|separei)\b/,
+    /\bo que (eu )?(paguei|separei|comprei|tem)\b/,
   ]);
 
   const wantsClearCart = matchAny(normalized, [
@@ -157,6 +164,23 @@ function analyzeUserMessage(text) {
     /\bpagamento\b/,
     /\bpagar\b/,
     /\bcheckout\b/,
+    // Expressões naturais de "terminei de escolher / pode fechar"
+    /\bterminei\b/,
+    /\bpront[oa]\b/,
+    /\bacabei\b/,
+    /\bpode\s+fechar\b/,
+    /\bpode\s+mandar\b/,
+    /\bfecha\s+(a[iíì]|a\s+compra|o\s+pedido)\b/,
+    /\b[ée]\s+isso\b/,
+    /\bissso?\s+[ée]\s+tudo\b/,
+    /\bquero\s+fechar\b/,
+    /\bpode\s+(ir|seguir|manda[r]?)\b/,
+    // Variações de "encerrar" e "terminar a compra" (ex: "encerrei", "terminar a compra")
+    /\bencerrr?[aeo][iu]?\b/,
+    /\bterminar?\s+(a\s+)?compra\b/,
+    /\bpode\s+(terminar|encerrar)\b/,
+    /\bso\s+isso\s+[ée]\s+tudo\b/,
+    /\bta\s*(bom|ok)\s+pode\s+(fechar|terminar|encerrar)\b/,
   ]);
 
   const wantsPrice = matchAny(normalized, [

@@ -11,36 +11,61 @@ const wooApi = axios.create({
     username: WC_CONSUMER_KEY,
     password: WC_CONSUMER_SECRET,
   },
-  timeout: 15000,
+  timeout: 30000, // 30s — WordPress pode ser lento sob carga
 });
 
-// In-memory cache for category IDs — avoids repeated lookups on each request
-const categoryCache = {};
+// In-memory cache for category IDs with TTL — avoids repeated lookups on each request
+const categoryCache = new Map();
+const CATEGORY_CACHE_TTL_MS = 10 * 60 * 1000;
 const variationCache = new Map();
 const VARIATION_CACHE_TTL_MS = 2 * 60 * 1000;
 
+// Cache de lista de produtos por categoria — evita múltiplas chamadas ao WordPress
+// sob concorrência (que pode derrubar o host). TTL de 5 min: produtos raramente mudam
+// entre atendimentos. Retornamos shallow copies para não compartilhar mutações entre
+// sessões (enrichProductWithStock modifica o objeto in-place).
+const productListCache = new Map();
+const PRODUCT_LIST_CACHE_TTL_MS = 5 * 60 * 1000;
+
+// Cache de busca por texto — TTL menor (3 min) pois queries são mais variadas
+const searchCache = new Map();
+const SEARCH_CACHE_TTL_MS = 3 * 60 * 1000;
+
 /**
- * Looks up a WooCommerce category ID by slug, with in-memory caching.
+ * Looks up a WooCommerce category ID by slug, with in-memory caching (TTL 10 min).
  * @param {string} slug - Category slug
  * @returns {Promise<number|null>} Category ID or null
  */
 async function getCategoryIdBySlug(slug) {
-  if (categoryCache[slug]) return categoryCache[slug];
+  const cached = categoryCache.get(slug);
+  if (cached && (Date.now() - cached.loadedAt) < CATEGORY_CACHE_TTL_MS) {
+    return cached.id;
+  }
 
   const { data: categories } = await wooApi.get('/products/categories', {
     params: { slug, per_page: 1 },
   });
 
   const id = categories.length > 0 ? categories[0].id : null;
-  if (id) categoryCache[slug] = id;
+  if (id) categoryCache.set(slug, { id, loadedAt: Date.now() });
   return id;
 }
 
 /**
  * Fetches products for a category with pagination.
- * Returns metadata for pagination control.
+ * Results are cached in memory for PRODUCT_LIST_CACHE_TTL_MS (5 min) to reduce
+ * WordPress load under concurrent usage. Returns shallow copies of cached products
+ * so that enrichProductWithStock mutations don't pollute the cache.
  */
 async function getProductsByCategory(categorySlug, perPage = 10, page = 1) {
+  const cacheKey = `${categorySlug}:${perPage}:${page}`;
+  const cached = productListCache.get(cacheKey);
+  if (cached && (Date.now() - cached.loadedAt) < PRODUCT_LIST_CACHE_TTL_MS) {
+    logger.debug({ cacheKey }, '[WooCommerce] productListCache hit');
+    // Retorna cópias rasas dos produtos — evita compartilhar mutações entre sessões
+    return { ...cached.result, products: cached.result.products.map((p) => ({ ...p })) };
+  }
+
   const categoryId = await getCategoryIdBySlug(categorySlug);
   if (!categoryId) {
     throw new Error(`Categoria "${categorySlug}" não encontrada no WooCommerce.`);
@@ -63,30 +88,44 @@ async function getProductsByCategory(categorySlug, perPage = 10, page = 1) {
   const totalPages = parseInt(response.headers['x-wp-totalpages'] || '1', 10);
 
   const products = deduplicateProducts(response.data.map(formatProduct));
+  const result = { products, page, totalPages, total, hasMore: page < totalPages };
 
-  return {
-    products,
-    page,
-    totalPages,
-    total,
-    hasMore: page < totalPages,
-  };
+  productListCache.set(cacheKey, { result, loadedAt: Date.now() });
+  logger.debug({ cacheKey, count: products.length }, '[WooCommerce] productListCache miss — stored');
+
+  // Retorna cópias rasas para esta requisição
+  return { ...result, products: result.products.map((p) => ({ ...p })) };
 }
 
 /**
- * Searches products by name or keyword.
+ * Searches products by name or keyword, with pagination support.
+ * Results cached for SEARCH_CACHE_TTL_MS (3 min) — reduz carga no WordPress.
  */
-async function searchProducts(query, perPage = 20) {
-  const { data: products } = await wooApi.get('/products', {
+async function searchProducts(query, perPage = 20, page = 1) {
+  const cacheKey = `search:${String(query).toLowerCase().trim()}:${perPage}:${page}`;
+  const cached = searchCache.get(cacheKey);
+  if (cached && (Date.now() - cached.loadedAt) < SEARCH_CACHE_TTL_MS) {
+    logger.debug({ cacheKey }, '[WooCommerce] searchCache hit');
+    return { ...cached.result, products: cached.result.products.map((p) => ({ ...p })) };
+  }
+
+  const response = await wooApi.get('/products', {
     params: {
       search: query,
       per_page: perPage,
+      page,
       status: 'publish',
       stock_status: 'instock',
     },
   });
 
-  return deduplicateProducts(products.map(formatProduct));
+  const total = parseInt(response.headers['x-wp-total'] || '0', 10);
+  const totalPages = parseInt(response.headers['x-wp-totalpages'] || '1', 10);
+  const products = deduplicateProducts(response.data.map(formatProduct));
+  const result = { products, page, totalPages, total, hasMore: page < totalPages };
+
+  searchCache.set(cacheKey, { result, loadedAt: Date.now() });
+  return { ...result, products: result.products.map((p) => ({ ...p })) };
 }
 
 /**
@@ -111,11 +150,53 @@ function extractSizes(product) {
     (attr) => attr.name.toLowerCase() === 'tamanho' || attr.name.toLowerCase() === 'size'
   );
 
-  return sizeAttr ? sizeAttr.options : [];
+  if (!sizeAttr) return [];
+
+  const sizes = sizeAttr.options.filter(s => s && String(s).trim());
+  if (sizeAttr.options.length > 0 && sizes.length === 0) {
+    logger.warn({ productId: product.id, productName: product.name }, '[WooCommerce] Atributo Tamanho existe mas todas as opções estão vazias — tratando como sem variação');
+  }
+  return sizes;
 }
 
+/**
+ * Extracts secondary (non-size) variation attributes from a product.
+ * Example: [{ name: 'Categoria', options: ['Mãe', 'Filha'] }]
+ * Used to detect products that require a second selection step (e.g. Mãe/Filha).
+ */
+function extractSecondaryAttributes(product) {
+  if (!Array.isArray(product.attributes)) return [];
+  return product.attributes
+    .filter((attr) => {
+      const name = String(attr.name || '').toLowerCase();
+      return name !== 'tamanho' && name !== 'size' && Array.isArray(attr.options) && attr.options.length > 1;
+    })
+    .map((attr) => ({ name: attr.name, options: attr.options.filter(Boolean) }));
+}
+
+// Sinônimos reconhecidos de "tamanho único" → normaliza para 'ÚNICO'
+const UNIQUE_SIZE_SYNONYMS = new Set([
+  'U', 'UN', 'UNI', 'UNICO', 'ÚNICO',
+  'TU', 'TAMUNICO', 'TAM UNICO', 'TAM ÚNICO',
+  'UNIVERSAL',
+]);
+
+/**
+ * Normalizes a size label to uppercase canonical form.
+ * Any synonym for "tamanho único" is collapsed to 'ÚNICO' for comparisons.
+ * Display to the user should use the original WooCommerce label.
+ */
 function normalizeSizeLabel(value) {
-  return String(value || '').trim().toUpperCase();
+  const raw = String(value || '').trim().toUpperCase();
+  // "Tam único - pct com 5 unidades" → 'ÚNICO'
+  if (
+    raw.startsWith('TAM ÚNICO') || raw.startsWith('TAM UNICO') ||
+    raw.startsWith('ÚNICO') || raw.startsWith('UNICO')
+  ) {
+    return 'ÚNICO';
+  }
+  if (UNIQUE_SIZE_SYNONYMS.has(raw)) return 'ÚNICO';
+  return raw;
 }
 
 function buildDefaultSizeDetails(product) {
@@ -142,10 +223,27 @@ function parseStockQuantity(value) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-function buildSizeDetailsFromVariations(product, variations) {
+/**
+ * @param {object} product
+ * @param {Array} variations - raw WooCommerce variations
+ * @param {{ name: string, value: string } | null} variantFilter - when set, only considers
+ *   variations that match this secondary attribute (e.g. { name: 'Categoria', value: 'Mãe' }).
+ */
+function buildSizeDetailsFromVariations(product, variations, variantFilter = null) {
   const bySize = new Map();
 
-  for (const variation of variations) {
+  // Filter variations by secondary attribute when a variant is selected
+  const filteredVariations = variantFilter
+    ? variations.filter((v) =>
+        Array.isArray(v.attributes) && v.attributes.some(
+          (a) =>
+            String(a.name || '').toLowerCase() === String(variantFilter.name || '').toLowerCase() &&
+            String(a.option || '').toLowerCase() === String(variantFilter.value || '').toLowerCase()
+        )
+      )
+    : variations;
+
+  for (const variation of filteredVariations) {
     const size = extractVariationSize(variation);
     if (!size) continue;
 
@@ -177,11 +275,12 @@ function buildSizeDetailsFromVariations(product, variations) {
     const found = bySize.get(normalizeSizeLabel(size));
 
     if (!found) {
+      // Tamanho existe no atributo do produto mas não tem variação publicada — não disponível
       return {
         size,
         stockQuantity: null,
-        isAvailable: true,
-        stockLabel: 'Disponível',
+        isAvailable: false,
+        stockLabel: 'Indisponível',
       };
     }
 
@@ -225,34 +324,105 @@ async function getProductVariations(productId) {
   return Array.isArray(variations) ? variations : [];
 }
 
-async function enrichProductWithStock(product) {
+/**
+ * Enriches a product with stock data from WooCommerce variations.
+ * @param {object} product
+ * @param {{ name: string, value: string } | null} variantFilter - when set, only considers
+ *   variations matching this secondary attribute (e.g. { name: 'Categoria', value: 'Mãe' }).
+ *   Raw variations are cached per productId; the filter is applied at computation time.
+ */
+async function enrichProductWithStock(product, variantFilter = null) {
   if (!product?.id || !Array.isArray(product.sizes) || product.sizes.length === 0) {
     return product;
   }
 
   const cacheKey = String(product.id);
   const cached = variationCache.get(cacheKey);
+
+  let rawVariations;
   if (cached && (Date.now() - cached.loadedAt) < VARIATION_CACHE_TTL_MS) {
-    product.sizeDetails = cached.sizeDetails.map((detail) => ({ ...detail }));
-    return product;
-  }
-
-  let sizeDetails = buildDefaultSizeDetails(product);
-
-  try {
-    const variations = await getProductVariations(product.id);
-    if (variations.length > 0) {
-      sizeDetails = buildSizeDetailsFromVariations(product, variations);
+    rawVariations = cached.rawVariations;
+  } else {
+    rawVariations = [];
+    try {
+      rawVariations = await getProductVariations(product.id);
+    } catch (err) {
+      logger.warn({ productId: product.id, err: err?.message || String(err) }, '[WooCommerce] Falha ao carregar estoque por tamanho');
     }
-  } catch (err) {
-    logger.warn({ productId: product.id, err: err?.message || String(err) }, '[WooCommerce] Falha ao carregar estoque por tamanho');
+    variationCache.set(cacheKey, { loadedAt: Date.now(), rawVariations });
   }
+
+  const sizeDetails = rawVariations.length > 0
+    ? buildSizeDetailsFromVariations(product, rawVariations, variantFilter)
+    : buildDefaultSizeDetails(product);
 
   product.sizeDetails = sizeDetails;
-  variationCache.set(cacheKey, {
-    loadedAt: Date.now(),
-    sizeDetails: sizeDetails.map((detail) => ({ ...detail })),
-  });
+
+  // Compute per-variant sizes (ex: { Mãe: ['M','EXGG'], Filha: ['M','G','GG'] })
+  // Only when raw variations are available and product has secondary attributes
+  if (rawVariations.length > 0 && product.secondaryAttributes?.length > 0) {
+    const secAttr = product.secondaryAttributes[0];
+    const variantSizes       = {};
+    const variantPrices      = {};
+    const variantSizeDetails = {};
+    for (const opt of secAttr.options) {
+      const filtered = rawVariations.filter((v) =>
+        Array.isArray(v.attributes) && v.attributes.some(
+          (a) =>
+            String(a.name || '').toLowerCase() === String(secAttr.name || '').toLowerCase() &&
+            String(a.option || '').toLowerCase() === String(opt || '').toLowerCase()
+        )
+      );
+      const sizes = [...new Set(
+        filtered
+          .filter((v) => {
+            const qty = parseStockQuantity(v.stock_quantity);
+            return v.stock_status === 'instock' || (qty !== null && qty > 0);
+          })
+          .map(extractVariationSize)
+          .filter(Boolean)
+      )];
+      if (sizes.length > 0) variantSizes[opt] = sizes;
+
+      // Preço da variante: usa o primeiro resultado com preço definido
+      const withPrice = filtered.find(v => v.regular_price || v.price);
+      if (withPrice) {
+        const regular = parseFloat(withPrice.regular_price || withPrice.price || '0');
+        const sale    = parseFloat(withPrice.sale_price || withPrice.regular_price || withPrice.price || '0');
+        variantPrices[opt] = { price: regular, salePrice: sale > 0 ? sale : regular };
+      }
+
+      // Estoque por tamanho dentro desta variante (para exibição no card)
+      const bySize = new Map();
+      for (const v of filtered) {
+        const size = extractVariationSize(v);
+        if (!size) continue;
+        const qty = parseStockQuantity(v.stock_quantity);
+        const hasKnownStock = Boolean(v.manage_stock) && qty !== null;
+        const isAvail = v.stock_status === 'instock' || (qty !== null && qty > 0);
+        const existing = bySize.get(size);
+        const cur = existing || { size, stockQuantity: 0, hasKnownStock: true, isAvailable: false };
+        cur.isAvailable = cur.isAvailable || isAvail;
+        if (existing) {
+          // Segunda variação para o mesmo (variante, tamanho): soma pode ser irreal (ex: cores diferentes).
+          // Invalida a exibição de quantidade para evitar estoque falso.
+          cur.hasKnownStock = false;
+        } else if (hasKnownStock) {
+          cur.stockQuantity = Math.max(qty, 0);
+        } else {
+          cur.hasKnownStock = false;
+        }
+        bySize.set(size, cur);
+      }
+      const details = [...bySize.values()]
+        .filter((d) => d.isAvailable)
+        .map((d) => ({ size: d.size, stockQuantity: d.hasKnownStock ? d.stockQuantity : null }));
+      if (details.length > 0) variantSizeDetails[opt] = details;
+    }
+    if (Object.keys(variantSizes).length       > 0) product.variantSizes       = variantSizes;
+    if (Object.keys(variantPrices).length      > 0) product.variantPrices      = variantPrices;
+    if (Object.keys(variantSizeDetails).length > 0) product.variantSizeDetails = variantSizeDetails;
+  }
 
   return product;
 }
@@ -291,6 +461,7 @@ function formatProduct(product) {
     images: product.images.map((img) => img.src), // ✅ todas as fotos preservadas
     sizes: extractSizes(product),
     sizeDetails: buildDefaultSizeDetails({ sizes: extractSizes(product) }),
+    secondaryAttributes: extractSecondaryAttributes(product),
     permalink: product.permalink,
     description: shortDesc,
   };
@@ -301,7 +472,10 @@ function formatProduct(product) {
  */
 function formatPrice(price) {
   const num = parseFloat(price);
-  if (isNaN(num)) return 'Preço indisponível';
+  if (isNaN(num)) {
+    logger.warn({ price }, '[WooCommerce] formatPrice recebeu valor não-numérico');
+    return 'Preço indisponível';
+  }
   return `R$ ${num.toFixed(2).replace('.', ',')}`;
 }
 
@@ -320,8 +494,23 @@ function buildCaption(product, productNumber = null) {
     caption += `💰 *${formatPrice(product.price)}*\n`;
   }
 
-  if (product.sizes.length > 0) {
-    caption += `📏 Tamanhos: ${product.sizes.join(' | ')}`;
+  if (product.variantSizes && Object.keys(product.variantSizes).length > 0) {
+    const lines = Object.entries(product.variantSizes)
+      .filter(([, sizes]) => sizes.length > 0)
+      .map(([variant, sizes]) => `📏 ${variant}: ${sizes.join(' | ')}`);
+    caption += lines.join('\n');
+  } else if (product.secondaryAttributes?.length > 0) {
+    const opts = product.secondaryAttributes[0].options.join(' | ');
+    caption += `📏 *${opts}*`;
+  } else if (Array.isArray(product.sizeDetails) && product.sizeDetails.some((detail) => detail.isAvailable)) {
+    const availableSizes = product.sizeDetails
+      .filter((detail) => detail.isAvailable)
+      .map((detail) => detail.size);
+    if (availableSizes.length > 0) {
+      caption += `📏 Disponível: ${availableSizes.join(' | ')}`;
+    }
+  } else if (product.sizes.length > 0) {
+    caption += `📏 Disponível: ${product.sizes.join(' | ')}`;
   }
 
   if (product.description) {
@@ -359,6 +548,36 @@ function buildCatalogContext(session) {
   return ctx;
 }
 
+/**
+ * Pré-aquece o cache de produtos para as categorias principais.
+ * Deve ser chamado no startup do servidor (fire-and-forget).
+ * Se WooCommerce estiver lento/offline, apenas loga um aviso — não bloqueia o startup.
+ */
+async function warmupCache() {
+  const CATS = [
+    'lancamento-da-semana',
+    'feminino',
+    'femininoinfantil',
+    'masculino',
+    'masculinoinfantil',
+  ];
+
+  logger.info('[WooCommerce] Iniciando warmup de cache de produtos...');
+
+  for (const slug of CATS) {
+    try {
+      await getProductsByCategory(slug, 100, 1);
+      logger.info({ slug }, '[WooCommerce] warmup OK');
+    } catch (err) {
+      logger.warn({ slug, err: err.message }, '[WooCommerce] warmup falhou para categoria — será tentado na primeira requisição');
+    }
+    // Pausa entre categorias para não sobrecarregar WordPress
+    await new Promise((resolve) => setTimeout(resolve, 800));
+  }
+
+  logger.info('[WooCommerce] Warmup de cache concluído.');
+}
+
 module.exports = {
   enrichProductWithStock,
   getProductsByCategory,
@@ -367,4 +586,5 @@ module.exports = {
   formatPrice,
   buildCaption,
   buildCatalogContext,
+  warmupCache,
 };

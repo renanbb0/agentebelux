@@ -300,15 +300,19 @@ function buildConversationContext(session) {
   ];
 
   if (memory.preferences.length > 0) {
-    lines.push(`- Preferencias detectadas: ${memory.preferences.join(', ')}`);
+    lines.push(`- Preferencias detectadas na fala do cliente: ${memory.preferences.join(', ')}`);
   }
 
   if (memory.objections.length > 0) {
-    lines.push(`- Objecoes ou travas: ${memory.objections.join(', ')}`);
+    lines.push(`- Objecoes ou travas levantadas pelo cliente: ${memory.objections.join(', ')}`);
   }
 
   if (memory.discussedTopics.length > 0) {
-    lines.push(`- Assuntos ja tratados: ${memory.discussedTopics.join(', ')}`);
+    // IMPORTANTE: esses termos foram EXTRAÍDOS da fala do cliente (regex),
+    // NÃO significam que a Bela já mostrou esses produtos. Evita alucinação
+    // onde a IA dizia "já mostrei a linha masculina" quando o cliente só
+    // havia mencionado a palavra "masculino".
+    lines.push(`- Termos que o cliente citou (NÃO significa que já foram exibidos): ${memory.discussedTopics.join(', ')}`);
   }
 
   if (session.customerName) {

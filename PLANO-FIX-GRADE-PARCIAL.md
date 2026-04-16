@@ -944,3 +944,361 @@ await zapi.sendText(phone, msg);
 | `17 - Inteligência Híbrida (FSM + IA).md` | Atualizar diagrama de interceptação e novo fluxo de escape |
 | `09 - Humanização e Eventos WhatsApp.md` | Documentar melhoria de comportamento durante FSM ativa |
 | `03 - Serviço WooCommerce.md` | Atualizar seção de busca com novo fluxo de erro |
+
+---
+
+# 🔁 REFORÇO CRÍTICO — Correções do Plano que AINDA NÃO foram aplicadas
+
+> Renan reportou (print do dia 10/04) que dois fixes documentados acima **continuam aparecendo em produção**. Isto é um lembrete explícito para o Claude Code: **implementar AGORA, não apenas documentar**.
+
+### ⚠️ Pendência 1 — Remover listagem textual antes dos cards
+
+**Arquivo:** `index.js`
+**Função: `sendProductPage`** (~linha 2643)
+**Função: `searchAndShowProducts`** (~linha 2480)
+**Função: `showAllCategory`** (~linha 2496)
+
+Em **todas as três**, existe um bloco que monta `msg` concatenando `1. Nome — R$ preço` e chama `zapi.sendText(phone, msg)` **antes** do loop de `sendImage`. Esse bloco precisa ser **removido por completo** — os cards (imagem + caption numerada) já cumprem o papel de listagem, o texto duplicado polui a conversa.
+
+```javascript
+// ❌ APAGAR (todos os 3 locais):
+let msg = `✨ *Resultados para: ${query}* ✨\n\n`;
+products.forEach((p, i) => {
+  msg += `${i + 1}. *${p.name}* — ${woocommerce.formatPrice(p.salePrice || p.price)}\n`;
+});
+await zapi.sendText(phone, msg);
+```
+
+**Como validar:** pedir "quero ver infantil" e verificar que NENHUMA mensagem de texto com lista numerada aparece antes dos cards.
+
+### ⚠️ Pendência 2 — Mensagem "Buscando..." ainda sendo enviada como texto
+
+**Arquivo:** `index.js` — qualquer `await zapi.sendText(phone, '🔍 Buscando...')` ou similar em `searchAndShowProducts`, `showCategory`, `showAllCategory`.
+
+**Correção em 2 etapas:**
+
+1. **Humanizar o texto** — trocar por uma das variantes (escolher aleatoriamente para parecer natural):
+   ```javascript
+   const LOADING_LINES = [
+     'Deixa eu ver aqui pra você, um instantinho 😊',
+     'Calma que já te mando 🙌',
+     'Peraí que estou separando pra você ✨',
+     'Só um segundo que já te trago 😉',
+   ];
+   const loadingText = LOADING_LINES[Math.floor(Math.random() * LOADING_LINES.length)];
+   ```
+
+2. **Enviar como áudio via TTS (quando habilitado)** com fallback para texto:
+   ```javascript
+   async function sendLoadingCue(phone) {
+     const text = LOADING_LINES[Math.floor(Math.random() * LOADING_LINES.length)];
+     if (process.env.TTS_ENABLED === 'true') {
+       try {
+         const { buffer, mimeType } = await tts.textToSpeech(text);
+         const base64 = `data:${mimeType};base64,${buffer.toString('base64')}`;
+         await zapi.sendAudio(phone, base64);
+         return;
+       } catch (err) {
+         logger.warn({ err: err.message }, '[sendLoadingCue] TTS falhou — fallback texto');
+       }
+     }
+     await zapi.sendText(phone, text);
+   }
+   ```
+
+3. **Diagnosticar TTS** (por que não está tocando hoje):
+   - Verificar `.env`: `TTS_ENABLED=true`, `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID` carregados.
+   - Adicionar log em `services/tts.js` no início de `textToSpeech`: `logger.info({ voiceId: VOICE_ID, modelId: MODEL_ID }, '[TTS] start')`.
+   - Testar isoladamente: `node -e "require('./services/tts').textToSpeech('teste').then(r => console.log(r.buffer.length))"`.
+   - Checar se `zapi.sendAudio` existe e aceita base64 data URL (verificar `services/zapi.js`).
+   - Se ElevenLabs retornar 401 → chave inválida. Se 422 → voiceId inválido. Se timeout → rede/firewall.
+
+---
+
+# 🧠 BUG 7 — Humanização da Fala da Bela (Prompt Engineering)
+
+**Gravidade:** 🟡 Média (UX crítico)
+**Pedido literal do Renan:** *"gostaria que ela tivesse tambem a capacidade de ser mais 'humana' na fala. como podemos melhorar?"*
+
+## Diagnóstico do SYSTEM_PROMPT atual (`services/gemini.js`)
+
+O prompt atual (linhas 6-84) já tem uma base boa: persona Bela, anti-padrões, bloco `<think>`, tokens de ação. Mas sofre de 3 problemas:
+
+1. **Só diz o que NÃO fazer** — lista de proibições ("NUNCA use 'Olá!'") sem **modelagem positiva** (exemplos concretos de mensagens boas).
+2. **Temperatura 0.4** — muito baixa para variabilidade humana. WhatsApp real tem ritmo, pausas, interjeições espontâneas.
+3. **Sem repertório de estilo** — faltam exemplos few-shot de como a Bela fala em situações típicas (saudação, objeção de preço, pedido de foto, cliente indeciso, fechamento).
+
+## Plano de correção
+
+### Passo 1 — Subir temperatura para `0.7`
+
+**Arquivo:** `services/gemini.js` linha 152
+```javascript
+// ANTES
+generationConfig: { temperature: 0.4, maxOutputTokens: 500 },
+// DEPOIS
+generationConfig: { temperature: 0.7, maxOutputTokens: 500 },
+```
+**Justificativa:** 0.4 é temperatura de assistente técnico. Vendedora humana varia tom, usa sinônimos, muda ordem das frases — 0.7 é o sweet spot documentado pela própria Anthropic/Google para personas conversacionais.
+
+### Passo 2 — Adicionar bloco REPERTÓRIO DE FALA no SYSTEM_PROMPT
+
+Inserir **logo após** a seção "IDENTIDADE E TOM DE VOZ", antes de "REGRAS CRÍTICAS":
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━
+REPERTÓRIO — COMO A BELA FALA (exemplos reais)
+━━━━━━━━━━━━━━━━━━━━━━━━
+Estes são exemplos de mensagens boas. Absorva o RITMO, não copie literalmente.
+
+SAUDAÇÃO (lojista chegando):
+✅ "Oi amor, tudo bem? Tô aqui 😊 Quer dar uma olhada nos lançamentos dessa semana?"
+✅ "Eaí linda! Bora ver o que chegou de novo pra você?"
+✅ "Oi! Chegou coisa linda essa semana, tá doida 🙌 quer ver?"
+
+APRESENTANDO PRODUTO:
+✅ "Olha essa calcinha renda, tá voando viu 😍 tem em preto e branco"
+✅ "Essa aqui é campeã de venda. Saiu 3 grades só essa semana"
+
+OBJEÇÃO DE PREÇO:
+✅ "Poxa amiga, esse aí já é o atacado viu. Mas olha, no PIX tem desconto"
+✅ "Entendo. Mas repara que é renda importada, aguenta lavagem tranquilo"
+
+CLIENTE INDECISO:
+✅ "Olha, eu te dou uma dica: pega a grade dessa renda que gira rápido. Faz essa aposta comigo"
+✅ "Posso te sugerir? Começa com 2 grades dessa e uma do básico. Daí você sente o giro"
+
+PEDINDO FOTO:
+✅ "Claro, já te mando 😉"
+✅ "Peraí que te mostro"
+
+FECHAMENTO:
+✅ "Fechou então? Vou separar aqui 🙌"
+✅ "Beleza amor, tá anotado. Mais alguma coisa ou fecho por aqui?"
+
+DÚVIDA TÉCNICA QUE VOCÊ NÃO SABE:
+✅ "Boa pergunta, deixa eu conferir rapidinho com o estoque e já te falo"
+
+NUNCA:
+❌ "Olá! Como posso ajudá-la hoje?"
+❌ "Com certeza! Aqui estão as opções disponíveis:"
+❌ "Entendido. Vou processar sua solicitação."
+❌ "Segue abaixo a lista de produtos:"
+```
+
+### Passo 3 — Adicionar REGRAS DE RITMO no SYSTEM_PROMPT
+
+Inserir logo após o repertório:
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━
+RITMO E NATURALIDADE
+━━━━━━━━━━━━━━━━━━━━━━━━
+• Varie o tamanho das mensagens. Às vezes 1 linha. Às vezes 2-3. Nunca blocos gigantes.
+• Use contrações naturais: "tá", "pra", "cê", "tamo", "bora".
+• Pode começar mensagem com letra minúscula, como todo mundo faz no zap.
+• Use vírgulas "respirando" como na fala: "olha, essa peça, ela é diferente das outras viu".
+• Interjeições curtas funcionam: "Poxa", "Nossa", "Ó", "Eita".
+• NÃO use travessão (—) nem reticências formais em excesso.
+• NÃO termine toda mensagem com pergunta. Às vezes, só afirme e deixe o cliente reagir.
+• Emojis: no MÁXIMO 1-2 por mensagem. Nunca em toda frase.
+• Vocativos variados: "amor", "linda", "amiga", "miga", "querida" — alterne, não repita.
+```
+
+### Passo 4 — Injetar hora do dia no `nudgeBlock`
+
+Saudação natural muda com hora do dia. Em `index.js`, onde monta o `nudge` da primeira mensagem:
+
+```javascript
+const hour = new Date().getHours();
+const greeting = hour < 12 ? 'bom dia' : hour < 18 ? 'boa tarde' : 'boa noite';
+const nudge = `É o primeiro contato do dia com esse lojista. Saudação natural de ${greeting}, chama pra ver os lançamentos da semana. 1 linha só.`;
+```
+
+### Passo 5 — Adicionar "variação forçada" nos learnings
+
+Na tabela `learnings` do Supabase, adicionar entradas do tipo:
+```
+"Se a última mensagem sua começou com 'Oi', varie para 'Eaí', 'Opa', 'Olha só' na próxima."
+"Não repita vocativos. Se usou 'amor' na última, use 'linda' ou 'amiga' agora."
+"Se o lojista mandou msg curta, você responde curta também. Espelha o ritmo dele."
+```
+
+## Validação
+
+Após aplicar Passos 1-3, testar com estas mensagens e comparar antes/depois:
+1. "oi" → deve variar saudação entre testes
+2. "quanto é essa calcinha?" → resposta curta, sem "Com certeza!"
+3. "tá caro" → objeção tratada com empatia, não defensiva formal
+4. "quero ver infantil" → 1 linha + token, sem "Aqui estão as opções"
+
+---
+
+## Resumo das Ações Imediatas para o Claude Code
+
+1. ✅ **Aplicar Pendência 1** — remover 3 blocos de listagem textual em `index.js` (sendProductPage, searchAndShowProducts, showAllCategory).
+2. ✅ **Aplicar Pendência 2** — criar `sendLoadingCue()` com TTS + fallback; substituir `sendText('Buscando...')` em todos os call sites.
+3. ✅ **Diagnosticar TTS** — log + teste isolado de `services/tts.js`.
+4. ✅ **Bug 7 Passo 1** — subir `temperature` para 0.7 em `services/gemini.js`.
+5. ✅ **Bug 7 Passos 2-3** — inserir blocos REPERTÓRIO e RITMO no `SYSTEM_PROMPT`.
+6. ✅ **Bug 7 Passo 4** — greeting por hora do dia no nudge do primeiro contato.
+7. ✅ **Atualizar Obsidian** — `10 - Persona da Bela.md` (novo repertório) e `16 - Serviço Gemini.md` (nova temperatura + prompt).
+
+---
+
+# 🐛 BUG 8 — STT parou de funcionar (regressão de áudio)
+
+**Gravidade:** 🔴 Alta (cliente manda áudio, Bela ignora completamente)
+
+## Causa Raiz
+
+Em `index.js`, a detecção de áudio depende de `body.audio` ser truthy (linha 406 de `extractTextFromEvent`). Se o Z-API mudou o payload para enviar o áudio dentro de `body.message.audio`, a detecção falha silenciosamente: `extractTextFromEvent` retorna `''`, o guard `if (!text) return` encerra tudo, e a Bela nunca responde ao áudio.
+
+`extractAudioUrl` tem o mesmo gap: checa `event.message?.audioUrl` mas não `event.message?.audio?.audioUrl`.
+
+## Fix — `index.js`
+
+### Passo 1 — Ampliar detecção em `extractTextFromEvent`
+
+```javascript
+// ANTES (linha 406):
+if (event.audio) return '[Áudio_STT]';
+
+// DEPOIS:
+if (event.audio || event?.message?.audio) return '[Áudio_STT]';
+```
+
+### Passo 2 — Ampliar extração de URL em `extractAudioUrl`
+
+```javascript
+// ANTES:
+function extractAudioUrl(event) {
+  return event?.audio?.audioUrl
+    || event?.audio?.url
+    || event?.audioUrl
+    || event?.message?.audioUrl
+    || null;
+}
+
+// DEPOIS:
+function extractAudioUrl(event) {
+  return event?.audio?.audioUrl
+    || event?.audio?.url
+    || event?.audioUrl
+    || event?.message?.audioUrl
+    || event?.message?.audio?.audioUrl
+    || event?.message?.audio?.url
+    || null;
+}
+```
+
+### Passo 3 — Adicionar log de diagnóstico no webhook (para confirmar a causa)
+
+Logo antes de `let text = extractTextFromEvent(body)` (linha 455), adicionar:
+```javascript
+if (!body.text && !body.listResponseMessage && !body.buttonsResponseMessage) {
+  logger.info({ bodyKeys: Object.keys(body), hasAudio: Boolean(body.audio), hasMessageAudio: Boolean(body?.message?.audio) }, '[Webhook] Payload sem texto — inspecionando tipo');
+}
+```
+
+Isso vai aparecer nos logs da próxima vez que um áudio chegar, confirmando qual campo está sendo usado.
+
+---
+
+# 🐛 BUG 9 — Bot para após mostrar resultados de busca (sem menu de navegação)
+
+**Gravidade:** 🔴 Alta (conversa morre após busca por ref)
+
+## Causa Raiz
+
+`searchAndShowProducts` tem dois problemas:
+
+1. **Falha silenciosa da IA:** o catch na linha 2529 engole o erro e não envia **nada**. O cliente viu os produtos e recebe silêncio total.
+
+2. **Menu de categoria automático quebra o contexto:** quando a IA funciona, `sendCategoryMenu` abre o menu completo de navegação logo após a busca. O cliente buscou "602s", viu o produto, e imediatamente aparece uma lista perguntando qual categoria quer. É desorientante — parece que a Bela quer mudar de assunto.
+
+## Fix — `index.js`
+
+### Passo 1 — Reescrever o nudge para ser intencional, não prescritivo
+
+```javascript
+// ANTES (linha 2514):
+const nudge = '[SISTEMA: Você mostrou os resultados da busca. Pergunte se a cliente gostou de alguma peça ou se quer pesquisar outra coisa.]';
+
+// DEPOIS:
+const nudge = '[SISTEMA: Os produtos da busca foram exibidos. Reagir naturalmente — pode ser curto, tipo "gostou?" ou "tem mais coisa?". NÃO liste produtos, NÃO dê instruções de número. Mantenha o ritmo de WhatsApp.]';
+```
+
+### Passo 2 — Não enviar menu de categorias automaticamente após busca
+
+Após busca, o menu de categorias quebra o contexto. O cliente que buscou um produto específico não quer ser redirecionado para "qual categoria você quer?". A Bela deve apenas perguntar naturalmente se gostou, sem estrutura de menu.
+
+```javascript
+// ANTES (linhas 2523-2527):
+if (session.items.length > 0) {
+  await sendCartOptions(phone, session, cleanText);
+} else {
+  await sendCategoryMenu(phone, cleanText);
+}
+
+// DEPOIS:
+if (session.items.length > 0) {
+  await sendCartOptions(phone, session, cleanText);
+} else {
+  // Após busca: só texto da IA, sem menu forçado.
+  // O menu de categorias só aparece se o cliente pedir explicitamente.
+  await zapi.sendText(phone, cleanText);
+}
+```
+
+### Passo 3 — Garantir fallback se a IA falhar
+
+```javascript
+// No catch (linha 2529):
+} catch (aiErr) {
+  logger.error({ query, err: aiErr.message }, '[searchAndShowProducts] Erro na IA — usando fallback');
+  const fallbacks = [
+    'Gostou de alguma? Me manda o número pra eu separar o tamanho 😊',
+    'Achou o que procurava? É só me dizer o número da peça!',
+    'Quer saber mais sobre alguma dessas? Só falar 😄',
+  ];
+  const fallback = fallbacks[Math.floor(Math.random() * fallbacks.length)];
+  await zapi.sendText(phone, fallback);
+}
+```
+
+---
+
+# 🐛 BUG 10 — Bot excessivamente formal após ações do sistema
+
+**Gravidade:** 🟡 Média (UX degradada — parece robô)
+
+## Causa Raiz
+
+Os nudges injetados pelo sistema (`[SISTEMA: ...]`) são prescritivos — descrevem exatamente o que a Bela deve dizer. A IA segue à risca e o resultado parece um atendente de call center lendo script.
+
+Exemplos problemáticos encontrados no código:
+- `"[SISTEMA: Você mostrou os resultados da busca. Pergunte se a cliente gostou de alguma peça ou se quer pesquisar outra coisa.]"` → Bela diz literalmente "Me diz o número da peça que você gostou, ou se preferir escolhe outra coleção"
+- Qualquer nudge do tipo "faça X" produz a frase X quase literal
+
+## Fix — Revisar todos os nudges em `index.js`
+
+Buscar todas as strings `[SISTEMA:` no código e reescrevê-las no padrão **contextual, não prescritivo**:
+
+| Nudge atual | Nudge revisado |
+|---|---|
+| "Pergunte se a cliente gostou de alguma peça ou se quer pesquisar outra coisa." | "Os produtos foram exibidos. Reaja naturalmente, curto, no ritmo de zap." |
+| "Apresente o produto X e pergunte o tamanho" | "Produto exibido. Conversa fluindo — tamanho é o próximo passo se o cliente quiser." |
+| "O carrinho está vazio, convier para ver mais produtos" | "Carrinho vazio. Mantém papo casual." |
+
+**Regra geral para novos nudges:** nunca usar verbo imperativo ("pergunte", "diga", "apresente"). Sempre usar indicativo descritivo ("os produtos foram exibidos", "o cliente está no carrinho").
+
+---
+
+## Resumo das Ações para o Claude Code (Bugs 8-10)
+
+1. ✅ **Bug 8 Passos 1-2** — ampliar `extractTextFromEvent` e `extractAudioUrl` para cobrir `body.message.audio`
+2. ✅ **Bug 8 Passo 3** — adicionar log de diagnóstico de payload
+3. ✅ **Bug 9 Passos 1-3** — reescrever nudge de busca, remover `sendCategoryMenu` automático pós-busca, adicionar fallback de IA
+4. ✅ **Bug 10** — auditar e reescrever todos os `[SISTEMA:]` nudges no `index.js`
+5. ✅ **Atualizar Obsidian** — `02 - Webhook e Roteamento.md` (STT fix), `09 - Humanização.md` (nudges revisados)

@@ -11,3 +11,6 @@ server.err
 .agent/*.pid
 .agent/preview.pid
 .agent/cache/
+
+# Dashboard dependencies
+services/dashboard/node_modules/

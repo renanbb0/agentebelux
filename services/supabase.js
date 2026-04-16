@@ -1,4 +1,5 @@
 const { createClient } = require('@supabase/supabase-js');
+const crypto = require('crypto');
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -20,33 +21,42 @@ async function upsertSession(phone, session) {
   const purchaseFlowPayload = {
     ...session.purchaseFlow,
     handoffDone: session.handoffDone,
-    contextMemory: session.conversationMemory || null,
+    // contextMemory removido de purchase_flow — agora em coluna própria (P1.6)
   };
 
   const { error } = await supabase
     .from('sessions')
     .upsert({
       phone,
-      history:          session.history,
-      items:            session.items,
-      products:         session.products,
-      current_product:  session.currentProduct,
-      customer_name:    session.customerName,
-      current_category: session.currentCategory,
-      current_page:     session.currentPage,
-      total_pages:      session.totalPages,
-      total_products:   session.totalProducts,
-      last_viewed_product: session.lastViewedProduct,
+      history:              session.history,
+      items:                session.items,
+      products:             session.products,
+      current_product:      session.currentProduct,
+      customer_name:        session.customerName,
+      current_category:     session.currentCategory,
+      current_page:         session.currentPage,
+      total_pages:          session.totalPages,
+      total_products:       session.totalProducts,
+      last_viewed_product:  session.lastViewedProduct,
       last_viewed_product_index: session.lastViewedProductIndex,
-      purchase_flow:    purchaseFlowPayload,
-      message_product_map: session.messageProductMap || {},
-      last_activity:    session.lastActivity,
-      active_category:  session.activeCategory || null,
-      support_mode:     session.supportMode || null,
-      cart_notified:    session.cartNotified || false,
-      updated_at:       new Date().toISOString(),
+      purchase_flow:        purchaseFlowPayload,
+      conversation_memory:  session.conversationMemory || null,
+      message_product_map:  session.messageProductMap || {},
+      last_activity:        session.lastActivity,
+      active_category:      session.activeCategory || null,
+      support_mode:         session.supportMode || null,
+      cart_notified:        session.cartNotified || false,
+      updated_at:           new Date().toISOString(),
     }, { onConflict: 'phone' });
 
+  if (error) throw error;
+}
+
+async function clearAllSessions() {
+  const { error } = await supabase
+    .from('sessions')
+    .delete()
+    .neq('phone', '');
   if (error) throw error;
 }
 
@@ -65,13 +75,12 @@ async function deleteExpiredSessions(timeoutMs) {
 // ── Learnings ─────────────────────────────────────────────────────────────
 
 async function addLearning(insight) {
-  const key = insight.slice(0, 40).toLowerCase();
+  const insightHash = crypto.createHash('sha256').update(insight).digest('hex').slice(0, 16);
 
-  // Busca registro com chave similar
   const { data: existing } = await supabase
     .from('learnings')
-    .select('id, insight, uses')
-    .ilike('insight', `${key}%`)
+    .select('id, uses')
+    .eq('insight_hash', insightHash)
     .single();
 
   if (existing) {
@@ -82,9 +91,10 @@ async function addLearning(insight) {
   } else {
     await supabase.from('learnings').insert({
       insight,
-      uses:      1,
-      added_at:  Date.now(),
-      last_seen: Date.now(),
+      insight_hash: insightHash,
+      uses:         1,
+      added_at:     Date.now(),
+      last_seen:    Date.now(),
     });
   }
 }
@@ -118,6 +128,7 @@ module.exports = {
   // sessions
   getSession,
   upsertSession,
+  clearAllSessions,
   deleteExpiredSessions,
   // learnings
   addLearning,
