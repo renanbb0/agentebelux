@@ -92,7 +92,17 @@
       "Bash(taskkill /PID 18664 /F)",
       "Bash(kill -9 18664)",
       "Bash(kill -9 938)",
-      "Bash(node -e \"let d=''; process.stdin.on\\('data',c=>d+=c\\); process.stdin.on\\('end',\\(\\)=>{ const t=JSON.parse\\(d\\).tunnels; t.forEach\\(x=>{ if\\(x.public_url.includes\\('https'\\)\\) console.log\\('🌐 Ngrok: ' + x.public_url\\); }\\); }\\)\")"
+      "Bash(node -e \"let d=''; process.stdin.on\\('data',c=>d+=c\\); process.stdin.on\\('end',\\(\\)=>{ const t=JSON.parse\\(d\\).tunnels; t.forEach\\(x=>{ if\\(x.public_url.includes\\('https'\\)\\) console.log\\('🌐 Ngrok: ' + x.public_url\\); }\\); }\\)\")",
+      "Bash(powershell -Command \"Stop-Process -Name node -Force -ErrorAction SilentlyContinue; Start-Sleep -Milliseconds 500; Get-NetTCPConnection -LocalPort 3000 -ErrorAction SilentlyContinue | Select-Object LocalAddress,LocalPort,State,OwningProcess\")",
+      "Bash(powershell -Command \"Stop-Process -Name node -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 1; Write-Host 'Node finalizado'\")",
+      "Bash(powershell -Command \"Get-NetTCPConnection -LocalPort 3000 -ErrorAction SilentlyContinue\")",
+      "Bash(powershell -Command \"Stop-Process -Name ngrok -Force -ErrorAction SilentlyContinue; Write-Host 'Ngrok antigo finalizado \\(se havia\\)'\")",
+      "Bash(powershell -Command \"Start-Process ngrok -ArgumentList 'http 3000' -WindowStyle Hidden; Start-Sleep -Seconds 5; Write-Host 'Ngrok iniciado em background'\")",
+      "Bash(powershell -Command \"\\(Invoke-RestMethod -Uri 'http://localhost:4040/api/tunnels'\\).tunnels | Select-Object -ExpandProperty public_url\")",
+      "Bash(powershell -Command \"Get-Process ngrok -ErrorAction SilentlyContinue | Select-Object ProcessName,Id\")",
+      "Bash(powershell -Command \"Get-Command ngrok -ErrorAction SilentlyContinue | Select-Object Source\")",
+      "Bash(powershell -Command \"Get-ChildItem 'C:\\\\Users\\\\renan\\\\AppData\\\\Roaming\\\\npm\\\\ngrok*'\")",
+      "Bash(powershell -Command \"Start-Process -FilePath 'C:\\\\Users\\\\renan\\\\AppData\\\\Roaming\\\\npm\\\\ngrok.cmd' -ArgumentList 'http 3000' -WindowStyle Hidden; Start-Sleep -Seconds 6; Get-Process ngrok -ErrorAction SilentlyContinue | Select-Object ProcessName,Id\")"
     ]
   },
   "defaultMode": "bypassPermissions"

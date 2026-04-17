@@ -24,7 +24,8 @@ const io = new Server(server, { cors: { origin: '*' } });
 global.visualIo = io;
 
 const PORT = process.env.PORT || 3000;
-const ADMIN_PHONE = process.env.ADMIN_PHONE || null;
+const ADMIN_PHONES = (process.env.ADMIN_PHONES || process.env.ADMIN_PHONE || '')
+  .split(',').map(n => n.trim()).filter(Boolean);
 const SESSION_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes inactivity
 // Timestamp do momento em que o servidor foi iniciado.
 // Sessões carregadas do Supabase com last_activity anterior a este momento
@@ -5529,8 +5530,8 @@ async function handoffToHuman(phone, session) {
     'Perfeito 😊 Vou sinalizar nossa consultora aqui para seguir com você no atendimento.'
   );
 
-  if (!ADMIN_PHONE) {
-    logger.warn({ phone }, '[HumanHandoff] ADMIN_PHONE not configured — skipping admin notification');
+  if (!ADMIN_PHONES.length) {
+    logger.warn({ phone }, '[HumanHandoff] ADMIN_PHONES not configured — skipping admin notification');
     return;
   }
 
@@ -5540,11 +5541,13 @@ async function handoffToHuman(phone, session) {
     (session.customerName ? `👤 ${session.customerName}\n` : '') +
     `${cartBlock}`;
 
-  try {
-    await zapi.sendText(ADMIN_PHONE, adminMsg);
-    logger.info({ phone, adminPhone: ADMIN_PHONE, itemCount }, '[HumanHandoff] Admin notified');
-  } catch (err) {
-    logger.error({ err: err?.message || String(err), adminPhone: ADMIN_PHONE }, '[HumanHandoff] Failed to notify admin');
+  for (const adminPhone of ADMIN_PHONES) {
+    try {
+      await zapi.sendText(adminPhone, adminMsg);
+      logger.info({ phone, adminPhone, itemCount }, '[HumanHandoff] Admin notified');
+    } catch (err) {
+      logger.error({ err: err?.message || String(err), adminPhone }, '[HumanHandoff] Failed to notify admin');
+    }
   }
 }
 
@@ -5577,7 +5580,7 @@ async function executeHandoff(phone, session) {
   }
 
   // ── Notifica o admin ──────────────────────────────────────────────────
-  if (ADMIN_PHONE) {
+  if (ADMIN_PHONES.length) {
     const adminHeader =
       `📦 *NOVO PEDIDO — Agente Belux*\n` +
       `─────────────────\n` +
@@ -5587,41 +5590,44 @@ async function executeHandoff(phone, session) {
       `${summaryToSend}\n\n` +
       `📸 _Enviando fotos dos produtos a seguir..._`;
 
-    try {
-      await zapi.sendText(ADMIN_PHONE, adminHeader);
-      logger.info({ phone, adminPhone: ADMIN_PHONE }, '[Handoff] Text summary sent to admin');
+    const groups = buildProductGroupsFromCart({ items: itemsToSend });
 
-      const groups = buildProductGroupsFromCart({ items: itemsToSend });
-      for (let i = 0; i < groups.length; i++) {
-        const g = groups[i];
-        const variationsText = g.variations.map(v => {
-          const sizeLabel = v.variant ? `${v.variant} - ${v.size}` : v.size;
-          return `${sizeLabel} x${v.quantity}`;
-        }).join(' · ');
-        const caption =
-          `📦 *Produto ${i + 1}/${groups.length}*\n` +
-          `*${g.productName}*\n` +
-          `Tamanhos: ${variationsText}\n` +
-          `Total: ${g.totalPieces} ${g.totalPieces === 1 ? 'peça' : 'peças'} — ${woocommerce.formatPrice(g.subtotal)}`;
+    for (const adminPhone of ADMIN_PHONES) {
+      try {
+        await zapi.sendText(adminPhone, adminHeader);
+        logger.info({ phone, adminPhone }, '[Handoff] Text summary sent to admin');
 
-        if (g.imageUrl) {
-          try {
-            await zapi.sendImage(ADMIN_PHONE, g.imageUrl, caption);
-            await zapi.delay(400);
-          } catch (err) {
-            logger.error({ err: err?.message, productId: g.productId }, '[Handoff] Falha ao enviar foto, fallback para texto');
-            await zapi.sendText(ADMIN_PHONE, caption);
+        for (let i = 0; i < groups.length; i++) {
+          const g = groups[i];
+          const variationsText = g.variations.map(v => {
+            const sizeLabel = v.variant ? `${v.variant} - ${v.size}` : v.size;
+            return `${sizeLabel} x${v.quantity}`;
+          }).join(' · ');
+          const caption =
+            `📦 *Produto ${i + 1}/${groups.length}*\n` +
+            `*${g.productName}*\n` +
+            `Tamanhos: ${variationsText}\n` +
+            `Total: ${g.totalPieces} ${g.totalPieces === 1 ? 'peça' : 'peças'} — ${woocommerce.formatPrice(g.subtotal)}`;
+
+          if (g.imageUrl) {
+            try {
+              await zapi.sendImage(adminPhone, g.imageUrl, caption);
+              await zapi.delay(400);
+            } catch (err) {
+              logger.error({ err: err?.message, productId: g.productId }, '[Handoff] Falha ao enviar foto, fallback para texto');
+              await zapi.sendText(adminPhone, caption);
+            }
+          } else {
+            await zapi.sendText(adminPhone, caption + '\n⚠️ _Produto sem foto cadastrada._');
           }
-        } else {
-          await zapi.sendText(ADMIN_PHONE, caption + '\n⚠️ _Produto sem foto cadastrada._');
         }
+        logger.info({ phone, adminPhone, groupCount: groups.length }, '[Handoff] Photos forwarded to admin');
+      } catch (err) {
+        logger.error({ err: err?.message || String(err), adminPhone }, '[Handoff] Failed to notify admin');
       }
-      logger.info({ phone, groupCount: groups.length }, '[Handoff] Photos forwarded to admin');
-    } catch (err) {
-      logger.error({ err: err?.message || String(err), adminPhone: ADMIN_PHONE }, '[Handoff] Failed to notify admin');
     }
   } else {
-    logger.warn({ phone }, '[Handoff] ADMIN_PHONE not configured — skipping admin notification');
+    logger.warn({ phone }, '[Handoff] ADMIN_PHONES not configured — skipping admin notification');
   }
 
   // ── Persiste no Supabase ──────────────────────────────────────────────

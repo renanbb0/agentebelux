@@ -11,18 +11,48 @@ const logger = pino({
 
 module.exports = logger;
 
+function classifyByMessage(msg, fallback) {
+  if (typeof msg === 'string') {
+    if (msg.includes('[FSM]')) return 'fsm';
+    if (msg.includes('webhook') || msg.includes('Webhook')) return 'webhook';
+    if (msg.includes('Gemini') || msg.includes('[AI]')) return 'ai';
+    if (msg.includes('Z-API') || msg.includes('send')) return 'send';
+  }
+  return fallback;
+}
+
+function emitVisual(defaultType, data, msg) {
+  if (!global.visualIo) return;
+  let payload = data;
+  // Normaliza Error passado diretamente
+  if (data instanceof Error) {
+    payload = { err: data.message, stack: data.stack };
+  }
+  const type = classifyByMessage(msg, defaultType);
+  const state = payload?.state || payload?.pfCheck?.state || payload?.pf?.state;
+  global.visualIo.emit('log', {
+    timestamp: Date.now(),
+    type,
+    message: msg || payload,
+    state,
+    data: typeof payload === 'object' ? payload : undefined,
+  });
+}
+
 const originalInfo = logger.info.bind(logger);
 logger.info = (data, msg) => {
   originalInfo(data, msg);
-  if (global.visualIo) {
-    let type = 'system';
-    if (typeof msg === 'string') {
-      if (msg.includes('[FSM]')) type = 'fsm';
-      else if (msg.includes('webhook') || msg.includes('Webhook')) type = 'webhook';
-      else if (msg.includes('Gemini') || msg.includes('[AI]')) type = 'ai';
-      else if (msg.includes('Z-API') || msg.includes('send')) type = 'send';
-    }
-    const state = data?.state || data?.pfCheck?.state || (data?.pf?.state);
-    global.visualIo.emit('log', { timestamp: Date.now(), type, message: msg || data, state });
-  }
+  emitVisual('system', data, msg);
+};
+
+const originalWarn = logger.warn.bind(logger);
+logger.warn = (data, msg) => {
+  originalWarn(data, msg);
+  emitVisual('warn', data, msg);
+};
+
+const originalError = logger.error.bind(logger);
+logger.error = (data, msg) => {
+  originalError(data, msg);
+  emitVisual('error', data, msg);
 };
