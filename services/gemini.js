@@ -226,6 +226,12 @@ function sanitizeVisible(text) {
  * - 'assistant' → 'model'
  * - 'system' → merged as 'user' (Gemini doesn't support system role in history)
  * - Consecutive same-role messages are merged to maintain alternation.
+ *
+ * CRITICAL: Gemini API requires the first message in history to have role='user'.
+ * If the bot sent a proactive greeting (e.g. inactivity follow-up), the history
+ * may start with role='model'. We drop leading 'model' entries until we find
+ * the first 'user' message — this preserves conversational integrity without
+ * breaking the API contract.
  */
 function toGeminiHistory(history) {
   const converted = [];
@@ -239,6 +245,20 @@ function toGeminiHistory(history) {
     } else {
       converted.push({ role, parts: [{ text }] });
     }
+  }
+
+  // Drop leading 'model' entries — Gemini requires history to start with 'user'.
+  // This handles the case where the bot greeted first (proactive message).
+  let droppedCount = 0;
+  while (converted.length > 0 && converted[0].role === 'model') {
+    converted.shift();
+    droppedCount++;
+  }
+
+  if (droppedCount > 0) {
+    const logger = require('./logger');
+    logger.debug({ droppedCount, remainingLen: converted.length },
+      '[Gemini] Histórico ajustado: removidas mensagens iniciais do bot (Gemini exige role=user no início)');
   }
 
   return converted;
@@ -340,4 +360,4 @@ function parseAction(text) {
   return { cleanText: sanitizeVisible(text), action: null };
 }
 
-module.exports = { chat, parseAction };
+module.exports = { chat, parseAction, toGeminiHistory };

@@ -11,6 +11,10 @@ const learnings = require('./services/learnings');
 const logger = require('./services/logger');
 const conversationMemory = require('./services/conversation-memory');
 const semantic = require('./services/semantic');
+const archiver = require('./services/session-archiver');
+const shadowV2 = require('./services/agent-v2/shadow-router');
+const imageMatcher = require('./services/image-matcher');
+const catalogSync  = require('./services/catalog-sync');
 
 const TTS_ENABLED = process.env.TTS_ENABLED === 'true';
 
@@ -201,6 +205,10 @@ const silentAddDebounce = new Map();
 /** Timer de upsell pós-checkout: atrasa envio para admin em 5min, mostra categoria não vista */
 const upsellHandoffTimers = new Map();
 // Estrutura: phone → { timer: Timeout }
+
+/** Timer de inatividade pós "fechar pedido": 90s sem mensagem → notifica vendedora */
+const fecharPedidoInactivityTimers = new Map();
+// Estrutura: phone → Timeout
 
 const SLUG_MAP = {
   'feminina': 'feminino',
@@ -688,6 +696,20 @@ async function getSession(phone) {
   } finally {
     sessionLoadLocks.delete(phone);
   }
+  // [STUDY] Sessão carregada — contexto de entrada do cliente
+  const _s = sessions[phone];
+  if (_s) {
+    logger.info({
+      phone,
+      isNew:        !_s.previousLastActivity,
+      cartItems:    _s.items?.length        || 0,
+      historyLen:   _s.history?.length      || 0,
+      customerName: _s.customerName         || null,
+      supportMode:  _s.supportMode          || null,
+      fsmState:     _s.purchaseFlow?.state  || 'idle',
+      sessionAgeMs: _s.previousLastActivity ? Date.now() - _s.previousLastActivity : 0,
+    }, '[Session/Load] Sessão carregada');
+  }
 
   return sessions[phone];
 }
@@ -709,17 +731,40 @@ function persistSession(phone) {
   return next;
 }
 
-// Clean up sessions
-setInterval(() => {
+// Clean up sessions — arquiva antes de deletar (session_archives + JSONL)
+setInterval(async () => {
   const now = Date.now();
+
+  // 1) Memória: arquiva cada sessão expirada antes de apagar
   for (const phone of Object.keys(sessions)) {
     if (now - sessions[phone].lastActivity > SESSION_TIMEOUT_MS) {
+      try {
+        const result = await archiver.archiveSession(phone, sessions[phone]);
+        if (result?.archived) {
+          logger.info({ phone, outcome: result.outcome }, '[Archiver] In-memory session archived');
+        }
+      } catch (err) {
+        logger.error({ phone, err: err.message }, '[Archiver] Falha ao arquivar da memória');
+      }
       delete sessions[phone];
       logger.info({ phone }, '[Session] Expired');
     }
   }
-  db.deleteExpiredSessions(SESSION_TIMEOUT_MS)
-    .catch(err => logger.error({ err: err.message }, '[Supabase] deleteExpiredSessions'));
+
+  // 2) Supabase: lê expiradas, arquiva, depois apaga
+  try {
+    const expired = await db.getExpiredSessions(SESSION_TIMEOUT_MS);
+    for (const row of expired) {
+      try {
+        await archiver.archiveSupabaseRow(row);
+      } catch (err) {
+        logger.error({ phone: row.phone, err: err.message }, '[Archiver] Falha ao arquivar do Supabase');
+      }
+    }
+    await db.deleteExpiredSessions(SESSION_TIMEOUT_MS);
+  } catch (err) {
+    logger.error({ err: err.message }, '[Supabase] archive+delete pipeline');
+  }
 }, 10 * 60 * 1000);
 
 // ── Cart Recovery (Abandono de Carrinho) ─────────────────────────────────
@@ -803,6 +848,9 @@ function extractTextFromEvent(event) {
     if (brmId) {
       logger.info({ buttonId: brmId }, '[extractText] buttonsResponseMessage recebido');
       // Normaliza IDs legados lowercase → sentinelas canônicas
+      if (brmId === 'btn_fechar_pedido')   return 'BTN_FECHAR_PEDIDO';
+      if (brmId === 'btn_lancamentos')     return 'CAT_LANCAMENTOS';
+      if (brmId === 'btn_problema')        return 'FALAR_ATENDENTE';
       if (brmId === 'cat_feminina')        return 'CAT_FEMININO';
       if (brmId === 'cat_masculina')       return 'CAT_MASCULINO';
       if (brmId === 'cat_lancamentos')     return 'CAT_LANCAMENTOS';
@@ -858,6 +906,24 @@ function extractAudioUrl(event) {
     || event?.message?.audio?.url
     || null;
 }
+
+// ── WooCommerce Webhook (sync em tempo real do catálogo) ─────────────────
+// Configurar no WooCommerce: Settings → Advanced → Webhooks →
+//   Topic: Product created / updated / deleted
+//   Delivery URL: https://<ngrok>/wc-webhook/product
+//   Secret: defina WC_WEBHOOK_SECRET no .env
+// Opcional — o cron de 1h já captura tudo sem webhook.
+app.post('/wc-webhook/product', async (req, res) => {
+  res.sendStatus(200); // responde imediatamente (Woo tem timeout baixo)
+
+  try {
+    const event = req.headers['x-wc-webhook-event'] || 'updated';
+    const result = await catalogSync.handleWebhook({ event, product: req.body });
+    logger.info({ event, result }, '[WC Webhook] Processado');
+  } catch (err) {
+    logger.error({ err: err.message }, '[WC Webhook] Falha ao processar');
+  }
+});
 
 // ── Webhook ───────────────────────────────────────────────────────────────
 app.post('/webhook', async (req, res) => {
@@ -934,8 +1000,14 @@ app.post('/webhook', async (req, res) => {
 
     let text = extractTextFromEvent(body);
     if (!text) {
-      logger.warn({ from, bodyKeys: Object.keys(body), hasList: Boolean(body.listResponseMessage), hasBtn: Boolean(body.buttonsResponseMessage) }, '[Webhook] extractTextFromEvent retornou vazio — evento descartado');
-      return;
+      // Foto sem legenda no modo fechar_pedido_pending: não descarta — deixa relay encaminhar
+      const preloadedSession = sessions[from];
+      const isFecharPedidoRelay = preloadedSession?.supportMode === 'fechar_pedido_pending' && body.image?.imageUrl;
+      if (!isFecharPedidoRelay) {
+        logger.warn({ from, bodyKeys: Object.keys(body), hasList: Boolean(body.listResponseMessage), hasBtn: Boolean(body.buttonsResponseMessage) }, '[Webhook] extractTextFromEvent retornou vazio — evento descartado');
+        return;
+      }
+      text = ''; // foto sem caption: segue o fluxo com texto vazio
     }
 
     // Fallbacks de áudio/sticker que NÃO precisam de sessão (respondem direto)
@@ -986,6 +1058,45 @@ app.post('/webhook', async (req, res) => {
       ? Date.now() - session.previousLastActivity
       : 0;
 
+    // ── Gate de Entrada — exibido antes de qualquer interação para clientes novos ──
+    // Clientes com histórico vazio e carrinho vazio devem escolher entre catálogo e vendedora.
+    // Retorna ao fluxo normal apenas quando selecionam o catálogo (gate_catalog / "1").
+    {
+      const isNewClient = session.history.length === 0 && !(session.items?.length > 0) && (session.purchaseFlow?.state === 'idle' || !session.purchaseFlow?.state);
+      if (isNewClient) {
+        const isGateCatalog    = text === 'gate_catalog' || text.trim() === '1';
+        const isGateSeller     = text === 'gate_seller'  || text.trim() === '2';
+        const isGateFecharPed  = text === 'BTN_FECHAR_PEDIDO';
+
+        if (isGateSeller) {
+          logger.info({ from }, '[Gate] Cliente escolheu resolver problema — handoff humano');
+          await handoffToHuman(from, session);
+          persistSession(from);
+          return;
+        }
+
+        if (isGateFecharPed) {
+          // Cai fora do gate diretamente no interceptor BTN_FECHAR_PEDIDO abaixo
+          logger.info({ from }, '[Gate] Cliente escolheu fechar pedido — passando para interceptor');
+          // Não retorna — deixa cair no interceptor BTN_FECHAR_PEDIDO mais abaixo
+        } else if (!isGateCatalog) {
+          logger.info({ from, text: text.slice(0, 50) }, '[Gate] Enviando menu inicial de escolha');
+          try {
+            await zapi.sendInitialGate(from);
+          } catch (err) {
+            logger.error({ from, err: err.message }, '[Gate] sendInitialGate falhou — enviando texto simples');
+            await zapi.sendText(from, 'Olá! Sou a *Bela*, consultora da *Belux Moda Íntima* 👋\n\nO que você prefere?\n\n📦 *Fechar meu pedido*\n🆕 *Ver lançamentos*\n❓ *Resolver um problema*');
+          }
+          persistSession(from);
+          return;
+        } else {
+          // isGateCatalog = true → continua fluxo normal (isFirstContact → boas-vindas + catálogo)
+          logger.info({ from }, '[Gate] Cliente escolheu lançamentos — prosseguindo com boas-vindas');
+        }
+      }
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
     // Rotas determinísticas de carrinho
     if (text === 'CART_VIEW') {
       logger.info({ from }, '[Intercept] Visualização de carrinho');
@@ -1035,14 +1146,43 @@ app.post('/webhook', async (req, res) => {
     }
 
     if (text === 'FALAR_ATENDENTE') {
-      logger.info({ from }, '[Intercept] Encaminhamento humano determinístico');
+      logger.info({ from, trigger: 'BOTAO_FALAR_ATENDENTE', fsmState: session.purchaseFlow?.state || 'idle', cartItems: session.items?.length || 0 }, '[Intercept] Encaminhamento humano determinístico');
       await handoffToHuman(from, session);
+      persistSession(from);
+      return;
+    }
+
+    if (text === 'BTN_FECHAR_PEDIDO') {
+      logger.info({ from }, '[Intercept] Botão "Fechar Pedido" — modo fotos/tamanho');
+      session.supportMode = 'fechar_pedido_pending';
+      session.fecharPedidoHeaderSent = false;
+      // Captura nome do contato do próprio webhook
+      const waName = body.senderName || body.chatName || null;
+      if (waName && !session.customerName) session.customerName = waName;
+      const pedidoMsg = 'Ótimo! 📦 Me envie as *fotos* dos produtos que deseja, e para cada uma me diga o *tamanho* e a *quantidade*. Pode mandar tudo em sequência! 😊\n\n_Quando terminar de enviar, é só parar de digitar — vou chamar a consultora automaticamente._';
+      appendHistory(session, 'assistant', pedidoMsg);
+      conversationMemory.refreshConversationMemory(session, { assistantText: pedidoMsg });
+      await zapi.sendText(from, pedidoMsg);
+      scheduleFecharPedidoHandoff(from, session);
       persistSession(from);
       return;
     }
 
     // Sprint 1 — Interceptor global: limpeza de carrinho com linguagem natural
     const semanticQuick = semantic.analyzeUserMessage(text);
+    // [STUDY] Intenções detectadas pelo analisador semântico
+    logger.info({
+      from,
+      text: text.slice(0, 100),
+      intent: {
+        wantsHuman:    semanticQuick.wantsHuman    || false,
+        wantsCheckout: semanticQuick.wantsCheckout || false,
+        wantsClearCart:semanticQuick.wantsClearCart|| false,
+        wantsCart:     semanticQuick.wantsCart     || false,
+        slangOrNoisy:  semanticQuick.slangOrNoisy  || false,
+        categories:    semanticQuick.categories    || [],
+      },
+    }, '[Semantic] Intenção detectada');
     if (semanticQuick.wantsClearCart) {
       logger.info({ from, text: text.slice(0, 80) }, '[Intercept] Limpeza de carrinho via semântica');
       await clearCart(from, session);
@@ -1052,7 +1192,7 @@ app.post('/webhook', async (req, res) => {
 
     // Sprint 1 — Interceptor global: handoff humano com linguagem natural
     if (semanticQuick.wantsHuman) {
-      logger.info({ from, text: text.slice(0, 80) }, '[Intercept] Handoff humano via semântica');
+      logger.info({ from, text: text.slice(0, 80), trigger: 'SEMANTICA_WANTS_HUMAN', fsmState: session.purchaseFlow?.state || 'idle', cartItems: session.items?.length || 0 }, '[Intercept] Handoff humano via semântica');
       await handoffToHuman(from, session);
       persistSession(from);
       return;
@@ -1137,6 +1277,132 @@ _Prefere falar com a consultora agora? É só me dizer "falar com consultora"_ �
         logger.info({ from }, '[SupportMode] Cliente retomou interesse de compra — saindo de human_pending');
         clearSupportMode(session, 'shopping_resumed');
       }
+    }
+
+    // Relay mode: encaminha cada mensagem IMEDIATAMENTE para a vendedora (URLs frescas)
+    if (session.supportMode === 'fechar_pedido_pending') {
+      if (!session.fecharPedidoPhotoMap) session.fecharPedidoPhotoMap = {};
+
+      const waName = body.senderName || body.chatName || null;
+      if (waName && !session.customerName) session.customerName = waName;
+
+      const imageUrl = body.image?.imageUrl || null;
+      const caption  = body.image?.caption  || null;
+      const audioUrl = body.audio?.audioUrl || null;
+      const msgId    = body.messageId;
+      const refMsgId = body.referenceMessageId || body?.quotedMessage?.messageId || null;
+
+      // Guarda foto recebida para resolver replies futuros
+      if (imageUrl && msgId) session.fecharPedidoPhotoMap[msgId] = imageUrl;
+
+      // Se é reply a uma foto anterior, tenta resolver a URL da foto citada
+      let quotedImageUrl = null;
+      if (refMsgId && !imageUrl) {
+        quotedImageUrl = session.fecharPedidoPhotoMap[refMsgId] || null;
+        if (!quotedImageUrl && session.messageProductMap?.[refMsgId]?.imageUrl) {
+          quotedImageUrl = session.messageProductMap[refMsgId].imageUrl;
+        }
+        if (!quotedImageUrl) {
+          try {
+            const fetched = await zapi.getMessageById(refMsgId);
+            quotedImageUrl = fetched?.image?.imageUrl
+              || fetched?.imageMessage?.url
+              || fetched?.message?.imageMessage?.url
+              || null;
+          } catch (err) {
+            logger.warn({ refMsgId, err: err.message }, '[FecharPedido] getMessageById falhou');
+          }
+        }
+      }
+
+      // === Image matching: tenta identificar o produto da foto no catálogo ===
+      // Roda em paralelo ao relay para não atrasar o encaminhamento à vendedora.
+      // Resultado acumulado em session.matchedProducts; mostrado no FIM DO ENVIO.
+      //
+      // Padrão da cliente: foto → texto separado (tamanho/qtd).
+      // Usamos uma fila FIFO (pendingSizeTexts): texto puro → enfileira;
+      // quando o match async resolve → desenfila como caption da foto correspondente.
+      if (!session.matchedProducts)   session.matchedProducts  = [];
+      if (!session.pendingSizeTexts)  session.pendingSizeTexts  = [];
+
+      const imageToMatch = imageUrl || quotedImageUrl;
+      if (imageToMatch) {
+        // Foto recebida: guarda caption inline (se veio junto) e dispara o match
+        const inlineCaption = caption || null;
+        imageMatcher.matchProductFromImage(imageToMatch, { minConfidence: 0.65, topK: 10 })
+          .then((match) => {
+            if (!match) {
+              logger.info({ from }, '[FecharPedido] Nenhum match retornado (catálogo vazio?)');
+              return;
+            }
+            // Caption: prioridade → inline > fila FIFO de textos separados
+            const sizeCaption = inlineCaption || session.pendingSizeTexts.shift() || null;
+            // Dedup conservador: só descarta se for EXATAMENTE a mesma foto
+            // (mesmo productId + mesmo caption). Permite o cliente pedir 2 cores
+            // do mesmo modelo com captions diferentes (ex: "2m 1g" e "1g").
+            const isDuplicate = session.matchedProducts.find(
+              (m) => m.productId === match.productId && m.caption === sizeCaption,
+            );
+            if (!isDuplicate) {
+              session.matchedProducts.push({
+                productId:  match.productId,
+                name:       match.name,
+                price:      match.price,
+                confidence: match.confidence,
+                uncertain:  !!match.uncertain,
+                caption:    sizeCaption,
+              });
+              logger.info(
+                { from, productId: match.productId, caption: sizeCaption, uncertain: !!match.uncertain, confidence: match.confidence },
+                match.uncertain ? '[FecharPedido] Produto identificado como INCERTO (revisar)' : '[FecharPedido] Produto identificado',
+              );
+              persistSession(from);
+            }
+          })
+          .catch((err) => {
+            logger.warn({ from, err: err.message }, '[FecharPedido] Falha no image matching');
+          });
+      } else if (text && text !== '[Sticker]' && text !== '[Áudio_STT]' && text !== '[Áudio]' && !audioUrl) {
+        // Texto puro (tamanho/qtd): enfileira para ser consumido pelo próximo match
+        // OU atualiza o último produto identificado se ainda não tem caption
+        const lastMatched = session.matchedProducts[session.matchedProducts.length - 1];
+        if (lastMatched && !lastMatched.caption) {
+          lastMatched.caption = text;
+          persistSession(from);
+        } else {
+          session.pendingSizeTexts.push(text);
+        }
+      }
+
+      for (const adminPhone of ADMIN_PHONES) {
+        try {
+          if (!session.fecharPedidoHeaderSent) {
+            const headerMsg =
+              `📦 *NOVO PEDIDO CHEGANDO*\n` +
+              `📱 wa.me/${from}\n` +
+              (session.customerName ? `👤 *${session.customerName}*\n` : '') +
+              `\n_A cliente está enviando fotos e tamanhos abaixo 👇_`;
+            await zapi.sendText(adminPhone, headerMsg);
+            await zapi.delay(300);
+          }
+          if (quotedImageUrl) {
+            // Reply a uma foto: reencaminha a foto citada com o texto da cliente como legenda
+            await zapi.sendImage(adminPhone, quotedImageUrl, text || '');
+          } else if (imageUrl) {
+            await zapi.sendImage(adminPhone, imageUrl, caption || '');
+          } else if (audioUrl) {
+            await zapi.sendText(adminPhone, `🎙️ _Cliente enviou áudio (abra o chat: wa.me/${from})_`);
+          } else if (text && text !== '[Sticker]' && text !== '[Áudio_STT]' && text !== '[Áudio]') {
+            await zapi.sendText(adminPhone, text);
+          }
+        } catch (err) {
+          logger.error({ from, adminPhone, err: err.message }, '[FecharPedido] Falha ao encaminhar para vendedora');
+        }
+      }
+      session.fecharPedidoHeaderSent = true;
+      scheduleFecharPedidoHandoff(from, session);
+      persistSession(from);
+      return;
     }
 
     // Intercept: botão "Ver Mais Produtos" — roteado ANTES de qualquer detector semântico.
@@ -2415,7 +2681,7 @@ _Pedido mínimo: *R$ 150,00*_ 🛒 — pagamento via *PIX tem desconto especial*
 _Qualquer dúvida sobre tamanho, disponibilidade ou preço — pode perguntar a qualquer momento 😊_
 _Quer falar com a consultora humana? É só dizer "falar com consultora"_
 
-Vamos lá! 👀`;
+O que você prefere agora? 👇`;
 
       // Texto TTS — sem markdown, escrito para ser falado
       const welcomeTTS = `${turno}! Que bom ter você aqui! Sou a Bela, consultora da Belux Moda Íntima, e vou te acompanhar em cada passo dessa compra!
@@ -2434,9 +2700,7 @@ Quarto: quando terminar de escolher, é só me avisar que terminou. Eu te mando 
 
 Qualquer dúvida que aparecer no caminho — sobre tamanho, disponibilidade, preço ou o que for — pode me perguntar à vontade e na hora que quiser.
 
-Então bora lá! Vou começar te mostrando os lançamentos da semana — as peças mais novas e mais pedidas aqui da Belux. Dá uma olhada com carinho!
-
-E sabe o que é bom? Temos muito mais além dos lançamentos! Linha feminina, infantil, masculina e outras coleções incríveis esperando por você. Se quiser explorar qualquer uma delas, é só me pedir: "quero ver feminino", ou "mostra a linha infantil", e eu apareço na hora com tudo!`;
+Então me diz: o que você prefere agora? Fechar um pedido que já sabe o que quer? Ver os lançamentos da semana? Ou precisa resolver algum problema? É só escolher uma das opções e a gente começa!`;
 
       appendHistory(session, 'assistant', welcomeMsg);
       conversationMemory.refreshConversationMemory(session, { assistantText: welcomeMsg });
@@ -2450,11 +2714,21 @@ E sabe o que é bom? Temos muito mais além dos lançamentos! Linha feminina, in
         }
       }
       try {
-        await showAllCategory(from, 'lancamento-da-semana', session);
+        await zapi.sendButtonList(
+          from,
+          'Escolha uma opção:',
+          'Belux Moda Íntima',
+          '',
+          {
+            buttons: [
+              { id: 'btn_fechar_pedido', label: '📦 Fechar meu pedido' },
+              { id: 'btn_lancamentos',   label: '🆕 Ver lançamentos' },
+              { id: 'btn_problema',      label: '❓ Resolver um problema' },
+            ],
+          }
+        );
       } catch (err) {
-        // showAllCategory já tem seu próprio catch — isso só protege contra re-throw inesperado
-        logger.error({ err: err.message }, '[FirstContact] showAllCategory lançou exceção não tratada');
-        await sendCategoryMenu(from, 'Por onde você quer começar?');
+        logger.warn({ from, err: err.message }, '[FirstContact] Falha ao enviar botões de boas-vindas');
       }
       persistSession(from);
       return;
@@ -2503,10 +2777,35 @@ E sabe o que é bom? Temos muito mais além dos lançamentos! Linha feminina, in
     logger.info({ phone: from, response: aiRaw }, '[AI] Response');
 
     let { cleanText, action } = ai.parseAction(aiRaw);
+    // [STUDY] Decisão da IA após parse
+    logger.info({
+      from,
+      actionType:       action?.type        || null,
+      hasText:          !!cleanText,
+      textPreview:      cleanText?.slice(0, 100) || null,
+      fsmState:         session.purchaseFlow?.state || 'idle',
+      currentProduct:   session.currentProduct    || null,
+    }, '[AI] Decisão parseada');
 
     // ── Auto-escalação: reset do contador quando IA processa com sucesso ──
     if (cleanText || action) {
       session.consecutiveFailures = 0;
+    }
+
+    // ── V2 SHADOW MODE ─────────────────────────────────────────────────────
+    // Roda a Bela V2 (Function Calling) em paralelo, fire-and-forget.
+    // Apenas LOGA a decisão V2 vs V1 — nunca envia mensagem ao cliente.
+    // Qualquer erro é silenciado dentro do shadow-router. NUNCA pode afetar V1.
+    // Ativar via .env: AGENT_SHADOW_MODE=true
+    if (shadowV2.isShadowEnabled()) {
+      setImmediate(() => {
+        shadowV2.runShadow({
+          phone: from,
+          history: activeHistory,
+          catalogContext: promptContext,
+          v1Result: { cleanText, action },
+        }).catch(() => { /* já tratado internamente */ });
+      });
     }
 
     const semanticFallbackAction = semantic.inferActionFromSemantics(text, session);
@@ -2683,7 +2982,7 @@ E sabe o que é bom? Temos muito mais além dos lançamentos! Linha feminina, in
       // ── Auto-escalação: 2 falhas consecutivas → atendente humano ──
       session.consecutiveFailures = (session.consecutiveFailures || 0) + 1;
       if (session.consecutiveFailures >= 2) {
-        logger.info({ phone: from, failures: session.consecutiveFailures }, '[AutoEscalation] 2 falhas consecutivas — encaminhando para atendente');
+        logger.info({ phone: from, failures: session.consecutiveFailures, trigger: 'AUTO_ESCALATION_AI_EMPTY', fsmState: session.purchaseFlow?.state || 'idle', cartItems: session.items?.length || 0 }, '[AutoEscalation] 2 falhas consecutivas — encaminhando para atendente');
         session.consecutiveFailures = 0;
         await handoffToHuman(from, session);
         persistSession(from);
@@ -5505,6 +5804,103 @@ async function sendProductPage(phone, result, session, startIdx = 0) {
  * @param {string} phone - Customer phone number
  * @param {object} session - Current session object
  */
+function scheduleFecharPedidoHandoff(phone, session) {
+  const existing = fecharPedidoInactivityTimers.get(phone);
+  if (existing) clearTimeout(existing);
+
+  const timer = setTimeout(async () => {
+    fecharPedidoInactivityTimers.delete(phone);
+    // Só dispara se a sessão ainda está no modo fechar pedido e sem compras em andamento
+    if (session.supportMode !== 'fechar_pedido_pending') return;
+    session.supportMode = 'human_pending';
+
+    // Monta resumo dos produtos identificados pela IA de visão.
+    // Divide em confirmados (alta confiança) e incertos (precisa revisão humana).
+    const matched = session.matchedProducts || [];
+    const confirmed = matched.filter((m) => !m.uncertain);
+    const uncertain = matched.filter((m) => m.uncertain);
+    let cartSummaryForClient = '';
+    let cartSummaryForAdmin = '';
+    if (matched.length > 0) {
+      let totalConfirmed = 0;
+      const confirmedLines = confirmed.map((m, i) => {
+        const price = parseFloat(m.price) || 0;
+        totalConfirmed += price;
+        const sizeQty = m.caption ? ` · _${m.caption}_` : '';
+        return `${i + 1}. ${m.name} — R$ ${price.toFixed(2).replace('.', ',')}${sizeQty}`;
+      });
+
+      // Cliente só vê os confirmados — evita passar info errada.
+      if (confirmed.length > 0) {
+        cartSummaryForClient =
+          `\n\n🛒 *Identifiquei esses produtos nas suas fotos:*\n` +
+          confirmedLines.join('\n') +
+          `\n\n💰 *Subtotal:* R$ ${totalConfirmed.toFixed(2).replace('.', ',')}` +
+          `\n\n_A consultora vai confirmar os detalhes do pedido com você._ 😊`;
+      }
+
+      // Admin vê tudo, com os incertos destacados.
+      const adminParts = [];
+      if (confirmed.length > 0) {
+        adminParts.push(
+          `\n\n🛒 *CARRINHO IDENTIFICADO (IA):*\n` +
+          confirmed.map((m, i) => {
+            const price = parseFloat(m.price) || 0;
+            const conf = Math.round((m.confidence || 0) * 100);
+            const sizeQty = m.caption ? ` | _"${m.caption}"_` : '';
+            return `${i + 1}. #${m.productId} — ${m.name} — R$ ${price.toFixed(2).replace('.', ',')}${sizeQty} _(${conf}% confiança)_`;
+          }).join('\n') +
+          `\n💰 *Subtotal:* R$ ${totalConfirmed.toFixed(2).replace('.', ',')}`,
+        );
+      }
+      if (uncertain.length > 0) {
+        adminParts.push(
+          `\n\n⚠️ *FOTOS NÃO IDENTIFICADAS COM CERTEZA* (revisar manualmente):\n` +
+          uncertain.map((m, i) => {
+            const price = parseFloat(m.price) || 0;
+            const conf = Math.round((m.confidence || 0) * 100);
+            const sizeQty = m.caption ? ` | _"${m.caption}"_` : '';
+            return `${i + 1}. Palpite: #${m.productId} — ${m.name} — R$ ${price.toFixed(2).replace('.', ',')}${sizeQty} _(${conf}% confiança — CONFIRMAR)_`;
+          }).join('\n'),
+        );
+      }
+      cartSummaryForAdmin = adminParts.join('');
+    }
+
+    const confirmMsg =
+      '✅ Perfeito! Já estou separando o seu pedido com a consultora. Ela vai falar com você em instantes! 🌸' +
+      cartSummaryForClient;
+    try {
+      await zapi.sendText(phone, confirmMsg);
+      appendHistory(session, 'assistant', confirmMsg);
+    } catch (err) {
+      logger.error({ phone, err: err.message }, '[FecharPedido] Falha ao enviar confirmação');
+    }
+
+    const closeMsg =
+      `✅ *FIM DO ENVIO*\n` +
+      `📱 wa.me/${phone}\n` +
+      (session.customerName ? `👤 *${session.customerName}*\n` : '') +
+      `\n_A cliente está aguardando seu contato para fechar o pedido._` +
+      cartSummaryForAdmin;
+
+    for (const adminPhone of ADMIN_PHONES) {
+      try {
+        await zapi.sendText(adminPhone, closeMsg);
+        logger.info({ phone, adminPhone }, '[FecharPedido] Fim do relay enviado');
+      } catch (err) {
+        logger.error({ phone, adminPhone, err: err.message }, '[FecharPedido] Falha ao enviar fim do relay');
+      }
+    }
+    session.fecharPedidoHeaderSent = false;
+    session.matchedProducts = [];
+    persistSession(phone);
+  }, 90_000);
+
+  fecharPedidoInactivityTimers.set(phone, timer);
+  logger.info({ phone }, '[FecharPedido] Timer de 90s agendado');
+}
+
 async function handoffToHuman(phone, session) {
   if (session.supportMode === 'human_pending') {
     logger.info({ phone }, '[HumanHandoff] Duplicate request while already pending');
@@ -5786,4 +6182,9 @@ server.listen(PORT, () => {
   woocommerce.warmupCache().catch((err) => {
     logger.error({ err: err.message }, '[Startup] warmupCache falhou inesperadamente');
   });
+
+  // Catalog sync automático (boot em 30s + incremental 1h + reconcile 24h).
+  // Garante que produtos novos/atualizados/deletados no WooCommerce fiquem
+  // refletidos no Supabase sem intervenção manual.
+  catalogSync.start();
 });

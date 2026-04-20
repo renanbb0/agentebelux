@@ -546,4 +546,30 @@ async function sendVariantButtonCard(phone, product, attr, version) {
   return res;
 }
 
-module.exports = { readMessage, sendText, replyText, sendImage, sendAudio, getMessageById, delay, sendButtonList, sendOptionList, sendProductShowcase, sendSizeList, sendQuantityList, sendSizeQuantityList, sendMoreSizesButtons, sendSingleSizeConfirm, sendReaction, sendVariantOptionList, sendVariantButtonCard };
+/**
+ * Menu inicial de escolha: catálogo ou vendedora humana.
+ * Enviado antes de qualquer interação com clientes novos (history vazio).
+ */
+async function sendInitialGate(phone) {
+  const payload = {
+    phone,
+    message: 'Olá! Sou a *Bela*, consultora da *Belux Moda Íntima* 👋\n\nO que você prefere agora?',
+    buttonList: {
+      buttons: [
+        { id: 'btn_fechar_pedido', label: '📦 Fechar meu pedido' },
+        { id: 'gate_catalog',      label: '🆕 Ver lançamentos' },
+        { id: 'gate_seller',       label: '❓ Resolver um problema' },
+      ],
+    },
+  };
+  try {
+    const res = await zapiClient.post('/send-button-list', payload);
+    logger.info({ phone, zaapId: res.data?.zaapId }, '[Z-API] sendInitialGate');
+    return res;
+  } catch (err) {
+    logger.error({ err: err.message }, '[Z-API] sendInitialGate failed');
+    throw err;
+  }
+}
+
+module.exports = { readMessage, sendText, replyText, sendImage, sendAudio, getMessageById, delay, sendButtonList, sendOptionList, sendProductShowcase, sendSizeList, sendQuantityList, sendSizeQuantityList, sendMoreSizesButtons, sendSingleSizeConfirm, sendReaction, sendVariantOptionList, sendVariantButtonCard, sendInitialGate };

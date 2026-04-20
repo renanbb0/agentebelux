@@ -37,6 +37,10 @@ const FULL_HISTORY = hasFlag('full-history');
 const OUT_PATH = getArg('out', './relatório_producao_hoje.md');
 const TAIL_HANDOFF = parseInt(getArg('tail-handoff', '8'), 10);
 const TAIL_ABANDON = parseInt(getArg('tail-abandon', '5'), 10);
+const ARCHIVE_EXISTING = hasFlag('archive-existing');
+
+// Archiver opcional — só carrega se for usar (evita require desnecessário)
+const archiver = ARCHIVE_EXISTING ? require('../../services/session-archiver') : null;
 
 // ── Supabase client ──────────────────────────────────────────────────────
 const supabaseUrl = process.env.SUPABASE_URL;
@@ -276,10 +280,39 @@ async function extrair() {
     relatorio += `_Arquivo \`logs/agent.log\` não encontrado. Para capturar erros em disco, rode o Agente com \`node index.js 2>&1 | Tee-Object -FilePath logs/agent.log\` (PowerShell) ou \`node index.js 2>&1 | tee logs/agent.log\` (bash)._\n\n`;
   }
 
+  // ── 7. ARQUIVAMENTO OPCIONAL (rede de segurança) ──
+  let archiveStats = null;
+  if (ARCHIVE_EXISTING && archiver) {
+    console.log('[extrator] Flag --archive-existing: arquivando sessões classificáveis...');
+    const stats = { archived: 0, skipped: 0, failed: 0, byOutcome: {} };
+    for (const s of sessoes) {
+      try {
+        const r = await archiver.archiveSupabaseRow(s);
+        if (r?.archived) {
+          stats.archived++;
+          stats.byOutcome[r.outcome] = (stats.byOutcome[r.outcome] || 0) + 1;
+        } else {
+          stats.skipped++;
+        }
+      } catch (err) {
+        stats.failed++;
+        console.warn(`[extrator]   arquivo falhou phone=${s.phone}: ${err.message}`);
+      }
+    }
+    archiveStats = stats;
+    relatorio += `## 📦 7. Arquivamento (--archive-existing)\n\n`;
+    relatorio += `- Arquivadas: **${stats.archived}** ${JSON.stringify(stats.byOutcome)}\n`;
+    relatorio += `- Puladas (sem outcome classificável ou já arquivadas): ${stats.skipped}\n`;
+    relatorio += `- Falhas: ${stats.failed}\n\n`;
+  }
+
   // ── Grava ──
   fs.writeFileSync(OUT_PATH, relatorio, 'utf8');
   console.log(`[extrator] ✅ Relatório gravado em: ${OUT_PATH}`);
   console.log(`[extrator] Resumo: ${sessoes.length} sessões / ${handoffs.length} handoffs / ${abandonos.length} abandonos / ${orders.length} vendas / ${learnings.length} learnings.`);
+  if (archiveStats) {
+    console.log(`[extrator] Arquivamento: ${archiveStats.archived} arquivadas, ${archiveStats.skipped} puladas, ${archiveStats.failed} falhas.`);
+  }
 }
 
 extrair().catch(err => {

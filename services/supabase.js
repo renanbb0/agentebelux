@@ -61,7 +61,8 @@ async function clearAllSessions() {
 }
 
 async function deleteExpiredSessions(timeoutMs) {
-  const cutoff = new Date(Date.now() - timeoutMs).toISOString();
+  // last_activity é bigint (Date.now()). Passar número cru, não ISO string.
+  const cutoff = Date.now() - timeoutMs;
   const { error } = await supabase
     .from('sessions')
     .delete()
@@ -70,6 +71,36 @@ async function deleteExpiredSessions(timeoutMs) {
     const logger = require('./logger');
     logger.error({ err: error.message }, '[Supabase] deleteExpiredSessions');
   }
+}
+
+async function getExpiredSessions(timeoutMs) {
+  const cutoff = Date.now() - timeoutMs;
+  const { data, error } = await supabase
+    .from('sessions')
+    .select('*')
+    .lt('last_activity', cutoff);
+  if (error) {
+    const logger = require('./logger');
+    logger.error({ err: error.message }, '[Supabase] getExpiredSessions');
+    return [];
+  }
+  return data || [];
+}
+
+async function archiveSession(archive) {
+  const { error } = await supabase.from('session_archives').insert(archive);
+  if (error) throw error;
+}
+
+async function hasArchiveFor(phone, sessionStartedAtIso) {
+  const { data, error } = await supabase
+    .from('session_archives')
+    .select('id')
+    .eq('phone', phone)
+    .eq('session_started_at', sessionStartedAtIso)
+    .limit(1);
+  if (error) return false;
+  return Array.isArray(data) && data.length > 0;
 }
 
 // ── Learnings ─────────────────────────────────────────────────────────────
@@ -130,6 +161,10 @@ module.exports = {
   upsertSession,
   clearAllSessions,
   deleteExpiredSessions,
+  getExpiredSessions,
+  // archives
+  archiveSession,
+  hasArchiveFor,
   // learnings
   addLearning,
   getActiveLearnings,

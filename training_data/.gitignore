@@ -1,0 +1,5 @@
+# Dados de treino contêm PII — nunca versionar.
+events.jsonl
+finetune_*.jsonl
+*_train.jsonl
+*_val.jsonl
