@@ -80,15 +80,17 @@ async function sendAudio(to, audioBuffer, mimeType = 'audio/mpeg') {
   return res;
 }
 
-async function sendDocument(to, pdfBuffer, fileName) {
+async function sendDocument(to, pdfBuffer, fileName, extension = 'pdf') {
   const base64 = pdfBuffer.toString('base64');
-  const dataUri = `data:application/pdf;base64,${base64}`;
-  const res = await zapiClient.post('/send-document', {
+  const dataUri = `data:application/${extension};base64,${base64}`;
+  // Z-API exige a extensão no path: /send-document/{extension}
+  // Ver: D:\obsidian\Agente Belux\Agente Belux Docs\zapi\Z-API — Envio de Mensagens.md
+  const res = await zapiClient.post(`/send-document/${extension}`, {
     phone: to,
     document: dataUri,
     fileName,
   });
-  logger.info({ to, fileName, zaapId: res.data?.zaapId }, '[Z-API] sendDocument');
+  logger.info({ to, fileName, extension, zaapId: res.data?.zaapId, messageId: res.data?.messageId }, '[Z-API] sendDocument');
   return res;
 }
 
