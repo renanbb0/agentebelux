@@ -15,6 +15,8 @@ const archiver = require('./services/session-archiver');
 const shadowV2 = require('./services/agent-v2/shadow-router');
 const imageMatcher = require('./services/image-matcher');
 const catalogSync  = require('./services/catalog-sync');
+const pdfService = require('./services/pdf');
+const { buildProductGroupsFromCart, buildProductGroupsFromMatched } = require('./services/order-groups');
 
 const TTS_ENABLED = process.env.TTS_ENABLED === 'true';
 
@@ -30,6 +32,7 @@ global.visualIo = io;
 const PORT = process.env.PORT || 3000;
 const ADMIN_PHONES = (process.env.ADMIN_PHONES || process.env.ADMIN_PHONE || '')
   .split(',').map(n => n.trim()).filter(Boolean);
+const HANDOFF_PIX_DISCOUNT_PCT = parseFloat(process.env.PIX_DISCOUNT_PCT || '10');
 const SESSION_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes inactivity
 // Timestamp do momento em que o servidor foi iniciado.
 // Sessões carregadas do Supabase com last_activity anterior a este momento
@@ -218,7 +221,11 @@ const SLUG_MAP = {
   'masculino': 'masculino',
   'masculino_infantil': 'masculinoinfantil',
   'lancamentos': 'lancamento-da-semana',
-  'lancamento': 'lancamento-da-semana'
+  'lancamento': 'lancamento-da-semana',
+  'promocao': 'promocao',
+  'promocoes': 'promocao',
+  'promoção': 'promocao',
+  'promocoes-semanal': 'promocao'
 };
 
 const CATEGORY_DISPLAY_NAMES = {
@@ -227,6 +234,7 @@ const CATEGORY_DISPLAY_NAMES = {
   'masculino':            'Masculino',
   'masculinoinfantil':    'Masculino Infantil',
   'lancamento-da-semana': 'Lançamentos da Semana',
+  'promocao':             'Promoção',
 };
 
 function getCategoryDisplayName(slug) {
@@ -234,18 +242,20 @@ function getCategoryDisplayName(slug) {
 }
 
 const CAT_SENTINELS = {
+  'CAT_LANCAMENTOS':       'lancamento-da-semana',
   'CAT_FEMININO':          'feminino',
   'CAT_FEMININOINFANTIL':  'femininoinfantil',
   'CAT_MASCULINO':         'masculino',
   'CAT_MASCULINOINFANTIL': 'masculinoinfantil',
-  'CAT_LANCAMENTOS':       'lancamento-da-semana',
+  'CAT_PROMOCAO':          'promocao',
 };
 const CATEGORY_OPTIONS = [
+  { id: 'cat_lancamentos', title: 'Lançamentos', description: 'As novidades da semana' },
   { id: 'cat_feminina', title: 'Feminino', description: 'Moda íntima feminina' },
   { id: 'cat_feminino_infantil', title: 'Feminino Infantil', description: 'Conforto para as meninas' },
   { id: 'cat_masculina', title: 'Masculino', description: 'Moda íntima masculina' },
   { id: 'cat_masculino_infantil', title: 'Masculino Infantil', description: 'Conforto para os meninos' },
-  { id: 'cat_lancamentos', title: 'Lançamentos', description: 'As novidades da semana' },
+  { id: 'cat_promocao', title: 'Promoção', description: 'Peças com preços especiais' },
   { id: 'falar_atendente', title: 'Falar com Humano', description: 'Tire suas dúvidas agora' },
 ];
 
@@ -257,6 +267,79 @@ async function sendCategoryMenu(phone, text) {
     'Ver Opções',
     CATEGORY_OPTIONS
   );
+}
+
+function buildAdminPdfHeader(phone, customerName, productGroups, totalToSend) {
+  const totalPieces = productGroups.reduce((sum, group) => sum + (group.totalPieces || 0), 0);
+  const pixTotal = totalToSend * (1 - (HANDOFF_PIX_DISCOUNT_PCT / 100));
+
+  return (
+    `📦 *NOVO PEDIDO - Agente Belux*\n` +
+    `📱 wa.me/${phone}\n` +
+    (customerName ? `👤 *Nome:* ${customerName}\n` : '') +
+    `🧾 *Itens:* ${productGroups.length} produtos | ${totalPieces} peças\n` +
+    `💰 *Total:* ${woocommerce.formatPrice(totalToSend)}\n` +
+    `💸 *PIX (${HANDOFF_PIX_DISCOUNT_PCT}%):* ${woocommerce.formatPrice(pixTotal)}\n\n` +
+    `_PDF do pedido abaixo._`
+  );
+}
+
+async function sendLegacyHandoffToAdmin(adminPhone, phone, session, summaryToSend, itemsToSend) {
+  const adminHeader =
+    `📦 *NOVO PEDIDO — Agente Belux*\n` +
+    `─────────────────\n` +
+    `📱 *Lojista:* wa.me/${phone}\n` +
+    (session.customerName ? `👤 *Nome:* ${session.customerName}\n` : '') +
+    `─────────────────\n` +
+    `${summaryToSend}\n\n` +
+    `📸 _Enviando fotos dos produtos a seguir..._`;
+
+  const groups = buildProductGroupsFromCart({ items: itemsToSend });
+
+  await zapi.sendText(adminPhone, adminHeader);
+  logger.info({ phone, adminPhone }, '[Handoff] Text summary sent to admin');
+
+  for (let i = 0; i < groups.length; i++) {
+    const g = groups[i];
+    const variationsText = g.variations.map(v => {
+      const sizeLabel = v.variant ? `${v.variant} - ${v.size}` : v.size;
+      return `${sizeLabel} x${v.quantity}`;
+    }).join(' · ');
+    const caption =
+      `📦 *Produto ${i + 1}/${groups.length}*\n` +
+      `*${g.productName}*\n` +
+      `Tamanhos: ${variationsText}\n` +
+      `Total: ${g.totalPieces} ${g.totalPieces === 1 ? 'peça' : 'peças'} — ${woocommerce.formatPrice(g.subtotal)}`;
+
+    if (g.imageUrl) {
+      try {
+        await zapi.sendImage(adminPhone, g.imageUrl, caption);
+        await zapi.delay(400);
+      } catch (err) {
+        logger.error({ err: err?.message, productId: g.productId }, '[Handoff] Falha ao enviar foto, fallback para texto');
+        await zapi.sendText(adminPhone, caption);
+      }
+    } else {
+      await zapi.sendText(adminPhone, caption + '\n⚠️ _Produto sem foto cadastrada._');
+    }
+  }
+
+  logger.info({ phone, adminPhone, groupCount: groups.length }, '[Handoff] Photos forwarded to admin');
+}
+
+async function sendLegacyHandoffToAdmins(phone, session, summaryToSend, itemsToSend) {
+  if (!ADMIN_PHONES.length) {
+    logger.warn({ phone }, '[Handoff] ADMIN_PHONES not configured — skipping admin notification');
+    return;
+  }
+
+  for (const adminPhone of ADMIN_PHONES) {
+    try {
+      await sendLegacyHandoffToAdmin(adminPhone, phone, session, summaryToSend, itemsToSend);
+    } catch (err) {
+      logger.error({ err: err?.message || String(err), adminPhone }, '[Handoff] Failed to notify admin');
+    }
+  }
 }
 
 /**
@@ -307,19 +390,49 @@ async function sendTextWithTTS(phone, text, options = {}) {
  * Se a busca falhar para uma categoria, o card é pulado silenciosamente.
  * IDs dos botões mapeados em CAT_SENTINELS — clicks já funcionam sem alteração.
  */
-async function sendCategoryShowcase(phone, session) {
-  const SHOWCASE_CATEGORIES = [
-    { slug: 'feminino',             id: 'CAT_FEMININO',          label: 'Feminino',          desc: 'Moda íntima feminina adulta' },
-    { slug: 'femininoinfantil',     id: 'CAT_FEMININOINFANTIL',  label: 'Feminino Infantil', desc: 'Conforto para as meninas' },
-    { slug: 'masculino',            id: 'CAT_MASCULINO',         label: 'Masculino',         desc: 'Moda íntima masculina adulta' },
-    { slug: 'masculinoinfantil',    id: 'CAT_MASCULINOINFANTIL', label: 'Masculino Infantil',desc: 'Conforto para os meninos' },
-    { slug: 'lancamento-da-semana', id: 'CAT_LANCAMENTOS',       label: '🆕 Lançamentos',    desc: 'As novidades da semana' },
-  ];
+const SHOWCASE_CATEGORIES = [
+  { slug: 'lancamento-da-semana', id: 'CAT_LANCAMENTOS',       label: '🆕 Lançamentos da Semana', desc: 'As novidades mais recentes' },
+  { slug: 'feminino',             id: 'CAT_FEMININO',          label: 'Feminino',                 desc: 'Moda íntima feminina adulta' },
+  { slug: 'femininoinfantil',     id: 'CAT_FEMININOINFANTIL',  label: 'Feminino Infantil',        desc: 'Conforto para as meninas' },
+  { slug: 'masculino',            id: 'CAT_MASCULINO',         label: 'Masculino',                desc: 'Moda íntima masculina adulta' },
+  { slug: 'masculinoinfantil',    id: 'CAT_MASCULINOINFANTIL', label: 'Masculino Infantil',       desc: 'Conforto para os meninos' },
+  { slug: 'promocao',             id: 'CAT_PROMOCAO',          label: '🏷️ Promoção',              desc: 'Peças com preços especiais' },
+];
 
+/**
+ * Envia UM único card de categoria (imagem + botão "Ver [categoria]").
+ * Reutiliza o visual do showcase, mas para uma categoria específica.
+ * Usado no upsell pós-checkout — melhor CTR que mandar várias fotos de produtos.
+ */
+async function sendCategoryCard(phone, slug) {
+  const cat = SHOWCASE_CATEGORIES.find(c => c.slug === slug);
+  if (!cat) {
+    logger.warn({ slug }, '[CategoryCard] slug não mapeado em SHOWCASE_CATEGORIES');
+    return;
+  }
+  try {
+    const result = await woocommerce.getProductsByCategory(cat.slug, 1, 1);
+    const imageUrl = result.products?.[0]?.imageUrl || null;
+    const buttonList = { buttons: [{ id: cat.id, label: `Ver ${cat.label}` }] };
+    if (imageUrl) buttonList.image = imageUrl;
+    await zapi.sendButtonList(phone, `*${cat.label}*\n_${cat.desc}_`, cat.label, '', buttonList);
+  } catch (err) {
+    logger.warn(
+      { slug: cat.slug, errMsg: err.message, status: err.response?.status },
+      '[CategoryCard] Falha ao enviar card de categoria',
+    );
+  }
+}
+
+async function sendCategoryShowcase(phone, session, opts = {}) {
+  const { includeImages = true } = opts;
   for (const cat of SHOWCASE_CATEGORIES) {
     try {
-      const result = await woocommerce.getProductsByCategory(cat.slug, 1, 1);
-      const imageUrl = result.products?.[0]?.imageUrl || null;
+      let imageUrl = null;
+      if (includeImages) {
+        const result = await woocommerce.getProductsByCategory(cat.slug, 1, 1);
+        imageUrl = result.products?.[0]?.imageUrl || null;
+      }
       // Não incluir o campo image se for null — Z-API rejeita payloads com null
       const buttonList = { buttons: [{ id: cat.id, label: `Ver ${cat.label}` }] };
       if (imageUrl) buttonList.image = imageUrl;
@@ -330,7 +443,7 @@ async function sendCategoryShowcase(phone, session) {
         '',
         buttonList,
       );
-      await zapi.delay(800); // 800ms entre cards — evita flood rejection da Z-API
+      await zapi.delay(500); // 500ms entre cards — sem imagem o flood é menor
     } catch (err) {
       logger.warn(
         { slug: cat.slug, errMsg: err.message, status: err.response?.status, data: err.response?.data },
@@ -1155,7 +1268,7 @@ app.post('/webhook', async (req, res) => {
     if (text === 'BTN_FECHAR_PEDIDO') {
       logger.info({ from }, '[Intercept] Botão "Fechar Pedido" — modo fotos/tamanho');
       session.supportMode = 'fechar_pedido_pending';
-      session.fecharPedidoHeaderSent = false;
+      session.fecharPedidoRelayBuffer = [];
       // Captura nome do contato do próprio webhook
       const waName = body.senderName || body.chatName || null;
       if (waName && !session.customerName) session.customerName = waName;
@@ -1319,38 +1432,56 @@ _Prefere falar com a consultora agora? É só me dizer "falar com consultora"_ �
       // Roda em paralelo ao relay para não atrasar o encaminhamento à vendedora.
       // Resultado acumulado em session.matchedProducts; mostrado no FIM DO ENVIO.
       //
-      // Padrão da cliente: foto → texto separado (tamanho/qtd).
-      // Usamos uma fila FIFO (pendingSizeTexts): texto puro → enfileira;
-      // quando o match async resolve → desenfila como caption da foto correspondente.
-      if (!session.matchedProducts)   session.matchedProducts  = [];
-      if (!session.pendingSizeTexts)  session.pendingSizeTexts  = [];
+      // Padrão da cliente: foto → texto separado (tamanho/qtd) OU foto → reply
+      // na mesma foto com texto (tamanho/qtd). Ambos devem virar caption do
+      // match correspondente. Usamos uma fila FIFO (pendingSizeTexts) para o
+      // caso 1; para o caso 2, resolvemos pelo refMsgId → matched direto.
+      if (!session.matchedProducts)    session.matchedProducts    = [];
+      if (!session.pendingSizeTexts)   session.pendingSizeTexts   = [];
 
-      const imageToMatch = imageUrl || quotedImageUrl;
-      if (imageToMatch) {
-        // Foto recebida: guarda caption inline (se veio junto) e dispara o match
+      const now = Date.now();
+      const SPLIT_GRADE_WINDOW_MS = 8000;
+      const isReplyWithText = !imageUrl && !!quotedImageUrl && !!text &&
+        text !== '[Sticker]' && text !== '[Áudio_STT]' && text !== '[Áudio]';
+
+      if (imageUrl) {
+        // Foto nova recebida: dispara match async. Caption inline tem prioridade;
+        // senão consome topo da fila FIFO de textos puros pendentes.
         const inlineCaption = caption || null;
-        imageMatcher.matchProductFromImage(imageToMatch, { minConfidence: 0.65, topK: 10 })
+        const sourceMessageId = msgId;
+        imageMatcher.matchProductFromImage(imageUrl, { minConfidence: 0.65, topK: 10 })
           .then((match) => {
             if (!match) {
               logger.info({ from }, '[FecharPedido] Nenhum match retornado (catálogo vazio?)');
               return;
             }
-            // Caption: prioridade → inline > fila FIFO de textos separados
-            const sizeCaption = inlineCaption || session.pendingSizeTexts.shift() || null;
-            // Dedup conservador: só descarta se for EXATAMENTE a mesma foto
-            // (mesmo productId + mesmo caption). Permite o cliente pedir 2 cores
-            // do mesmo modelo com captions diferentes (ex: "2m 1g" e "1g").
+            // Caption: prioridade → inline > reply pendente > fila FIFO
+            const pendingReply = session.pendingSizeTexts.findIndex(
+              (t) => t.refMsgId === sourceMessageId,
+            );
+            let sizeCaption = inlineCaption;
+            if (!sizeCaption && pendingReply !== -1) {
+              sizeCaption = session.pendingSizeTexts.splice(pendingReply, 1)[0].text;
+            }
+            if (!sizeCaption) {
+              // Fila FIFO tradicional: só itens sem refMsgId
+              const idx = session.pendingSizeTexts.findIndex((t) => !t.refMsgId);
+              if (idx !== -1) sizeCaption = session.pendingSizeTexts.splice(idx, 1)[0].text;
+            }
             const isDuplicate = session.matchedProducts.find(
               (m) => m.productId === match.productId && m.caption === sizeCaption,
             );
             if (!isDuplicate) {
               session.matchedProducts.push({
-                productId:  match.productId,
-                name:       match.name,
-                price:      match.price,
-                confidence: match.confidence,
-                uncertain:  !!match.uncertain,
-                caption:    sizeCaption,
+                productId:       match.productId,
+                name:             match.name,
+                price:            match.price,
+                imageUrl:         match.imageUrl || null,
+                confidence:       match.confidence,
+                uncertain:        !!match.uncertain,
+                caption:          sizeCaption || null,
+                _captionTs:       sizeCaption ? Date.now() : null,
+                sourceMessageId,
               });
               logger.info(
                 { from, productId: match.productId, caption: sizeCaption, uncertain: !!match.uncertain, confidence: match.confidence },
@@ -1362,44 +1493,79 @@ _Prefere falar com a consultora agora? É só me dizer "falar com consultora"_ �
           .catch((err) => {
             logger.warn({ from, err: err.message }, '[FecharPedido] Falha no image matching');
           });
-      } else if (text && text !== '[Sticker]' && text !== '[Áudio_STT]' && text !== '[Áudio]' && !audioUrl) {
-        // Texto puro (tamanho/qtd): enfileira para ser consumido pelo próximo match
-        // OU atualiza o último produto identificado se ainda não tem caption
-        const lastMatched = session.matchedProducts[session.matchedProducts.length - 1];
-        if (lastMatched && !lastMatched.caption) {
-          lastMatched.caption = text;
+      } else if (isReplyWithText) {
+        // Reply numa foto anterior com texto de grade → NÃO redispara match da
+        // foto antiga. Tenta casar com um matched já resolvido (por sourceMessageId);
+        // se o match ainda estiver pendente, enfileira com refMsgId para o .then()
+        // do match consumir quando resolver.
+        const target = session.matchedProducts.find(
+          (m) => m.sourceMessageId === refMsgId,
+        );
+        if (target) {
+          if (target.caption && target._captionTs &&
+              (now - target._captionTs) <= SPLIT_GRADE_WINDOW_MS) {
+            target.caption = `${target.caption} ${text}`;
+          } else {
+            target.caption = target.caption ? `${target.caption} ${text}` : text;
+          }
+          target._captionTs = now;
           persistSession(from);
         } else {
-          session.pendingSizeTexts.push(text);
+          session.pendingSizeTexts.push({ text, ts: now, refMsgId });
+        }
+      } else if (text && text !== '[Sticker]' && text !== '[Áudio_STT]' && text !== '[Áudio]' && !audioUrl) {
+        // Texto puro (tamanho/qtd). Três destinos possíveis, na ordem:
+        //   1. Último matched já tem caption setada há ≤ 8s → CONCATENA (cliente
+        //      mandou "Mãe 1m 3g" e logo em seguida "Filha 3m 2g" — grade única).
+        //   2. Último matched sem caption → setar caption (fluxo clássico).
+        //   3. Fila FIFO com timestamp → se último item da fila foi há ≤ 8s e
+        //      nenhuma foto chegou no meio, CONCATENA no item anterior.
+        //      Senão, empilha novo com { text, ts }.
+        const lastMatched = session.matchedProducts[session.matchedProducts.length - 1];
+
+        if (lastMatched && lastMatched.caption && lastMatched._captionTs &&
+            (now - lastMatched._captionTs) <= SPLIT_GRADE_WINDOW_MS) {
+          lastMatched.caption = `${lastMatched.caption} ${text}`;
+          lastMatched._captionTs = now;
+          persistSession(from);
+        } else if (lastMatched && !lastMatched.caption) {
+          lastMatched.caption = text;
+          lastMatched._captionTs = now;
+          persistSession(from);
+        } else {
+          const lastPending = session.pendingSizeTexts[session.pendingSizeTexts.length - 1];
+          if (lastPending && !lastPending.refMsgId && lastPending.ts &&
+              (now - lastPending.ts) <= SPLIT_GRADE_WINDOW_MS) {
+            lastPending.text = `${lastPending.text} ${text}`;
+            lastPending.ts = now;
+          } else {
+            session.pendingSizeTexts.push({ text, ts: now });
+          }
         }
       }
 
-      for (const adminPhone of ADMIN_PHONES) {
-        try {
-          if (!session.fecharPedidoHeaderSent) {
-            const headerMsg =
-              `📦 *NOVO PEDIDO CHEGANDO*\n` +
-              `📱 wa.me/${from}\n` +
-              (session.customerName ? `👤 *${session.customerName}*\n` : '') +
-              `\n_A cliente está enviando fotos e tamanhos abaixo 👇_`;
-            await zapi.sendText(adminPhone, headerMsg);
-            await zapi.delay(300);
-          }
-          if (quotedImageUrl) {
-            // Reply a uma foto: reencaminha a foto citada com o texto da cliente como legenda
-            await zapi.sendImage(adminPhone, quotedImageUrl, text || '');
-          } else if (imageUrl) {
-            await zapi.sendImage(adminPhone, imageUrl, caption || '');
-          } else if (audioUrl) {
-            await zapi.sendText(adminPhone, `🎙️ _Cliente enviou áudio (abra o chat: wa.me/${from})_`);
-          } else if (text && text !== '[Sticker]' && text !== '[Áudio_STT]' && text !== '[Áudio]') {
-            await zapi.sendText(adminPhone, text);
-          }
-        } catch (err) {
-          logger.error({ from, adminPhone, err: err.message }, '[FecharPedido] Falha ao encaminhar para vendedora');
-        }
+      // ADR-044: vendedora NÃO recebe nada em tempo real. Bufferiza cada evento
+      // (foto/texto/áudio) em ordem; replay consolidado acontece 30s após o
+      // upsell dentro de scheduleFecharPedidoHandoff.
+      //
+      // Reply com texto NUNCA duplica a foto no buffer — vira evento de texto
+      // com quote=true para a vendedora ver "↩️ <texto>" no replay, mantendo
+      // contexto visual sem repetir a imagem.
+      if (!session.fecharPedidoRelayBuffer) session.fecharPedidoRelayBuffer = [];
+      const nowTs = Date.now();
+      if (imageUrl) {
+        session.fecharPedidoRelayBuffer.push({
+          type: 'image', imageUrl, caption: caption || null, messageId, ts: nowTs,
+        });
+      } else if (isReplyWithText) {
+        session.fecharPedidoRelayBuffer.push({
+          type: 'text', text, quote: true, ts: nowTs,
+        });
+      } else if (audioUrl) {
+        session.fecharPedidoRelayBuffer.push({ type: 'audio', ts: nowTs });
+      } else if (text && text !== '[Sticker]' && text !== '[Áudio_STT]' && text !== '[Áudio]') {
+        session.fecharPedidoRelayBuffer.push({ type: 'text', text, ts: nowTs });
       }
-      session.fecharPedidoHeaderSent = true;
       scheduleFecharPedidoHandoff(from, session);
       persistSession(from);
       return;
@@ -4659,23 +4825,90 @@ async function skipCurrentProduct(phone, session) {
  * e deve permanecer — é a valid instruçao para a válvula de escape do menu
  * "Remover Item" (UX-RULE-003). Não remover.
  */
+/**
+ * Normaliza o campo size/variant para exibição em linha única.
+ * Dados vindos de grade multi-variante (ex: "Mãe e Filha") podem ter quebras
+ * de linha e formatadores markdown (`_texto_`) que sujam o resumo.
+ * Aqui colapsamos para algo escaneável: "_Mãe_ 1m · 3g · 4gg | _Filha_ 3m · 2g · 2exgg"
+ */
+function normalizeCartLabel(raw) {
+  if (!raw) return '';
+  return String(raw)
+    .replace(/\s*\n+\s*/g, ' · ')   // quebras de linha viram separadores
+    .replace(/·\s*·/g, '·')          // colapsa separadores duplos
+    .replace(/\s{2,}/g, ' ')
+    .replace(/·\s*$/g, '')
+    .trim();
+}
+
+/**
+ * Extrai a(s) referência(s) do nome do produto como chave canônica para
+ * agrupamento no resumo do cliente (atacado B2B). Captura "Ref XXX" isolado
+ * ou encadeado com " e Ref YYY" (ex: "Ref 604DTF e Ref 704DTF" vira uma
+ * chave única — SKU diferente de "Ref 604DTF" sozinha).
+ */
+function extractRefKey(name) {
+  if (!name) return null;
+  const matches = String(name).match(/Ref\s+[\w./-]+(?:\s+e\s+Ref\s+[\w./-]+)*/gi);
+  if (!matches || matches.length === 0) return null;
+  return matches.join(' ').toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Remove sufixo de variante (cor, estampa) que vem após a(s) Ref(s) no
+ * nome. Usado só no resumo do cliente: "Conjunto sem bojo - Ref 420L MARINHO"
+ * vira "Conjunto sem bojo - Ref 420L". No bloco admin mantemos o nome completo.
+ */
+function stripVariantSuffix(name) {
+  const m = String(name || '').match(/^(.*?Ref\s+[\w./-]+(?:\s+e\s+Ref\s+[\w./-]+)*)/i);
+  return m ? m[1].trim() : name;
+}
+
 function buildCartSummary(session, title = '🛒 *SEU CARRINHO*') {
+  const PIX_DISCOUNT = parseFloat(process.env.PIX_DISCOUNT_PCT || '10') / 100;
+
+  // Agrupa itens do mesmo produto (mesmo productId) para exibir uma linha por referência.
+  const productGroups = new Map();
+  for (const item of session.items) {
+    const key = String(item.productId);
+    if (!productGroups.has(key)) {
+      productGroups.set(key, {
+        productName: normalizeCartLabel(item.productName),
+        unitPrice: parseFloat(item.unitPrice) || 0,
+        totalQty: 0,
+        totalPrice: 0,
+        sizeLabels: [],
+      });
+    }
+    const g = productGroups.get(key);
+    const qty = item.quantity || 1;
+    g.totalQty += qty;
+    g.totalPrice += parseFloat(item.price) || 0;
+
+    const variant = normalizeCartLabel(item.variant);
+    const size = normalizeCartLabel(item.size);
+    const label = variant ? `${variant} ${size}` : size;
+    if (label) g.sizeLabels.push(label);
+  }
+
   let total = 0;
   let summary = `${title}\n─────────────────\n`;
+  let idx = 0;
 
-  session.items.forEach((item, idx) => {
-    const qty = item.quantity || 1;
-    const subtotal = parseFloat(item.price) * qty; // price é unitário — multiplica pela quantidade
-    total += subtotal;
-    const qtyLabel = qty > 1 ? ` x${qty}` : '';
-    const sizeLabel = item.variant ? `${item.variant} - ${item.size}` : item.size;
-    summary += `${idx + 1}. *${item.productName}* (${sizeLabel})${qtyLabel} — ${woocommerce.formatPrice(subtotal)}\n`;
-  });
+  for (const g of productGroups.values()) {
+    const pixSubtotal = g.totalPrice * (1 - PIX_DISCOUNT);
+    const pixUnit = g.totalQty > 0 ? pixSubtotal / g.totalQty : 0;
+    total += g.totalPrice;
 
-  const PIX_DISCOUNT = parseFloat(process.env.PIX_DISCOUNT_PCT || '10') / 100;
+    const sizeLabel = g.sizeLabels.join(' · ') || '-';
+    summary += `*${++idx}. ${g.productName}*\n`;
+    summary += `    ${sizeLabel}\n`;
+    summary += `    ${woocommerce.formatPrice(pixUnit)}/un × ${g.totalQty} = *${woocommerce.formatPrice(pixSubtotal)} no PIX*\n\n`;
+  }
+
   const pixTotal = total * (1 - PIX_DISCOUNT);
 
-  summary += `─────────────────\n💰 *PIX estimado: ${woocommerce.formatPrice(pixTotal)}*\n💳 Cartão: ${woocommerce.formatPrice(total)}\n\n_Para remover um item, responda: "remover 1", "remover 2", etc._`;
+  summary += `─────────────────\n💰 *Total no PIX: ${woocommerce.formatPrice(pixTotal)}*\n_Desconto de 10% já aplicado_\n\n_Para remover: "remover 1", "remover 2"..._`;
   return { summary, total };
 }
 
@@ -4684,34 +4917,6 @@ function buildCartSummary(session, title = '🛒 *SEU CARRINHO*') {
  * Cada grupo contém: productId, productName, imageUrl, variações (size+qty) e subtotal.
  * Usado por handoffToConsultant para enviar 1 foto por produto distinto.
  */
-function buildProductGroupsFromCart(session) {
-  const groups = {};
-
-  for (const item of session.items) {
-    const key = item.productId;
-    if (!groups[key]) {
-      groups[key] = {
-        productId: item.productId,
-        productName: item.productName,
-        imageUrl: item.imageUrl || null,
-        variations: [],
-        subtotal: 0,
-        totalPieces: 0,
-      };
-    }
-    groups[key].variations.push({
-      size: item.size,
-      variant: item.variant || null,
-      quantity: item.quantity,
-      unitPrice: item.unitPrice,
-    });
-    groups[key].subtotal += parseFloat(item.price || 0);
-    groups[key].totalPieces += item.quantity;
-  }
-
-  return Object.values(groups);
-}
-
 /**
  * Clears the cart, resets purchase state, and enables a new handoff.
  */
@@ -5819,56 +6024,146 @@ function scheduleFecharPedidoHandoff(phone, session) {
     const matched = session.matchedProducts || [];
     const confirmed = matched.filter((m) => !m.uncertain);
     const uncertain = matched.filter((m) => m.uncertain);
+
+    /**
+     * Extrai quantidade total de peças da caption da cliente.
+     * Padrão: números antes de letras de tamanho (ex: "2g" → 2, "3m 2g" → 5, "2p" → 2).
+     * Fallback: 1 se nenhum número for encontrado.
+     */
+    function parseQtyFromCaption(caption) {
+      if (!caption) return 1;
+      const matches = [...caption.matchAll(/\b(\d+)\s*[a-z]/gi)];
+      if (matches.length === 0) return 1;
+      return matches.reduce((sum, m) => sum + parseInt(m[1], 10), 0);
+    }
+
+    const fmt = (v) => v.toFixed(2).replace('.', ',');
+
     let cartSummaryForClient = '';
     let cartSummaryForAdmin = '';
-    if (matched.length > 0) {
-      let totalConfirmed = 0;
-      const confirmedLines = confirmed.map((m, i) => {
-        const price = parseFloat(m.price) || 0;
-        totalConfirmed += price;
-        const sizeQty = m.caption ? ` · _${m.caption}_` : '';
-        return `${i + 1}. ${m.name} — R$ ${price.toFixed(2).replace('.', ',')}${sizeQty}`;
-      });
+    let totalAdminPix = 0;
+    let orphanTexts = [];
 
-      // Cliente só vê os confirmados — evita passar info errada.
+    if (matched.length > 0) {
+      // --- Bloco CLIENTE ---
+      // Atacado B2B: agrupa por REFERÊNCIA (não por productId). Variantes de
+      // cor da mesma Ref viram uma linha só, com quantidades somadas.
+      // Produto sem Ref no nome cai no fallback por productId (linha isolada).
+      const productGroups = new Map();
+      for (const m of confirmed) {
+        const refKey = extractRefKey(m.name);
+        const key = refKey || `pid:${m.productId}`;
+        if (!productGroups.has(key)) {
+          productGroups.set(key, {
+            name: stripVariantSuffix(m.name),
+            unitPrice: parseFloat(m.price) || 0,
+            totalQty: 0,
+            captions: [],
+          });
+        }
+        const g = productGroups.get(key);
+        const currentPrice = parseFloat(m.price) || 0;
+        if (Math.abs(currentPrice - g.unitPrice) > 0.01) {
+          logger.warn(
+            { refKey: key, productId: m.productId, expected: g.unitPrice, got: currentPrice },
+            '[FecharPedido] Preços divergentes na mesma referência — revisar catálogo',
+          );
+        }
+        const qty = parseQtyFromCaption(m.caption);
+        g.totalQty += qty;
+        const normalized = normalizeCartLabel(m.caption);
+        if (normalized) g.captions.push(normalized);
+      }
+
+      let totalPix = 0;
+      const confirmedLines = [];
+      let lineIdx = 0;
+      for (const g of productGroups.values()) {
+        const pixUnit  = g.unitPrice * 0.90;
+        const pixTotal = pixUnit * g.totalQty;
+        totalPix += pixTotal;
+        const name           = normalizeCartLabel(g.name);
+        const uniqueCaptions = [...new Set(g.captions.filter(Boolean))];
+        const sizeLabel      = uniqueCaptions.join(' · ') || '-';
+        confirmedLines.push(`*${++lineIdx}. ${name}*\n    ${sizeLabel}\n    R$ ${fmt(pixUnit)}/un × ${g.totalQty} = *R$ ${fmt(pixTotal)} no PIX*`);
+      }
+
       if (confirmed.length > 0) {
         cartSummaryForClient =
-          `\n\n🛒 *Identifiquei esses produtos nas suas fotos:*\n` +
-          confirmedLines.join('\n') +
-          `\n\n💰 *Subtotal:* R$ ${totalConfirmed.toFixed(2).replace('.', ',')}` +
-          `\n\n_A consultora vai confirmar os detalhes do pedido com você._ 😊`;
+          `\n\n📦 *Resumo do que recebi:*\n` +
+          confirmedLines.join('\n\n') +
+          `\n\n─────────────────` +
+          `\n💰 *Total no PIX:* R$ ${fmt(totalPix)}` +
+          `\n_Desconto de 10% já aplicado. Valores e frete confirmados pela consultora._ 😊`;
       }
 
-      // Admin vê tudo, com os incertos destacados.
+      // Avisa que fotos incertas também foram recebidas (sem citar produto errado)
+      if (uncertain.length > 0) {
+        const extra = uncertain.length === 1
+          ? `\n_1 foto adicional será confirmada pela consultora._`
+          : `\n_${uncertain.length} fotos adicionais serão confirmadas pela consultora._`;
+        cartSummaryForClient += extra;
+      }
+
+      // --- Bloco ADMIN ---
       const adminParts = [];
+
       if (confirmed.length > 0) {
+        const confirmedAdminLines = confirmed.map((m, i) => {
+          const unitPrice = parseFloat(m.price) || 0;
+          const qty       = parseQtyFromCaption(m.caption);
+          const pixPrice  = unitPrice * qty * 0.90;
+          totalAdminPix  += pixPrice;
+          const conf      = Math.round((m.confidence || 0) * 100);
+          const sizeQty   = m.caption ? ` | _"${m.caption}"_` : '';
+          const qtyLabel  = qty > 1 ? ` ×${qty}` : '';
+          return `${i + 1}. #${m.productId} — ${m.name}${sizeQty}${qtyLabel} — R$ ${fmt(pixPrice)} PIX _(${conf}% confiança)_`;
+        });
         adminParts.push(
           `\n\n🛒 *CARRINHO IDENTIFICADO (IA):*\n` +
-          confirmed.map((m, i) => {
-            const price = parseFloat(m.price) || 0;
-            const conf = Math.round((m.confidence || 0) * 100);
-            const sizeQty = m.caption ? ` | _"${m.caption}"_` : '';
-            return `${i + 1}. #${m.productId} — ${m.name} — R$ ${price.toFixed(2).replace('.', ',')}${sizeQty} _(${conf}% confiança)_`;
-          }).join('\n') +
-          `\n💰 *Subtotal:* R$ ${totalConfirmed.toFixed(2).replace('.', ',')}`,
+          confirmedAdminLines.join('\n') +
+          `\n💰 *Total no PIX:* R$ ${fmt(totalAdminPix)}`,
         );
       }
+
       if (uncertain.length > 0) {
         adminParts.push(
           `\n\n⚠️ *FOTOS NÃO IDENTIFICADAS COM CERTEZA* (revisar manualmente):\n` +
           uncertain.map((m, i) => {
-            const price = parseFloat(m.price) || 0;
-            const conf = Math.round((m.confidence || 0) * 100);
-            const sizeQty = m.caption ? ` | _"${m.caption}"_` : '';
-            return `${i + 1}. Palpite: #${m.productId} — ${m.name} — R$ ${price.toFixed(2).replace('.', ',')}${sizeQty} _(${conf}% confiança — CONFIRMAR)_`;
+            const unitPrice = parseFloat(m.price) || 0;
+            const qty       = parseQtyFromCaption(m.caption);
+            const pixPrice  = unitPrice * qty * 0.90;
+            const conf      = Math.round((m.confidence || 0) * 100);
+            const sizeQty   = m.caption ? ` | _"${m.caption}"_` : '';
+            const qtyLabel  = qty > 1 ? ` ×${qty}` : '';
+            return `${i + 1}. Palpite: #${m.productId} — ${m.name}${sizeQty}${qtyLabel} — R$ ${fmt(pixPrice)} PIX _(${conf}% confiança — CONFIRMAR)_`;
           }).join('\n'),
         );
       }
+
+      // Textos de grade que sobraram na fila (sem foto correspondente) vão pra
+      // vendedora como órfãos — nunca descartar silenciosamente.
+      orphanTexts = (session.pendingSizeTexts || [])
+        .map((o) => (typeof o === 'string' ? o : o?.text))
+        .filter(Boolean);
+      if (orphanTexts.length > 0) {
+        adminParts.push(
+          `\n\n⚠️ *TEXTOS NÃO PAREADOS* (grades sem foto correspondente — confirmar com cliente):\n` +
+          orphanTexts.map((t) => `• "${t}"`).join('\n'),
+        );
+        logger.warn(
+          { phone, orphans: orphanTexts },
+          '[FecharPedido] Textos órfãos no handoff — revisar com cliente',
+        );
+      }
+
       cartSummaryForAdmin = adminParts.join('');
     }
 
+    // Mensagem ao cliente: acolhedora, confirma recebimento, avisa sobre próximos passos
     const confirmMsg =
-      '✅ Perfeito! Já estou separando o seu pedido com a consultora. Ela vai falar com você em instantes! 🌸' +
+      `✅ Recebi todos os seus produtos! 🎉\n` +
+      `Nossa consultora vai entrar em contato em breve para confirmar os itens, tamanhos, valor do frete e finalizar o pedido. 🌸` +
       cartSummaryForClient;
     try {
       await zapi.sendText(phone, confirmMsg);
@@ -5877,23 +6172,136 @@ function scheduleFecharPedidoHandoff(phone, session) {
       logger.error({ phone, err: err.message }, '[FecharPedido] Falha ao enviar confirmação');
     }
 
+    // Upsell pós-checkout: mostra todas as categorias (cards separados com foto + botão).
+    // Dá última chance do lojista acrescentar algo antes do handoff final.
+    try {
+      await zapi.delay(1200);
+      const vocative = session.customerName ? `, ${session.customerName}` : '';
+      const upsellPrompts = [
+        `Imagina${vocative}! Tô aqui pra te ajudar a deixar sua loja com as peças mais vendidas da região ✨ Dá uma olhadinha nos lançamentos da semana e nas outras linhas — inclusive tenho itens em promoção 💛`,
+        `Antes da consultora entrar${vocative}, deixa eu te mostrar o que tá saindo mais por aqui ✨ Lançamentos da semana, as linhas completas e a vitrine de promoção — pode ser que algum item faça sentido no seu mix 💛`,
+        `${session.customerName || 'Amiga'}, tô aqui pra te ajudar a montar sua loja com o que mais vende no atacado 💛 Dá uma passada rápida nos lançamentos, nas linhas e nos itens em promoção — vai que rola acrescentar algo.`,
+      ];
+      const upsellMsg = upsellPrompts[Math.floor(Math.random() * upsellPrompts.length)];
+      await sendTextWithTTS(phone, upsellMsg);
+      await sendCategoryShowcase(phone, session, { includeImages: false });
+      logger.info({ phone }, '[FecharPedido] Showcase de upsell enviado');
+    } catch (err) {
+      logger.warn({ phone, err: err.message }, '[FecharPedido] Falha no showcase de upsell');
+    }
+
+    // ADR-044: espera 30s após o upsell antes de mandar qualquer coisa pra vendedora.
+    // Objetivo: dar tempo do cliente acrescentar algo via catálogo/showcase se for o caso.
+    await new Promise((r) => setTimeout(r, 30_000));
+
+    // Header + replay fiel do buffer (foto + legenda exata que o cliente enviou)
+    const openingMsg =
+      `📦 *NOVO PEDIDO — Agente Belux*\n` +
+      `📱 wa.me/${phone}\n` +
+      (session.customerName ? `👤 *${session.customerName}*\n` : '') +
+      `\n_Fotos e legendas exatas do cliente abaixo 👇_`;
+
+    const buffer = session.fecharPedidoRelayBuffer || [];
+
+    for (const adminPhone of ADMIN_PHONES) {
+      try { await zapi.sendText(adminPhone, openingMsg); } catch (err) {
+        logger.error({ phone, adminPhone, err: err.message }, '[FecharPedido] Falha no opening');
+      }
+      for (const ev of buffer) {
+        try {
+          if (ev.type === 'image') {
+            await zapi.sendImage(adminPhone, ev.imageUrl, ev.caption || '');
+          } else if (ev.type === 'text') {
+            const textToSend = ev.quote ? `↩️ ${ev.text}` : ev.text;
+            await zapi.sendText(adminPhone, textToSend);
+          } else if (ev.type === 'audio') {
+            await zapi.sendText(adminPhone, `🎙️ _Cliente mandou áudio (abra o chat: wa.me/${phone})_`);
+          }
+          await zapi.delay(400);
+        } catch (err) {
+          logger.error({ phone, adminPhone, err: err.message }, '[FecharPedido] Falha no replay do buffer');
+        }
+      }
+    }
+
+    // Resumo formatado pela IA (Gemini). Fallback: formato hard-coded cartSummaryForAdmin.
+    let formattedSummary = null;
+    if (matched.length > 0) {
+      try {
+        formattedSummary = await ai.formatOrderSummaryForSeller({
+          matchedProducts: matched,
+          orphanTexts,
+          customerName: session.customerName,
+          totalPix: totalAdminPix,
+        });
+      } catch (err) {
+        logger.warn({ phone, err: err.message }, '[FecharPedido] Gemini summary falhou — usando fallback');
+      }
+    }
+    const finalSummary = formattedSummary || cartSummaryForAdmin;
+
     const closeMsg =
       `✅ *FIM DO ENVIO*\n` +
       `📱 wa.me/${phone}\n` +
       (session.customerName ? `👤 *${session.customerName}*\n` : '') +
-      `\n_A cliente está aguardando seu contato para fechar o pedido._` +
-      cartSummaryForAdmin;
+      `\n_A cliente está aguardando seu contato para fechar o pedido._\n` +
+      finalSummary;
 
     for (const adminPhone of ADMIN_PHONES) {
       try {
         await zapi.sendText(adminPhone, closeMsg);
-        logger.info({ phone, adminPhone }, '[FecharPedido] Fim do relay enviado');
+        logger.info({ phone, adminPhone, aiUsed: !!formattedSummary }, '[FecharPedido] Fim do relay enviado');
       } catch (err) {
         logger.error({ phone, adminPhone, err: err.message }, '[FecharPedido] Falha ao enviar fim do relay');
       }
     }
-    session.fecharPedidoHeaderSent = false;
+
+    // ── PDF do pedido (admin + cliente) ────────────────────────────────
+    // Gera o PDF só se houve match confirmado; incertos não entram para evitar
+    // confusão no documento formal. Falha silenciosa não bloqueia o fluxo —
+    // o resumo de texto acima já supre a vendedora com tudo que precisa.
+    if (confirmed.length > 0) {
+      let pdfBuffer = null;
+      const pdfGroups = buildProductGroupsFromMatched(confirmed);
+      const pdfTotalGross = totalAdminPix / (1 - HANDOFF_PIX_DISCOUNT_PCT / 100);
+      const pdfFileName = `pedido-belux-${String(phone).replace(/\D/g, '')}-${Date.now()}.pdf`;
+
+      try {
+        pdfBuffer = await pdfService.generateOrderPdf({
+          customerName: session.customerName,
+          phone,
+          productGroups: pdfGroups,
+          total: pdfTotalGross,
+          pixDiscountPct: HANDOFF_PIX_DISCOUNT_PCT,
+        });
+      } catch (err) {
+        logger.error(
+          { phone, err: err?.message || String(err) },
+          '[FecharPedido] Falha ao gerar PDF — pulando envio',
+        );
+      }
+
+      if (pdfBuffer) {
+        for (const adminPhone of ADMIN_PHONES) {
+          try {
+            await zapi.sendDocument(adminPhone, pdfBuffer, pdfFileName);
+            logger.info({ phone, adminPhone, fileName: pdfFileName }, '[FecharPedido] PDF enviado ao admin');
+          } catch (err) {
+            logger.error({ phone, adminPhone, fileName: pdfFileName, err: err.message, status: err?.response?.status, data: err?.response?.data }, '[FecharPedido] Falha ao enviar PDF ao admin — sendDocument');
+          }
+        }
+        try {
+          await zapi.sendDocument(phone, pdfBuffer, pdfFileName);
+          logger.info({ phone, fileName: pdfFileName }, '[FecharPedido] PDF enviado ao cliente');
+        } catch (err) {
+          logger.error({ phone, fileName: pdfFileName, err: err.message, status: err?.response?.status, data: err?.response?.data }, '[FecharPedido] Falha ao enviar PDF ao cliente — sendDocument');
+        }
+      }
+    }
+
     session.matchedProducts = [];
+    session.pendingSizeTexts = [];
+    session.fecharPedidoRelayBuffer = [];
     persistSession(phone);
   }, 90_000);
 
@@ -5953,6 +6361,8 @@ async function handoffToHuman(phone, session) {
  * confirmar de novo durante o upsell.
  */
 async function executeHandoff(phone, session) {
+  const handoffConfirmationText = 'Perfeito! 🎉 Seu pedido foi confirmado e nossa consultora vai entrar em contato em breve para finalizar tudo com você. Obrigada pela preferência! 💕';
+
   if (session.handoffDone) {
     logger.warn({ phone }, '[Handoff] executeHandoff bloqueado — handoffDone já true');
     return;
@@ -5962,68 +6372,81 @@ async function executeHandoff(phone, session) {
   const itemsToSend = session.upsellSnapshot?.items || session.items;
   const summaryToSend = session.upsellSnapshot?.summary || buildCartSummary(session, '🛒 *RESUMO DO SEU PEDIDO*').summary;
   const totalToSend   = session.upsellSnapshot?.total   || buildCartSummary(session, '🛒 *RESUMO DO SEU PEDIDO*').total;
+  const productGroups = buildProductGroupsFromCart({ items: itemsToSend });
+  const pdfFileName = `pedido-belux-${String(phone).replace(/\D/g, '')}-${Date.now()}.pdf`;
+  let pdfBuffer = null;
+
+  try {
+    pdfBuffer = await pdfService.generateOrderPdf({
+      customerName: session.customerName,
+      phone,
+      productGroups,
+      total: totalToSend,
+      pixDiscountPct: HANDOFF_PIX_DISCOUNT_PCT,
+    });
+  } catch (err) {
+    logger.error(
+      { phone, err: err?.message || String(err), stack: err?.stack },
+      '[Handoff] Falha ao gerar PDF do pedido — usando fluxo legado'
+    );
+  }
 
   // ── Confirmação ao cliente ────────────────────────────────────────────
   // Enviada sempre que executeHandoff dispara (timer 5min OU finalização durante upsell).
   // handoffToConsultant já enviou o resumo do pedido — aqui é o encerramento/agradecimento.
   try {
-    await sendTextWithTTS(
-      phone,
-      'Perfeito! 🎉 Seu pedido foi confirmado e nossa consultora vai entrar em contato em breve para finalizar tudo com você. Obrigada pela preferência! 💕'
-    );
+    await sendTextWithTTS(phone, handoffConfirmationText);
   } catch (err) {
-    logger.warn({ err: err?.message }, '[Handoff] Falha ao enviar confirmação ao cliente — continuando');
+    logger.warn({ err: err?.message }, '[Handoff] Falha ao enviar confirmação de texto ao cliente — continuando');
+  }
+
+  if (pdfBuffer) {
+    try {
+      await zapi.sendDocument(phone, pdfBuffer, pdfFileName);
+      logger.info({ phone, fileName: pdfFileName }, '[Handoff] PDF sent to customer');
+    } catch (err) {
+      logger.error(
+        { phone, fileName: pdfFileName, err: err?.message, status: err?.response?.status, data: err?.response?.data },
+        '[Handoff] Falha ao enviar PDF ao cliente — sendDocument'
+      );
+    }
   }
 
   // ── Notifica o admin ──────────────────────────────────────────────────
-  if (ADMIN_PHONES.length) {
-    const adminHeader =
-      `📦 *NOVO PEDIDO — Agente Belux*\n` +
-      `─────────────────\n` +
-      `📱 *Lojista:* wa.me/${phone}\n` +
-      (session.customerName ? `👤 *Nome:* ${session.customerName}\n` : '') +
-      `─────────────────\n` +
-      `${summaryToSend}\n\n` +
-      `📸 _Enviando fotos dos produtos a seguir..._`;
-
-    const groups = buildProductGroupsFromCart({ items: itemsToSend });
+  if (!pdfBuffer) {
+    await sendLegacyHandoffToAdmins(phone, session, summaryToSend, itemsToSend);
+  } else if (!ADMIN_PHONES.length) {
+    logger.warn({ phone }, '[Handoff] ADMIN_PHONES not configured — skipping admin notification');
+  } else {
+    const adminHeader = buildAdminPdfHeader(phone, session.customerName, productGroups, totalToSend);
 
     for (const adminPhone of ADMIN_PHONES) {
       try {
         await zapi.sendText(adminPhone, adminHeader);
-        logger.info({ phone, adminPhone }, '[Handoff] Text summary sent to admin');
-
-        for (let i = 0; i < groups.length; i++) {
-          const g = groups[i];
-          const variationsText = g.variations.map(v => {
-            const sizeLabel = v.variant ? `${v.variant} - ${v.size}` : v.size;
-            return `${sizeLabel} x${v.quantity}`;
-          }).join(' · ');
-          const caption =
-            `📦 *Produto ${i + 1}/${groups.length}*\n` +
-            `*${g.productName}*\n` +
-            `Tamanhos: ${variationsText}\n` +
-            `Total: ${g.totalPieces} ${g.totalPieces === 1 ? 'peça' : 'peças'} — ${woocommerce.formatPrice(g.subtotal)}`;
-
-          if (g.imageUrl) {
-            try {
-              await zapi.sendImage(adminPhone, g.imageUrl, caption);
-              await zapi.delay(400);
-            } catch (err) {
-              logger.error({ err: err?.message, productId: g.productId }, '[Handoff] Falha ao enviar foto, fallback para texto');
-              await zapi.sendText(adminPhone, caption);
-            }
-          } else {
-            await zapi.sendText(adminPhone, caption + '\n⚠️ _Produto sem foto cadastrada._');
-          }
-        }
-        logger.info({ phone, adminPhone, groupCount: groups.length }, '[Handoff] Photos forwarded to admin');
+        await zapi.sendDocument(adminPhone, pdfBuffer, pdfFileName);
+        logger.info({ phone, adminPhone, fileName: pdfFileName }, '[Handoff] PDF sent to admin');
       } catch (err) {
-        logger.error({ err: err?.message || String(err), adminPhone }, '[Handoff] Failed to notify admin');
+        logger.error(
+          { err: err?.message || String(err), adminPhone },
+          '[Handoff] Falha ao enviar PDF ao admin — usando fallback legado'
+        );
+
+        try {
+          await zapi.sendText(adminPhone, '⚠️ Falha ao anexar o PDF. Reenviando o pedido no formato legado.');
+        } catch (warnErr) {
+          logger.warn({ err: warnErr?.message, adminPhone }, '[Handoff] Falha ao avisar admin sobre fallback do PDF');
+        }
+
+        try {
+          await sendLegacyHandoffToAdmin(adminPhone, phone, session, summaryToSend, itemsToSend);
+        } catch (fallbackErr) {
+          logger.error(
+            { err: fallbackErr?.message || String(fallbackErr), adminPhone },
+            '[Handoff] Failed to notify admin after PDF fallback'
+          );
+        }
       }
     }
-  } else {
-    logger.warn({ phone }, '[Handoff] ADMIN_PHONES not configured — skipping admin notification');
   }
 
   // ── Persiste no Supabase ──────────────────────────────────────────────
@@ -6051,29 +6474,25 @@ async function executeHandoff(phone, session) {
 
 /**
  * Agenda o envio do pedido para o admin em 5 minutos (janela de upsell).
- * Enquanto aguarda, mostra ao cliente uma categoria que ele ainda não viu.
+ * Enquanto aguarda, reexibe o showcase de categorias (todas as 5) para o cliente
+ * dar uma última olhada e eventualmente acrescentar itens.
  * Se o cliente finalizar de novo durante o upsell → handoff imediato via interceptor.
  */
 async function scheduleUpsellAndHandoff(phone, session) {
-  const ALL_CATS = ['feminino', 'femininoinfantil', 'masculino', 'masculinoinfantil', 'lancamento-da-semana'];
-  const seen = Array.isArray(session.viewedCategories) ? session.viewedCategories : [];
-  const unseen = ALL_CATS.filter(c => !seen.includes(c));
-  const upsellSlug = unseen[0] || 'lancamento-da-semana';
-  const displayName = getCategoryDisplayName(upsellSlug);
-
+  const vocative = session.customerName ? `, ${session.customerName}` : '';
   const upsellMsgs = [
-    `Péra um segundo antes de fechar! 😄 Tenho umas peças incríveis de *${displayName}* que tô querendo muito te mostrar — às vezes a gente acha aquela pecinha que faltava no pedido 💛`,
-    `Seu pedido tá guardadinho aqui 🛒 Mas olha, preciso te mostrar o que temos em *${displayName}* antes de fechar... essa linha tá saindo muito bem! Vai que você quer acrescentar? 😉`,
-    `Amor, me dá só um minutinho! 🙏 Antes de mandar pra consultora, quero te mostrar *${displayName}* — é rapidinho e pode valer muito a pena no seu mix! 👀`,
+    `Imagina${vocative}! Tô aqui pra te ajudar a deixar sua loja com as peças mais vendidas da região ✨ Antes de fechar, dá uma olhadinha nos lançamentos da semana e nas outras linhas — inclusive tenho itens em promoção 💛`,
+    `Antes da consultora entrar${vocative}, deixa eu te mostrar o que tá saindo mais por aqui ✨ Lançamentos da semana, as linhas completas e a vitrine de promoção — pode ser que algum item faça sentido no seu mix 💛`,
+    `${session.customerName || 'Amiga'}, tô aqui pra te ajudar a montar sua loja com o que mais vende no atacado 💛 Antes de fechar, dá uma passada rápida nos lançamentos, nas linhas e nos itens em promoção — vai que rola acrescentar algo no pedido.`,
   ];
   const upsellMsg = upsellMsgs[Math.floor(Math.random() * upsellMsgs.length)];
 
   try {
     await sendTextWithTTS(phone, upsellMsg);
-    await showCategory(phone, upsellSlug, session);
+    await sendCategoryShowcase(phone, session, { includeImages: false });
     await persistSession(phone);
   } catch (err) {
-    logger.warn({ err: err?.message, phone, upsellSlug }, '[UpsellHandoff] Falha ao exibir categoria de upsell');
+    logger.warn({ err: err?.message, phone }, '[UpsellHandoff] Falha ao exibir showcase de upsell');
   }
 
   // Cancela timer anterior se houver (idempotência)

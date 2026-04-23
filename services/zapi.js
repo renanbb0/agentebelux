@@ -80,6 +80,18 @@ async function sendAudio(to, audioBuffer, mimeType = 'audio/mpeg') {
   return res;
 }
 
+async function sendDocument(to, pdfBuffer, fileName) {
+  const base64 = pdfBuffer.toString('base64');
+  const dataUri = `data:application/pdf;base64,${base64}`;
+  const res = await zapiClient.post('/send-document', {
+    phone: to,
+    document: dataUri,
+    fileName,
+  });
+  logger.info({ to, fileName, zaapId: res.data?.zaapId }, '[Z-API] sendDocument');
+  return res;
+}
+
 /**
  * Fetches full message details by ID from Z-API REST endpoint.
  * Fallback for when quotedMessage inline doesn't contain the caption.
@@ -572,4 +584,4 @@ async function sendInitialGate(phone) {
   }
 }
 
-module.exports = { readMessage, sendText, replyText, sendImage, sendAudio, getMessageById, delay, sendButtonList, sendOptionList, sendProductShowcase, sendSizeList, sendQuantityList, sendSizeQuantityList, sendMoreSizesButtons, sendSingleSizeConfirm, sendReaction, sendVariantOptionList, sendVariantButtonCard, sendInitialGate };
+module.exports = { readMessage, sendText, replyText, sendImage, sendAudio, sendDocument, getMessageById, delay, sendButtonList, sendOptionList, sendProductShowcase, sendSizeList, sendQuantityList, sendSizeQuantityList, sendMoreSizesButtons, sendSingleSizeConfirm, sendReaction, sendVariantOptionList, sendVariantButtonCard, sendInitialGate };
