@@ -56,6 +56,49 @@ test('sendDocument envia PDF em data URI para o endpoint correto com extensão n
   );
 });
 
+test('sendOptionList envia messageId quando precisa responder uma peca', async () => {
+  let capturedPath = null;
+  let capturedPayload = null;
+
+  const zapi = loadZapiWithAxiosStub(async (path, payload) => {
+    capturedPath = path;
+    capturedPayload = payload;
+    return { data: { zaapId: 'opt123' } };
+  });
+
+  await zapi.sendOptionList(
+    '5585981244025',
+    'Escolha o tamanho',
+    'Tamanho',
+    'Ver Opcoes',
+    [{ id: 'sizeqty_1_M_1_v1', title: 'M - 1 peca', description: 'Disponivel' }],
+    'CARD_MESSAGE_ID'
+  );
+
+  assert.equal(capturedPath, '/send-option-list');
+  assert.equal(capturedPayload.messageId, 'CARD_MESSAGE_ID');
+});
+
+test('sendSizeQuantityList cita o card da peca quando recebe replyToMessageId', async () => {
+  let capturedPayload = null;
+
+  const zapi = loadZapiWithAxiosStub(async (_path, payload) => {
+    capturedPayload = payload;
+    return { data: { zaapId: 'sizeqty123' } };
+  });
+
+  await zapi.sendSizeQuantityList(
+    '5585981244025',
+    { id: 7855, name: 'Pijama manga longa infantil' },
+    1,
+    [{ size: 'M', isAvailable: true, availableQuantity: 3 }],
+    'CARD_MESSAGE_ID'
+  );
+
+  assert.equal(capturedPayload.messageId, 'CARD_MESSAGE_ID');
+  assert.match(capturedPayload.message, /Pijama manga longa infantil/);
+});
+
 test('sendDocument aceita extensão customizada', async () => {
   let capturedPath = null;
   let capturedPayload = null;

@@ -160,6 +160,120 @@ test('processNextInQueue responde com citacao quando recebe replyToMessageId', a
   assert.equal(sent[0][3], 'msg-123');
 });
 
+test('handlePurchaseFlowEvent aceita nova escolha sizeqty do mesmo menu e mesmo produto', async () => {
+  const source = readSource(indexPath);
+  const functionSource = extractNamedFunction(source, 'handlePurchaseFlowEvent');
+  const parseSizeQtyEvent = instantiateFunction(extractNamedFunction(source, 'parseSizeQtyEvent'), 'parseSizeQtyEvent', {
+    parseInt,
+  });
+  const sent = [];
+  const added = [];
+  const product = { id: 620, name: 'Pijama americano Bordado', price: '60', salePrice: '', sizes: ['M', 'G', 'GG'] };
+
+  const handlePurchaseFlowEvent = instantiateFunction(functionSource, 'handlePurchaseFlowEvent', {
+    isStaleEvent: () => true,
+    parseSizeQtyEvent,
+    ensureProductStockData: async (value) => value,
+    resolveProductById: async (session, productId) => (String(productId) === String(product.id) ? product : null),
+    getLoadedProductById: () => product,
+    switchFsmFocus: () => ({ contextMessage: null }),
+    addToCart: async (phone, qty, session) => {
+      added.push({ phone, qty, productId: session.purchaseFlow.productId, size: session.purchaseFlow.selectedSize });
+      return true;
+    },
+    sendStockAwareSizeQtyList: async () => sent.push(['sendStockAwareSizeQtyList']),
+    handleQueueGuard: async () => {},
+    logger: { debug() {}, info() {}, warn() {}, error() {} },
+    zapi: {
+      sendText: async (...args) => sent.push(['sendText', ...args]),
+      replyText: async (...args) => sent.push(['replyText', ...args]),
+    },
+    persistSession: () => {},
+    Date,
+    String,
+    parseInt,
+    parseFloat,
+    isNaN,
+  });
+
+  const session = {
+    currentProduct: product,
+    purchaseFlow: {
+      state: 'awaiting_more_sizes',
+      productId: product.id,
+      productName: product.name,
+      price: 60,
+      selectedSize: null,
+      interactiveVersion: 2,
+      addedSizes: ['GG'],
+      buyQueue: [],
+    },
+    items: [{ productId: product.id, productName: product.name, size: 'GG', quantity: 1 }],
+  };
+
+  await handlePurchaseFlowEvent('5585999999999', 'sizeqty_620_M_1_v1', session);
+
+  assert.deepEqual(added, [{ phone: '5585999999999', qty: 1, productId: 620, size: 'M' }]);
+  assert.equal(sent.some((entry) => entry[0] === 'sendText' && /expirou/i.test(entry[2] || '')), false);
+});
+
+test('handlePurchaseFlowEvent aceita sizeqty antigo do produto em awaiting_size', async () => {
+  const source = readSource(indexPath);
+  const functionSource = extractNamedFunction(source, 'handlePurchaseFlowEvent');
+  const parseSizeQtyEvent = instantiateFunction(extractNamedFunction(source, 'parseSizeQtyEvent'), 'parseSizeQtyEvent', {
+    parseInt,
+  });
+  const sent = [];
+  const added = [];
+  const product = { id: 7855, name: 'Pijama manga longa infantil', price: '60', salePrice: '', sizes: ['M', 'G', 'GG'] };
+
+  const handlePurchaseFlowEvent = instantiateFunction(functionSource, 'handlePurchaseFlowEvent', {
+    isStaleEvent: () => true,
+    parseSizeQtyEvent,
+    ensureProductStockData: async (value) => value,
+    resolveProductById: async (_session, productId) => (String(productId) === String(product.id) ? product : null),
+    getLoadedProductById: () => product,
+    switchFsmFocus: () => ({ contextMessage: null }),
+    addToCart: async (_phone, qty, session) => {
+      added.push({ qty, productId: session.purchaseFlow.productId, size: session.purchaseFlow.selectedSize });
+      return true;
+    },
+    sendStockAwareSizeQtyList: async () => sent.push(['sendStockAwareSizeQtyList']),
+    handleQueueGuard: async () => {},
+    logger: { debug() {}, info() {}, warn() {}, error() {} },
+    zapi: {
+      sendText: async (...args) => sent.push(['sendText', ...args]),
+      replyText: async (...args) => sent.push(['replyText', ...args]),
+    },
+    persistSession: () => {},
+    Date,
+    String,
+    parseInt,
+    parseFloat,
+    isNaN,
+  });
+
+  const session = {
+    currentProduct: product,
+    purchaseFlow: {
+      state: 'awaiting_size',
+      productId: product.id,
+      productName: product.name,
+      price: 60,
+      selectedSize: null,
+      interactiveVersion: 2,
+      addedSizes: [],
+      buyQueue: [],
+    },
+    items: [],
+  };
+
+  await handlePurchaseFlowEvent('5585999999999', 'sizeqty_7855_G_3_v1', session);
+
+  assert.deepEqual(added, [{ qty: 3, productId: 7855, size: 'G' }]);
+  assert.equal(sent.some((entry) => entry[0] === 'sendText' && /expirou/i.test(entry[2] || '')), false);
+});
+
 test('index usa replyText nos pontos contextuais combinados pelo plano', () => {
   const source = readSource(indexPath);
 

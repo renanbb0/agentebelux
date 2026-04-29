@@ -1,6 +1,8 @@
 require('dotenv').config();
 
 const express = require('express');
+const path = require('path');
+const fs = require('fs');
 const woocommerce = require('./services/woocommerce');
 const zapi = require('./services/zapi');
 const ai       = require('./services/gemini');
@@ -15,13 +17,17 @@ const archiver = require('./services/session-archiver');
 const shadowV2 = require('./services/agent-v2/shadow-router');
 const imageMatcher = require('./services/image-matcher');
 const catalogSync  = require('./services/catalog-sync');
+const catalogQueryResolver = require('./services/catalog-query-resolver');
+const catalogSearch = require('./services/catalog-search');
 const pdfService = require('./services/pdf');
 const { buildProductGroupsFromCart, buildProductGroupsFromMatched } = require('./services/order-groups');
+const { distributeCompoundGrade } = require('./services/grade-distributor');
 
 const TTS_ENABLED = process.env.TTS_ENABLED === 'true';
 
 const app = express();
 app.use(express.json());
+app.use('/assets', express.static(path.join(__dirname, 'assets')));
 
 const http = require('http');
 const { Server } = require('socket.io');
@@ -30,6 +36,8 @@ const io = new Server(server, { cors: { origin: '*' } });
 global.visualIo = io;
 
 const PORT = process.env.PORT || 3000;
+const ORDER_GUIDE_IMAGE_PATH = '/assets/order-guide.png';
+const ORDER_GUIDE_IMAGE_FILE = path.join(__dirname, 'assets', 'order-guide.png');
 const ADMIN_PHONES = (process.env.ADMIN_PHONES || process.env.ADMIN_PHONE || '')
   .split(',').map(n => n.trim()).filter(Boolean);
 const HANDOFF_PIX_DISCOUNT_PCT = parseFloat(process.env.PIX_DISCOUNT_PCT || '10');
@@ -45,7 +53,96 @@ const MAX_HISTORY_MESSAGES = parseInt(process.env.MAX_HISTORY_MESSAGES || '80', 
 // de 20min afeta apenas o que a IA vê no prompt.
 const CONTEXT_WINDOW_MS = parseInt(process.env.CONTEXT_WINDOW_MS || String(20 * 60 * 1000), 10);
 const INACTIVITY_GREETING_MS = parseInt(process.env.INACTIVITY_GREETING_MS || String(20 * 60 * 1000), 10);
+const CATALOG_RESOLVER_ENABLED = String(process.env.CATALOG_RESOLVER_ENABLED || '').toLowerCase() !== 'false';
 // ── Grade Parser ─────────────────────────────────────────────────────────
+
+const WORD_TO_NUM_COMPOUND = {
+  um: 1, uma: 1, dois: 2, duas: 2, três: 3, tres: 3, quatro: 4, cinco: 5, seis: 6,
+};
+
+/**
+ * Detecta spec de grade composta multi-produto em texto livre, SEM exigir
+ * knownSizes (porque no caso composto múltiplos produtos podem ter grades
+ * diferentes — o solver determinístico resolve por produto depois).
+ *
+ * Padrões suportados:
+ *   - "6 de cada estampa"   → perVariant=6
+ *   - "2 de cada tamanho"   → perSize=2
+ *   - combinados: "6 de cada estampa, 2 de cada tamanho"
+ *
+ * @param {string} text
+ * @returns {{ perVariant: number|null, perSize: number|null } | null}
+ */
+function parseCompoundSpec(text) {
+  if (!text || typeof text !== 'string') return null;
+  const normalized = text.replace(/[\n\r]/g, ' ');
+
+  const perVariantRegex = /\b(\d+|um|uma|dois|duas|tr[eê]s|quatro|cinco|seis)\s+de\s+cada\s+(estampa|modelo|cor|desenho|padr[ãa]o)\b/i;
+  const perSizeRegex    = /\b(\d+|um|uma|dois|duas|tr[eê]s|quatro|cinco|seis)\s+de\s+cada\s+tamanho\b/i;
+  const perVariantSizesRegex =
+    /\b(\d+|um|uma|dois|duas|tr[eê]s|quatro|cinco|seis)\s+de\s+cada(?:\s+um)?\s+(?:(?:no|na|nos|nas)\s+)?(?:tam(?:anho)?s?|tamanhos)\s+([a-zà-ú0-9\s,;\/e]+?)(?=[.!?]|$)/i;
+
+  // Padrão "<grade> de cada estampa" — onde <grade> é uma especificação de
+  // tamanhos completa, ex: "2M de cada estampa", "1P 2M 1G de cada modelo".
+  // Captura tudo antes da frase "de cada (estampa|...)" e tenta parsear como grade.
+  const variantPhraseRegex = /\bde\s+cada\s+(estampa|modelo|cor|desenho|padr[ãa]o)s?\b/i;
+
+  const toNumber = (raw) => {
+    const key = String(raw).toLowerCase();
+    return WORD_TO_NUM_COMPOUND[key] ?? parseInt(key, 10);
+  };
+
+  const vMatch = normalized.match(perVariantRegex);
+  const sMatch = normalized.match(perSizeRegex);
+
+  const perVariant = vMatch ? toNumber(vMatch[1]) : null;
+  const perSize    = sMatch ? toNumber(sMatch[1]) : null;
+  const valid = (n) => Number.isFinite(n) && n > 0 && n <= 999;
+
+  // Tenta extrair perVariantGrade ANTES de validar — pega a grade antes de
+  // "de cada estampa". Só ativa se o perVariant simples não casou (evita
+  // conflitar com "6 de cada estampa" puro).
+  // Suporta variantes PT-BR ("2g mae de cada estampa" → {G,2,variant:'Mãe'}).
+  let perVariantGrade = null;
+  const STD_SIZES = ['PP', 'P', 'M', 'G', 'GG', 'XG', 'XGG', 'XGGG'];
+  const sizeListMatch = normalized.match(perVariantSizesRegex);
+  if (sizeListMatch) {
+    const qty = toNumber(sizeListMatch[1]);
+    const grade = parseGradeText(sizeListMatch[2], STD_SIZES);
+    if (valid(qty) && Array.isArray(grade) && grade.length > 0) {
+      perVariantGrade = grade.map(({ size }) => ({ size, qty }));
+    }
+  }
+
+  if (!vMatch) {
+    const phraseMatch = normalized.match(variantPhraseRegex);
+    if (phraseMatch && phraseMatch.index > 0) {
+      const prefix = normalized.slice(0, phraseMatch.index).trim();
+      // Primeiro tenta parse com variante (mãe/filha etc.) — parseMultiVariantGrade
+      // é hoisted e pode ser chamada aqui mesmo estando definida depois no arquivo.
+      const KNOWN_VARIANTS = ['Mãe', 'Filha', 'Adulto', 'Adulta', 'Infantil', 'Criança', 'Bebê'];
+      const multiPairs = parseMultiVariantGrade(prefix, KNOWN_VARIANTS, STD_SIZES);
+      if (Array.isArray(multiPairs) && multiPairs.length > 0) {
+        perVariantGrade = multiPairs.flatMap(({ variant, grade: g }) =>
+          g.map(({ size, qty }) => ({ size, qty, variant }))
+        );
+      } else {
+        const grade = parseGradeText(prefix, STD_SIZES);
+        if (Array.isArray(grade) && grade.length > 0) {
+          perVariantGrade = grade;
+        }
+      }
+    }
+  }
+
+  if (!valid(perVariant) && !valid(perSize) && !perVariantGrade) return null;
+
+  return {
+    perVariant: valid(perVariant) ? perVariant : null,
+    perSize:    valid(perSize)    ? perSize    : null,
+    perVariantGrade,
+  };
+}
 
 /**
  * Extracts a size+quantity grid from free text.
@@ -205,6 +302,10 @@ const buyDebounceBuffer = new Map();
 const silentAddDebounce = new Map();
 // Estrutura: phone → { timer: Timeout }
 
+/** Fila de processamento por telefone — garante serialização (evita race conditions) */
+const phoneProcessingQueue = new Map();
+// Estrutura: phone → Promise (resolve quando o processamento em curso terminar)
+
 /** Timer de upsell pós-checkout: atrasa envio para admin em 5min, mostra categoria não vista */
 const upsellHandoffTimers = new Map();
 // Estrutura: phone → { timer: Timeout }
@@ -212,6 +313,50 @@ const upsellHandoffTimers = new Map();
 /** Timer de inatividade pós "fechar pedido": 90s sem mensagem → notifica vendedora */
 const fecharPedidoInactivityTimers = new Map();
 // Estrutura: phone → Timeout
+
+/** Timer de debounce do caso composto multimodal: 3s sem mensagem → Bela confirma grade */
+const compoundConfirmationTimers = new Map();
+// Estrutura: phone → Timeout
+const COMPOUND_DEBOUNCE_MS = 3000;
+
+/** Timer de debounce do compound em modo normal (ver lançamento, catálogo): 1.5s */
+const normalCompoundTimers = new Map();
+// Estrutura: phone → Timeout
+const NORMAL_COMPOUND_DEBOUNCE_MS = 1500;
+const MAX_WAIT_FOR_FLIGHT = 30_000;
+/** Janela máxima desde a primeira foto até detecção compound em modo normal.
+ *  5 minutos — cliente B2B naturalmente navega pelo catálogo, manda fotos em
+ *  momentos distintos e só capta a legenda na última. O pool é zerado após
+ *  cada compound aceito, então não há risco de arrastar fotos de pedidos passados. */
+const NORMAL_COMPOUND_WINDOW_MS = 5 * 60 * 1000; // 5 min
+
+function markImageMatchStarted(session) {
+  if (!session) return;
+  session.pendingImageMatches = (session.pendingImageMatches || 0) + 1;
+  session.firstPhotoAt = session.firstPhotoAt || Date.now();
+}
+
+function markImageMatchFinished(session) {
+  if (!session) return;
+  session.pendingImageMatches = Math.max(0, (session.pendingImageMatches || 0) - 1);
+  if (session.pendingImageMatches === 0) {
+    session.imageMatchesCompletedAt = Date.now();
+    session.firstPhotoAt = null;
+  }
+}
+
+/**
+ * Aguarda até `timeoutMs` que session.pendingImageMatches caia para 0.
+ * Evita race condition: cliente clica "Finalizar" enquanto matchProductFromImage
+ * (até 8s) ainda não terminou — handoff veria session.items vazio.
+ */
+async function awaitPendingImageMatches(session, timeoutMs = 8000) {
+  if (!session) return;
+  const start = Date.now();
+  while ((session.pendingImageMatches || 0) > 0 && (Date.now() - start) < timeoutMs) {
+    await new Promise((r) => setTimeout(r, 100));
+  }
+}
 
 const SLUG_MAP = {
   'feminina': 'feminino',
@@ -573,6 +718,7 @@ function buildFsmContext(session) {
     const variantOptions = product?.secondaryAttributes?.find(a => a.name === pf.variantAttributeName)?.options || [];
     lines.push(`Aguardando escolha de ${pf.variantAttributeName || 'variante'}: ${variantOptions.join(', ')}`);
     lines.push(`→ O cliente precisa escolher a versão antes do tamanho. Quando escolher (ex: "Mãe", "Filha"), emita [VARIANTE:Mãe] ou [VARIANTE:Filha].`);
+    lines.push(`→ Se o cliente pediu AS DUAS variantes na mesma mensagem (ex: "M mãe e M filha", "G nas duas"), comprometa-se com a PRIMEIRA ([VARIANTE:Mãe]) — o sistema abre a próxima no turno seguinte. NÃO tente "anotar ambas" sem token, é o bug #Cíntia-2026-04-23.`);
     lines.push(`→ REGRA CRÍTICA: Nunca confirme verbalmente sem emitir token [VARIANTE:X]. Resposta sem token em awaiting_variant é um bug.`);
   }
 
@@ -615,8 +761,8 @@ function buildFsmContext(session) {
   }
 
   if (session.items?.length > 0) {
-    // Multiplica price * quantity para refletir o total real de cada linha
-    const cartTotal = session.items.reduce((acc, it) => acc + parseFloat(it.price || 0) * (it.quantity || 1), 0);
+    // item.price já é unitPrice * quantity (setado em pushCartItem) — não multiplicar novamente
+    const cartTotal = session.items.reduce((acc, it) => acc + parseFloat(it.price || 0), 0);
     const cartList = session.items.map((it, i) => {
       const sizeLabel = it.variant ? `${it.variant} - ${it.size}` : it.size;
       return `${i + 1}. ${it.productName} (${sizeLabel}) x${it.quantity}`;
@@ -1026,6 +1172,35 @@ function extractAudioUrl(event) {
 //   Delivery URL: https://<ngrok>/wc-webhook/product
 //   Secret: defina WC_WEBHOOK_SECRET no .env
 // Opcional — o cron de 1h já captura tudo sem webhook.
+function getPublicBaseUrl(req) {
+  const configured = process.env.PUBLIC_BASE_URL?.trim().replace(/\/+$/, '');
+  if (configured) return configured;
+
+  const forwardedProto = String(req.headers['x-forwarded-proto'] || req.protocol || 'http')
+    .split(',')[0]
+    .trim();
+  const forwardedHost = String(req.headers['x-forwarded-host'] || req.get?.('host') || req.headers.host || `localhost:${PORT}`)
+    .split(',')[0]
+    .trim();
+
+  return `${forwardedProto}://${forwardedHost}`;
+}
+
+function buildPublicAssetUrl(req, assetPath) {
+  const normalizedPath = String(assetPath || '').startsWith('/') ? assetPath : `/${assetPath}`;
+  return `${getPublicBaseUrl(req)}${normalizedPath}`;
+}
+
+let orderGuideImageDataUri = null;
+
+function getOrderGuideImageDataUri() {
+  if (!orderGuideImageDataUri) {
+    const imageBase64 = fs.readFileSync(ORDER_GUIDE_IMAGE_FILE).toString('base64');
+    orderGuideImageDataUri = `data:image/png;base64,${imageBase64}`;
+  }
+  return orderGuideImageDataUri;
+}
+
 app.post('/wc-webhook/product', async (req, res) => {
   res.sendStatus(200); // responde imediatamente (Woo tem timeout baixo)
 
@@ -1052,12 +1227,20 @@ app.post('/webhook', async (req, res) => {
     if (body?.type === 'DeliveryCallback' || body?.type === 'ReadCallback') return;
 
     // ── Cancela resumo silencioso agendado (ADR-035) ──────────────────────
-    // Qualquer nova interação do cliente cancela o timer de 30s.
-    // O timer é reiniciado pelo próximo add bem-sucedido se aplicável.
+    // Cancela o timer SE a nova mensagem é conteúdo não-relacionado a grade.
+    // Para mensagens com padrão grade (ex: "3M 2G", "2P", "mãe filha"), o timer
+    // é preservado — o interceptor de grade vai chamar scheduleCartSummary e
+    // reiniciá-lo, acumulando tudo no mesmo lote silencioso.
     if (from && silentAddDebounce.has(from)) {
-      clearTimeout(silentAddDebounce.get(from).timer);
-      silentAddDebounce.delete(from);
-      logger.debug({ from }, '[SilentAdd] Timer de resumo cancelado — nova interação recebida');
+      const rawIncoming = body?.image?.caption || body?.text?.message || '';
+      const isGradeLike = /\b\d{1,3}\s*(?:[a-zA-ZÀ-ÿ]{0,6}\s*)?(?:mãe|mae|filha|pp|p\b|m\b|g\b|gg\b|xg\b|eg\b|exgg\b)/i.test(rawIncoming);
+      if (!isGradeLike) {
+        clearTimeout(silentAddDebounce.get(from).timer);
+        silentAddDebounce.delete(from);
+        logger.debug({ from }, '[SilentAdd] Timer de resumo cancelado — nova interação recebida');
+      } else {
+        logger.debug({ from, rawIncoming: rawIncoming.slice(0, 60) }, '[SilentAdd] Timer preservado — grade detectada na mensagem entrante (ADR-035)');
+      }
     }
     // ────────────────────────────────────────────────────────────────────
 
@@ -1085,9 +1268,9 @@ app.post('/webhook', async (req, res) => {
     if (fsmEventId && /^(buy_|sizeqty_|size_|qty_|add_size_|skip_more_|skip_product_|confirm_add_|show_qty_|variant_v|queue_continue|queue_finalize_anyway)/.test(fsmEventId)) {
       if (messageId) zapi.readMessage(from, messageId);
 
-      // buy_ events são debounced: acumula cliques por 15s antes de processar
-      // buy_variant_ tem handler próprio em handlePurchaseFlowEvent — NÃO deve passar pelo debounce
-      if (fsmEventId.startsWith('buy_') && !fsmEventId.startsWith('buy_variant_')) {
+      // buy_ events são debounced: acumula cliques por 15s antes de processar.
+      // Inclui buy_variant_ (ex: "Mãe"), que também não deve abrir tamanho na hora.
+      if (fsmEventId.startsWith('buy_')) {
         logger.info({ from, fsmEventId }, '[BuyDebounce] buy_ interceptado para debounce');
         const session = await getSession(from);
         await addToBuyDebounce(from, fsmEventId, session);
@@ -1113,10 +1296,11 @@ app.post('/webhook', async (req, res) => {
 
     let text = extractTextFromEvent(body);
     if (!text) {
-      // Foto sem legenda no modo fechar_pedido_pending: não descarta — deixa relay encaminhar
-      const preloadedSession = sessions[from];
-      const isFecharPedidoRelay = preloadedSession?.supportMode === 'fechar_pedido_pending' && body.image?.imageUrl;
-      if (!isFecharPedidoRelay) {
+      // Foto sem legenda: deixa fluir para o ImageMatch popular session.matchedProducts
+      // e/ou setar inlineProduct, para que a próxima mensagem (grade textual) caia no
+      // produto certo. Sem isso, "2m" enviado depois cairia no focusedProduct antigo.
+      const hasImage = Boolean(body.image?.imageUrl);
+      if (!hasImage) {
         logger.warn({ from, bodyKeys: Object.keys(body), hasList: Boolean(body.listResponseMessage), hasBtn: Boolean(body.buttonsResponseMessage) }, '[Webhook] extractTextFromEvent retornou vazio — evento descartado');
         return;
       }
@@ -1139,9 +1323,297 @@ app.post('/webhook', async (req, res) => {
     logger.info({ phone: from, text }, '[MSG] Received');
     if (messageId) zapi.readMessage(from, messageId);
 
+    // ── Per-phone serialization ────────────────────────────────────────────────
+    // Serializa processamento por telefone: aguarda qualquer mensagem anterior do
+    // mesmo número terminar antes de começar. Previne race conditions quando múltiplas
+    // mensagens chegam em <1ms (ex: foto + grade + quote-reply simultâneos).
+    {
+      const _prev = phoneProcessingQueue.get(from);
+      if (_prev) await _prev;
+    }
+    let _releasePhone;
+    const _phoneTask = new Promise(r => (_releasePhone = r));
+    phoneProcessingQueue.set(from, _phoneTask);
+    try {
+    // ──────────────────────────────────────────────────────────────────────────
+
     // Carrega sessão ANTES do bloco de STT — o log de FSM ativa durante
     // transcrição precisa acessar session.purchaseFlow (ADR-026).
     const session = await getSession(from);
+
+    // ── Image-to-Product (fluxo normal) ───────────────────────────────────────
+    // Quando o cliente manda foto + caption (ex: screenshot de um card + grade textual),
+    // extractTextFromEvent descarta a imageUrl e retorna só a caption.
+    // Sem produto em foco, a IA não sabe o que foi fotografado e pede confirmação.
+    // Fix: antes de passar o texto para a IA, tenta identificar o produto pela foto.
+    //
+    // IMPORTANTE — inlineProduct é variável LOCAL, não escrita em session.currentProduct
+    // durante o await de 8s do ImageMatch. Isso previne race condition: outra mensagem
+    // simultânea pode escrever session.currentProduct enquanto esta aguarda, e a escrita
+    // prematura sobrescreveria o produto correto. O commit para session só ocorre depois
+    // que o interceptor de grade ou a IA já processou, confirmando o produto.
+    const inlineImageUrl = session.supportMode !== 'fechar_pedido_pending'
+      ? (body.image?.imageUrl || null)
+      : null;
+    let inlineProduct = null;
+    if (inlineImageUrl) {
+      markImageMatchStarted(session);
+      const applyNormalImageMatch = async (matchResult) => {
+        if (matchResult && !matchResult.uncertain) {
+          const loadedProduct = getLoadedProductById(session, matchResult.productId)
+            || (await resolveProductById(session, matchResult.productId).catch(() => null));
+          if (!loadedProduct) return null;
+
+          logger.info({
+            from,
+            productId:    loadedProduct.id,
+            productName:  loadedProduct.name,
+            confidence:   matchResult.confidence,
+          }, '[ImageMatch] Produto identificado pela foto — inlineProduct setado localmente');
+
+          // Acumula em session.matchedProducts para suporte a compound em modo
+          // normal. Dedup por productId — duas fotos da mesma estampa não viram
+          // 2 entradas. Marcamos compoundOrigin='normal' para distinguir do
+          // fluxo fechar_pedido_pending (que também usa matchedProducts).
+          if (session.supportMode !== 'fechar_pedido_pending') {
+            if (!Array.isArray(session.matchedProducts)) session.matchedProducts = [];
+            const dup = session.matchedProducts.find((m) => m.productId === loadedProduct.id);
+            if (!dup) {
+              session.matchedProducts.push({
+                productId:      loadedProduct.id,
+                name:           loadedProduct.name,
+                price:          loadedProduct.salePrice || loadedProduct.price,
+                imageUrl:       loadedProduct.imageUrl || null,
+                clientImageUrl: inlineImageUrl,
+                sizes:          Array.isArray(loadedProduct.sizes) ? loadedProduct.sizes : null,
+                attrOptions:    loadedProduct.secondaryAttributes?.[0]?.options || null,
+                confidence:     matchResult.confidence,
+                caption:        text || null,
+                _captionTs:     text ? Date.now() : null,
+                compoundOrigin: 'normal',
+                firstSeenAt:    Date.now(),
+              });
+              persistSession(from);
+              const detectedAfterMatch = detectCompoundCase(session);
+              if (detectedAfterMatch) {
+                logger.info(
+                  { from, spec: detectedAfterMatch.spec, matchedCount: session.matchedProducts.length },
+                  '[Compound] Caso composto detectado após ImageMatch — agendando confirmação'
+                );
+                scheduleNormalCompoundCheck(from, session);
+              }
+            }
+          }
+
+          return loadedProduct;
+        }
+
+        if (matchResult) {
+          logger.info({
+            from,
+            productId:  matchResult.productId,
+            confidence: matchResult.confidence,
+          }, '[ImageMatch] Foto identificada com incerteza — não setando inlineProduct');
+        } else {
+          logger.info({ from }, '[ImageMatch] Foto não reconhecida — seguindo sem produto em foco');
+        }
+        return null;
+      };
+
+      const matchPromise = imageMatcher
+        .matchProductFromImage(inlineImageUrl, { minConfidence: 0.65, topK: 5 })
+        .then(applyNormalImageMatch)
+        .catch((err) => {
+          logger.warn({ from, err: err?.message }, '[ImageMatch] Falha no matching — continuando sem produto');
+          return null;
+        })
+        .finally(() => markImageMatchFinished(session));
+      inlineProduct = await Promise.race([
+        matchPromise,
+        new Promise(resolve => setTimeout(() => resolve(null), 8000)),
+      ]);
+    }
+    // ── fim Image-to-Product ──────────────────────────────────────────────────
+
+    // ── Compound em modo normal (ver lançamento, catálogo) ───────────────────
+    // Se há 2+ produtos identificados via foto recentemente (dentro de 8s) e
+    // o texto atual carrega "N de cada estampa / M de cada tamanho", desvia
+    // para o fluxo composto da Bela. Caso contrário, segue o fluxo legacy
+    // inlineProduct (parseGradeText simples).
+    if (session.supportMode !== 'fechar_pedido_pending') {
+      const matchedAll = Array.isArray(session.matchedProducts) ? session.matchedProducts : [];
+      const now = Date.now();
+      // Limpa entradas antigas (fora da janela)
+      const fresh = matchedAll.filter(
+        (m) => m.compoundOrigin === 'normal' &&
+               m.firstSeenAt && (now - m.firstSeenAt) <= NORMAL_COMPOUND_WINDOW_MS
+      );
+      // Se há entradas antigas sobrando, descarta-as do buffer (preserva freshs)
+      if (fresh.length !== matchedAll.length) {
+        const others = matchedAll.filter((m) => m.compoundOrigin !== 'normal' || fresh.includes(m));
+        session.matchedProducts = others;
+      }
+
+      if (fresh.length >= 2) {
+        const currentSpec = text ? parseCompoundSpec(text) : null;
+        const detected = currentSpec ? { spec: currentSpec, sourceText: text } : detectCompoundCase(session);
+        if (detected) {
+          // Garante que o text atual entra no pool pra detectCompoundCase
+          if (currentSpec && text) {
+            if (!Array.isArray(session.pendingSizeTexts)) session.pendingSizeTexts = [];
+            const already = session.pendingSizeTexts.some((t) => t.text === text);
+            if (!already) session.pendingSizeTexts.push({ text, ts: now });
+          }
+          logger.info(
+            { from, freshCount: fresh.length, spec: detected.spec },
+            '[Compound] Caso composto detectado em modo normal — agendando confirmação'
+          );
+          scheduleNormalCompoundCheck(from, session);
+          persistSession(from);
+          return;
+        }
+      }
+    }
+    // ── fim Compound modo normal ──────────────────────────────────────────────
+
+    // ── Grade via foto (inlineProduct) ────────────────────────────────────────
+    // Quando o ImageMatch identificou o produto da foto E o caption é uma grade,
+    // processa deterministicamente sem depender do estado FSM (que pode estar sujo
+    // por race condition quando múltiplas mensagens chegam simultaneamente).
+    // Suporta produtos com variante (mãe+filha) via parseMultiVariantGrade.
+    if (inlineProduct && text) {
+      const pfInline = session.purchaseFlow;
+      const isFsmOnDifferentProduct = pfInline?.state !== 'idle' && String(pfInline?.productId) !== String(inlineProduct.id);
+
+      // Enriquece produto com dados de estoque antes de parsear a grade
+      const enrichedInline = await ensureProductStockData(inlineProduct);
+      const secAttrInline   = enrichedInline?.secondaryAttributes?.[0];
+      const rawSizesInline  = (enrichedInline?.sizes || []).filter(Boolean);
+      const sizesForGrade   = rawSizesInline.length > 0
+        ? buildSessionSizeDetails(session, enrichedInline).map(d => d.size)
+        : ['ÚNICO'];
+
+      let gradeInterceptedByPhoto = false;
+
+      // ── Multi-variante (ex: "3M mãe 2G filha") ──────────────────────────
+      if (secAttrInline?.options?.length > 1) {
+        const multiPairsInline = parseMultiVariantGrade(text, secAttrInline.options, sizesForGrade);
+        if (multiPairsInline?.length > 0) {
+          // Se FSM está em outro produto, enfileira o atual antes de trocar foco
+          if (isFsmOnDifferentProduct) {
+            const { contextMessage: switchMsg } = switchFsmFocus(session, enrichedInline);
+            if (switchMsg) {
+              appendHistory(session, 'assistant', switchMsg);
+              conversationMemory.refreshConversationMemory(session, { assistantText: switchMsg });
+            }
+          }
+
+          appendHistory(session, 'user', text);
+          conversationMemory.refreshConversationMemory(session, { userText: text });
+          const pf2 = session.purchaseFlow;
+          const unitPrice2 = parseFloat(enrichedInline.salePrice || enrichedInline.price) || 0;
+          pf2.productId   = enrichedInline.id;
+          pf2.productName = enrichedInline.name;
+          pf2.unitPrice   = unitPrice2;
+
+          const addedMV = [], outOfStockMV = [], outOfStockCtx = [];
+          for (const { variant, grade: varGrade } of multiPairsInline) {
+            pf2.selectedVariant = variant;
+            const enrichedV = await ensureProductStockData(enrichedInline, getVariantFilter(session));
+            const availSizesV = getAvailableSizesForSession(session, enrichedV || enrichedInline);
+            for (const { size, qty } of varGrade) {
+              const matched = availSizesV.find(s => normalizeSizeValue(s) === normalizeSizeValue(size));
+              if (matched) {
+                pushCartItem(session, pf2.productId, pf2.productName, matched, qty, unitPrice2, enrichedInline.imageUrl || null, variant);
+                addedMV.push(`${variant} ${matched} x${qty}`);
+              } else {
+                outOfStockMV.push(`${variant} ${size}`);
+                outOfStockCtx.push({ variant, size, qty });
+              }
+            }
+          }
+          logger.info({ from, product: enrichedInline.name, added: addedMV, outOfStock: outOfStockMV }, '[Grade] Multi-variante via foto (inlineProduct)');
+          if (messageId && addedMV.length > 0) zapi.sendReaction(from, messageId, '✅').catch(() => {});
+          pf2.state = 'awaiting_more_sizes';
+          pf2.lastCommitSource = 'text';
+          session.currentProduct = enrichedInline;
+          if (outOfStockMV.length > 0) {
+            pf2._pendingOosFallback = { outOfStock: outOfStockCtx, productId: enrichedInline.id };
+            const oosReply = await zapi.replyText(from, `⚠️ Sem estoque: ${outOfStockMV.join(', ')}`, messageId);
+            const oosZaapId = oosReply?.data?.zaapId;
+            if (oosZaapId) registerMessageProduct(session, oosZaapId, null, enrichedInline);
+          }
+          session.consecutiveFailures = 0; // sucesso determinístico via foto+grade
+          scheduleCartSummary(from);
+          persistSession(from);
+          return;
+        }
+      }
+
+      // ── Grade simples (ex: "2P", "3M 1G") ───────────────────────────────
+      if (!gradeInterceptedByPhoto) {
+        const gradeInline = parseGradeText(text, sizesForGrade);
+        if (gradeInline?.length > 0) {
+          // Se FSM está em outro produto, enfileira o atual antes de trocar foco
+          if (isFsmOnDifferentProduct) {
+            const { contextMessage: switchMsg } = switchFsmFocus(session, enrichedInline);
+            if (switchMsg) {
+              appendHistory(session, 'assistant', switchMsg);
+              conversationMemory.refreshConversationMemory(session, { assistantText: switchMsg });
+            }
+          }
+
+          appendHistory(session, 'user', text);
+          conversationMemory.refreshConversationMemory(session, { userText: text });
+          const pf3 = session.purchaseFlow;
+          const unitPrice3 = parseFloat(enrichedInline.salePrice || enrichedInline.price) || 0;
+          pf3.productId   = enrichedInline.id;
+          pf3.productName = enrichedInline.name;
+          pf3.unitPrice   = unitPrice3;
+
+          const addable3 = [], unavailable3 = [];
+          for (const { size, qty } of gradeInline) {
+            const matched = sizesForGrade.find(s => normalizeSizeValue(s) === normalizeSizeValue(size));
+            if (!matched) continue;
+            const avail = getSizeAvailability(session, enrichedInline, matched);
+            if (avail?.isAvailable === false) {
+              unavailable3.push({ size: matched, qty, available: avail.availableQuantity || 0 });
+            } else {
+              addable3.push({ size: matched, qty });
+            }
+          }
+
+          if (addable3.length > 0 || unavailable3.length > 0) {
+            const added3 = [];
+            for (const { size, qty } of addable3) {
+              pushCartItem(session, enrichedInline.id, enrichedInline.name, size, qty, unitPrice3, enrichedInline.imageUrl || null, null);
+              added3.push({ size, qty });
+            }
+            logger.info({ from, product: enrichedInline.name, added: added3, unavailable: unavailable3 }, '[Grade] Grade simples via foto (inlineProduct)');
+            if (messageId && added3.length > 0) zapi.sendReaction(from, messageId, '✅').catch(() => {});
+            pf3.state = added3.length > 0 ? 'awaiting_more_sizes' : 'awaiting_size';
+            pf3.lastCommitSource = 'text';
+            session.currentProduct = enrichedInline;
+            if (unavailable3.length > 0) {
+              const lines = unavailable3.map(({ size, available }) =>
+                available > 0 ? `• ${size}: só tem ${available} disponível` : `• ${size}: indisponível no momento`
+              ).join('\n');
+              await zapi.replyText(from, `⚠️ Não consegui incluir:\n${lines}`, messageId);
+            }
+            session.consecutiveFailures = 0; // sucesso determinístico via foto+grade
+            scheduleCartSummary(from);
+            persistSession(from);
+            return;
+          }
+        }
+      }
+
+      // Foto identificada mas caption NÃO é grade → commit inlineProduct para que
+      // a IA tenha o produto correto no contexto (ex: "qual o preço desse?")
+      session.currentProduct = enrichedInline;
+      logger.info({ from, productId: enrichedInline.id }, '[ImageMatch] Commit de inlineProduct para session (caption não é grade)');
+    }
+    // ── fim Grade via foto ────────────────────────────────────────────────────
 
     if (/^\[.*udio_STT\]$/i.test(text)) {
       const audioUrl = extractAudioUrl(body);
@@ -1198,7 +1670,7 @@ app.post('/webhook', async (req, res) => {
             await zapi.sendInitialGate(from);
           } catch (err) {
             logger.error({ from, err: err.message }, '[Gate] sendInitialGate falhou — enviando texto simples');
-            await zapi.sendText(from, 'Olá! Sou a *Bela*, consultora da *Belux Moda Íntima* 👋\n\nO que você prefere?\n\n📦 *Fechar meu pedido*\n🆕 *Ver lançamentos*\n❓ *Resolver um problema*');
+            await zapi.sendText(from, 'Olá! Sou a *Bela*, consultora da *Belux Moda Íntima* 👋\n\nO que você prefere?\n\n📦 *Fechar meu pedido*\n🆕 *Ver lançamentos*\n❓ *Dúvidas*');
           }
           persistSession(from);
           return;
@@ -1269,12 +1741,23 @@ app.post('/webhook', async (req, res) => {
       logger.info({ from }, '[Intercept] Botão "Fechar Pedido" — modo fotos/tamanho');
       session.supportMode = 'fechar_pedido_pending';
       session.fecharPedidoRelayBuffer = [];
+      session.fecharPedidoEmptyPromptSentAt = null;
       // Captura nome do contato do próprio webhook
       const waName = body.senderName || body.chatName || null;
       if (waName && !session.customerName) session.customerName = waName;
       const pedidoMsg = 'Ótimo! 📦 Me envie as *fotos* dos produtos que deseja, e para cada uma me diga o *tamanho* e a *quantidade*. Pode mandar tudo em sequência! 😊\n\n_Quando terminar de enviar, é só parar de digitar — vou chamar a consultora automaticamente._';
-      appendHistory(session, 'assistant', pedidoMsg);
-      conversationMemory.refreshConversationMemory(session, { assistantText: pedidoMsg });
+      const orderGuideCaption = 'Guia rapidinho: peça assim — produto + tamanho + quantidade 💕';
+      try {
+        const orderGuideImage = getOrderGuideImageDataUri();
+        await zapi.sendImage(from, orderGuideImage, orderGuideCaption);
+        await zapi.delay(300);
+      } catch (err) {
+        logger.warn({ from, err: err?.message }, '[FecharPedido] Falha ao enviar guia educativo');
+      }
+
+      const assistantGuideText = `${orderGuideCaption}\n${pedidoMsg}`;
+      appendHistory(session, 'assistant', assistantGuideText);
+      conversationMemory.refreshConversationMemory(session, { assistantText: assistantGuideText });
       await zapi.sendText(from, pedidoMsg);
       scheduleFecharPedidoHandoff(from, session);
       persistSession(from);
@@ -1351,6 +1834,20 @@ _Prefere falar com a consultora agora? É só me dizer "falar com consultora"_ �
       return;
     }
 
+    // Interceptor global: "deu quanto?" / "qual o total?" / "ver carrinho" — determinístico.
+    // Sem isso, perguntas simples sobre total caem na IA, que pode falhar e
+    // disparar auto-escalação (consecutiveFailures >= 2 → handoffToHuman).
+    // wantsCart já tem regex pra "deu quanto", "quanto ficou/tá/é/foi", etc.
+    if (semanticQuick.wantsCart && !semanticQuick.wantsCheckout && session.items?.length > 0) {
+      logger.info({ from, text: text.slice(0, 80), cartItems: session.items.length }, '[Intercept] Pergunta sobre carrinho/total via semântica');
+      appendHistory(session, 'user', text);
+      conversationMemory.refreshConversationMemory(session, { userText: text });
+      session.consecutiveFailures = 0; // sucesso determinístico — reseta ruído
+      await showCart(from, session);
+      persistSession(from);
+      return;
+    }
+
     // Interceptor global: "Finalizar pedido" por TEXTO — não depende da IA.
     // Sem isso, se Gemini crashar durante checkout o cliente fica preso no loop
     // "Poxa, tive um pequeno problema aqui" sem nunca disparar o handoff.
@@ -1389,6 +1886,111 @@ _Prefere falar com a consultora agora? É só me dizer "falar com consultora"_ �
       if (isShoppingResumeIntent(semanticQuick)) {
         logger.info({ from }, '[SupportMode] Cliente retomou interesse de compra — saindo de human_pending');
         clearSupportMode(session, 'shopping_resumed');
+      }
+    }
+
+    // ── Interceptor: confirmação de grade composta ─────────────────────────
+    // Quando a Bela mandou "Fechou? Só falar sim" com [awaitingCompoundConfirmation],
+    // a resposta textual do cliente é processada DETERMINISTICAMENTE — sem IA —
+    // para executar o pushCartItem em lote. Evita a IA reinterpretar "sim" como
+    // algo diferente e perder o plano que já foi mostrado ao cliente.
+    if (session.awaitingCompoundConfirmation) {
+      const ttlExpired = !session.compoundConfirmationExpiresAt ||
+                         Date.now() > session.compoundConfirmationExpiresAt;
+      if (ttlExpired) {
+        logger.info({ from }, '[Compound] TTL de confirmação expirado — limpando estado');
+        clearCompoundState(session);
+      } else {
+        const reply = classifyCompoundReply(text);
+        logger.info({ from, reply, text: text.slice(0, 60) }, '[Compound] Classificando resposta do cliente');
+
+        if (reply === 'accept') {
+          const plan = session.pendingCompoundGrade;
+          const matched = session.matchedProducts || [];
+
+          if (!plan || !Array.isArray(plan.items) || plan.items.length === 0) {
+            logger.warn({ from }, '[Compound] accept sem plano salvo — fallback handoff');
+            clearCompoundState(session);
+            await handoffToConsultant(from, session).catch(() => {});
+            persistSession(from);
+            return;
+          }
+
+          // Garante que purchaseFlow existe — pushCartItem depende de addedSizes
+          if (!session.purchaseFlow) {
+            session.purchaseFlow = { state: 'idle', addedSizes: [], buyQueue: [] };
+          } else if (!Array.isArray(session.purchaseFlow.addedSizes)) {
+            session.purchaseFlow.addedSizes = [];
+          }
+          if (!Array.isArray(session.items)) session.items = [];
+
+          let pushedItems = 0;
+          let pushedPieces = 0;
+          for (const item of plan.items) {
+            const matchMeta = matched.find(m => m.productId === item.productId);
+            const unitPrice = parseFloat(matchMeta?.price) || 0;
+            const imageUrl = matchMeta?.imageUrl || null;
+            for (const { size, qty, variant } of item.grade) {
+              if (!size || !qty || qty < 1) continue;
+              pushCartItem(session, item.productId, item.name, size, qty, unitPrice, imageUrl, variant || null);
+              pushedItems += 1;
+              pushedPieces += qty;
+            }
+          }
+
+          // Limpa buffers do modo fechar_pedido (ADR-044) e estado composto
+          session.matchedProducts = [];
+          session.pendingSizeTexts = [];
+          session.fecharPedidoRelayBuffer = [];
+          if (session.supportMode === 'fechar_pedido_pending') {
+            const existingHandoff = fecharPedidoInactivityTimers.get(from);
+            if (existingHandoff) {
+              clearTimeout(existingHandoff);
+              fecharPedidoInactivityTimers.delete(from);
+            }
+            session.supportMode = null;
+          }
+          clearCompoundState(session);
+
+          // Em modo normal, garante que FSM está em awaiting_more_sizes para
+          // scheduleCartSummary disparar corretamente. switchFsmFocus pode ter
+          // deixado a FSM em awaiting_variant (mãe e filha) que é ignorado pelo timer.
+          if (session.supportMode !== 'fechar_pedido_pending' && session.purchaseFlow) {
+            const pfC = session.purchaseFlow;
+            if (pfC.state !== 'awaiting_size' && pfC.state !== 'awaiting_more_sizes') {
+              pfC.state = 'awaiting_more_sizes';
+            }
+            pfC.selectedVariant = null;
+            pfC.selectedSize = null;
+          }
+
+          logger.info(
+            { from, pushedItems, pushedPieces, cartLineItems: session.items.length },
+            '[Compound] Grade confirmada — itens adicionados ao carrinho'
+          );
+
+          appendHistory(session, 'user', text);
+          const ack = `Fechou ✅ Adicionei ${pushedPieces} peças no carrinho (${pushedItems} linhas).\n\nJá mando o resumo em instantes pra você conferir 😊`;
+          appendHistory(session, 'assistant', ack);
+          await zapi.sendText(from, ack);
+          session.consecutiveFailures = 0; // sucesso determinístico via compound
+          scheduleCartSummary(from);
+          persistSession(from);
+          return;
+        }
+
+        if (reply === 'reject' || reply === 'correct') {
+          logger.info({ from, reply }, '[Compound] Cliente rejeitou ou corrigiu — limpando estado composto');
+          clearCompoundState(session);
+          // Limpa buffer compound do modo normal pra não re-disparar na próxima
+          // mensagem. Em fechar_pedido_pending, matchedProducts é input pra
+          // vendedora, então preserva.
+          if (Array.isArray(session.matchedProducts) && session.supportMode !== 'fechar_pedido_pending') {
+            session.matchedProducts = session.matchedProducts.filter((m) => m.compoundOrigin !== 'normal');
+          }
+          // Não faz return — deixa o fluxo normal (IA ou fechar_pedido) re-parsear a mensagem
+        }
+        // Se 'unclear': também deixa cair no fluxo normal para IA responder naturalmente
       }
     }
 
@@ -1449,6 +2051,7 @@ _Prefere falar com a consultora agora? É só me dizer "falar com consultora"_ �
         // senão consome topo da fila FIFO de textos puros pendentes.
         const inlineCaption = caption || null;
         const sourceMessageId = msgId;
+        markImageMatchStarted(session);
         imageMatcher.matchProductFromImage(imageUrl, { minConfidence: 0.65, topK: 10 })
           .then((match) => {
             if (!match) {
@@ -1477,6 +2080,8 @@ _Prefere falar com a consultora agora? É só me dizer "falar com consultora"_ �
                 name:             match.name,
                 price:            match.price,
                 imageUrl:         match.imageUrl || null,
+                clientImageUrl:   imageUrl, // foto original enviada pelo cliente (para replay multimodal na Bela)
+                sizes:            Array.isArray(match.sizes) ? match.sizes : null,
                 confidence:       match.confidence,
                 uncertain:        !!match.uncertain,
                 caption:          sizeCaption || null,
@@ -1488,10 +2093,27 @@ _Prefere falar com a consultora agora? É só me dizer "falar com consultora"_ �
                 match.uncertain ? '[FecharPedido] Produto identificado como INCERTO (revisar)' : '[FecharPedido] Produto identificado',
               );
               persistSession(from);
+              const detectedAfterMatch = detectCompoundCase(session);
+              if (detectedAfterMatch) {
+                const existingHandoff = fecharPedidoInactivityTimers.get(from);
+                if (existingHandoff) {
+                  clearTimeout(existingHandoff);
+                  fecharPedidoInactivityTimers.delete(from);
+                }
+                logger.info(
+                  { from, spec: detectedAfterMatch.spec, matchedCount: session.matchedProducts.length },
+                  '[Compound] Caso composto detectado após ImageMatch — desviando para Bela'
+                );
+                schedulePendingCompoundConfirmation(from, session);
+              }
             }
           })
           .catch((err) => {
             logger.warn({ from, err: err.message }, '[FecharPedido] Falha no image matching');
+          })
+          .finally(() => {
+            markImageMatchFinished(session);
+            persistSession(from);
           });
       } else if (isReplyWithText) {
         // Reply numa foto anterior com texto de grade → NÃO redispara match da
@@ -1566,6 +2188,29 @@ _Prefere falar com a consultora agora? É só me dizer "falar com consultora"_ �
       } else if (text && text !== '[Sticker]' && text !== '[Áudio_STT]' && text !== '[Áudio]') {
         session.fecharPedidoRelayBuffer.push({ type: 'text', text, ts: nowTs });
       }
+
+      // ── Compound detection ───────────────────────────────────────────────
+      // Antes de agendar handoff humano, verifica se o caso é composto:
+      // 2+ fotos + texto "N de cada estampa / M de cada tamanho". Se for,
+      // desvia para confirmação da Bela (schedulePendingCompoundConfirmation)
+      // em vez do replay consolidado à vendedora.
+      const compoundDetected = detectCompoundCase(session);
+      if (compoundDetected) {
+        // Cancela handoff de 90s — será retomado via fallback se a Bela falhar
+        const existingHandoff = fecharPedidoInactivityTimers.get(from);
+        if (existingHandoff) {
+          clearTimeout(existingHandoff);
+          fecharPedidoInactivityTimers.delete(from);
+        }
+        logger.info(
+          { from, spec: compoundDetected.spec, matchedCount: session.matchedProducts.length },
+          '[Compound] Caso composto detectado no fluxo fechar_pedido — desviando para Bela'
+        );
+        schedulePendingCompoundConfirmation(from, session);
+        persistSession(from);
+        return;
+      }
+
       scheduleFecharPedidoHandoff(from, session);
       persistSession(from);
       return;
@@ -2046,6 +2691,37 @@ _Prefere falar com a consultora agora? É só me dizer "falar com consultora"_ �
 
         if (grade && (grade.length > 0 || orphanSizes.length > 0)) {
           logger.info({ from, grade, orphanSizes, product: pfGrade.productName }, '[Grade] Grade semântica detectada');
+
+          // Intercepta fallback de OOS multi-variante: "pode ser gg entao" após "Sem estoque: Filha G"
+          // Usa o contexto armazenado (_pendingOosFallback) para restaurar variante + quantidade originais.
+          const fallback = pfGrade._pendingOosFallback;
+          if (fallback && String(fallback.productId) === String(focusedProduct.id) && grade.length > 0 && orphanSizes.length === 0) {
+            delete pfGrade._pendingOosFallback;
+            const unitPriceFb = parseFloat(focusedProduct.salePrice || focusedProduct.price);
+            const addedFb = [];
+            for (const oosEntry of fallback.outOfStock) {
+              for (const { size } of grade) {
+                const matchedSize = allSizes.find(s => s.toUpperCase() === size.toUpperCase());
+                if (!matchedSize) continue;
+                const avail = getSizeAvailability(session, focusedProduct, matchedSize);
+                if (avail?.isAvailable === false) continue;
+                pushCartItem(session, focusedProduct.id, focusedProduct.name, matchedSize, oosEntry.qty, unitPriceFb, focusedProduct.imageUrl || null, oosEntry.variant);
+                addedFb.push(`${oosEntry.variant} ${matchedSize} x${oosEntry.qty}`);
+              }
+            }
+            logger.info({ from, product: pfGrade.productName, addedFb }, '[Grade] OOS fallback multi-variante aplicado');
+            appendHistory(session, 'user', text);
+            conversationMemory.refreshConversationMemory(session, { userText: text });
+            if (messageId) zapi.sendReaction(from, messageId, '✅').catch(() => {});
+            pfGrade.state = 'awaiting_more_sizes';
+            pfGrade.lastCommitSource = 'text';
+            pfGrade.selectedVariant = null;
+            session.currentProduct = focusedProduct;
+            scheduleCartSummary(from);
+            persistSession(from);
+            return;
+          }
+
           appendHistory(session, 'user', text);
           conversationMemory.refreshConversationMemory(session, { userText: text });
 
@@ -2198,6 +2874,11 @@ _Prefere falar com a consultora agora? É só me dizer "falar com consultora"_ �
     // Intercepta textos ambíguos/curtos durante a FSM ativa (ex: "Ok", "sim")
     // para re-enviar o menu pendente. Textos com intenção real (comandos de
     // carrinho, cancelamento, navegação) passam direto para a IA.
+    if (await tryHandleCommercialCatalogQuery(from, text, session, semanticQuick)) {
+      persistSession(from);
+      return;
+    }
+
     const pfCheck = session.purchaseFlow;
 
     // Comandos que sempre escapam o interceptor — a IA deve tratá-los
@@ -2880,21 +3561,9 @@ Então me diz: o que você prefere agora? Fechar um pedido que já sabe o que qu
         }
       }
       try {
-        await zapi.sendButtonList(
-          from,
-          'Escolha uma opção:',
-          'Belux Moda Íntima',
-          '',
-          {
-            buttons: [
-              { id: 'btn_fechar_pedido', label: '📦 Fechar meu pedido' },
-              { id: 'btn_lancamentos',   label: '🆕 Ver lançamentos' },
-              { id: 'btn_problema',      label: '❓ Resolver um problema' },
-            ],
-          }
-        );
+        await showAllCategory(from, 'lancamento-da-semana', session);
       } catch (err) {
-        logger.warn({ from, err: err.message }, '[FirstContact] Falha ao enviar botões de boas-vindas');
+        logger.warn({ from, err: err.message }, '[FirstContact] Falha ao listar lançamentos pós-welcome');
       }
       persistSession(from);
       return;
@@ -3011,6 +3680,34 @@ Então me diz: o que você prefere agora? Fechar um pedido que já sabe o que qu
       }
     }
     // ── fim Reflection Call ───────────────────────────────────────────────────
+
+    // ── GUARD ANTI-ALUCINAÇÃO DE COMMIT (Bug #Cíntia-2026-04-23) ──────────────
+    // Sintoma: IA responde "Já anotei no carrinho: 1 Mãe M, 1 Filha M" em texto,
+    // sem emitir [TAMANHO]/[QUANTIDADE]/[COMPRAR_DIRETO]. Nada entra em session.items.
+    // Cliente tenta fechar pedido e recebe "Seu carrinho está vazio".
+    //
+    // Detector: action === null (nem parseAction nem reflection extraíram token)
+    // + texto com vocabulário de commit. Substitui por pergunta de re-ask e loga.
+    if (!action && cleanText) {
+      const commitPhraseRegex = /\b(anotei|anotado|anotada|deixei\s+anotad[oa]|adicionei|adicionado|adicionada|coloquei\s+no\s+(?:seu\s+)?carrinho|separei|j[áa]\s+separei|j[áa]\s+t[áa]\s+no\s+(?:seu\s+)?carrinho|t[áa]\s+anotado\s+(?:aqui|no)|ajustei\s+aqui|alterei\s+aqui|alterado\s+aqui|prontinho,?\s*ajustad[oa])\b/i;
+      if (commitPhraseRegex.test(cleanText)) {
+        session.hallucinatedCommits = (session.hallucinatedCommits || 0) + 1;
+        logger.warn({
+          from,
+          textPreview:          cleanText.slice(0, 160),
+          fsmState:             session.purchaseFlow?.state || 'idle',
+          currentProductId:     session.currentProduct?.id || null,
+          pfProductId:          session.purchaseFlow?.productId || null,
+          hallucinatedCommits:  session.hallucinatedCommits,
+        }, '[AI] Alucinação de commit detectada — resposta confirmou sem emitir token');
+
+        const hasProductFocus = session.purchaseFlow?.productId || session.currentProduct;
+        cleanText = hasProductFocus
+          ? 'Opa, me confirma rapidinho 😊 qual tamanho e quantidade você quer dessa peça? (ex: _M 1_, _2P 1G_)'
+          : 'Opa, só pra separar certinho 😊 me diz o produto (ou número dele), tamanho e quantidade que você quer.';
+      }
+    }
+    // ── fim guard anti-alucinação ─────────────────────────────────────────────
 
     // Mão de Ferro v3 — Se é primeiro contato ou o usuário pediu lançamentos/novidades,
     // nós FORÇAMOS o catálogo e limpamos qualquer outra ação conflitante.
@@ -3159,6 +3856,12 @@ Então me diz: o que você prefere agora? Fechar um pedido que já sabe o que qu
     }
 
     persistSession(from);
+
+    } finally {
+      // Libera o slot da fila — próxima mensagem pendente para este número pode iniciar
+      _releasePhone?.();
+      if (phoneProcessingQueue.get(from) === _phoneTask) phoneProcessingQueue.delete(from);
+    }
 
   } catch (error) {
     logger.error({ err: error }, '[Webhook] Error');
@@ -3672,6 +4375,12 @@ function getSizeAvailability(session, product, size) {
   ) || null;
 }
 
+function getProductShowcaseMessageId(session, product) {
+  if (!session || !product?.id) return null;
+  const map = session.productShowcaseMessageId || {};
+  return map[product.id] || map[String(product.id)] || null;
+}
+
 async function sendStockAwareSizeList(phone, session, product, version, excludeSizes = []) {
   const stockProduct = await ensureProductStockData(product, getVariantFilter(session));
   if (!stockProduct) return false;
@@ -3691,7 +4400,14 @@ async function sendStockAwareSizeList(phone, session, product, version, excludeS
     variantLabel: variantFilter?.value || null,
   };
 
-  await zapi.sendSizeList(phone, productForList, version, excludeSizes, true);
+  await zapi.sendSizeList(
+    phone,
+    productForList,
+    version,
+    excludeSizes,
+    true,
+    getProductShowcaseMessageId(session, productForList)
+  );
   return availableSizes.length > 0;
 }
 
@@ -3726,7 +4442,13 @@ async function sendStockAwareSizeQtyList(phone, session, product, version) {
   const stockProduct = await ensureProductStockData(product, getVariantFilter(session));
   if (!stockProduct) return;
   const sizeDetails = buildSessionSizeDetails(session, stockProduct);
-  await zapi.sendSizeQuantityList(phone, stockProduct, version, sizeDetails);
+  await zapi.sendSizeQuantityList(
+    phone,
+    stockProduct,
+    version,
+    sizeDetails,
+    getProductShowcaseMessageId(session, stockProduct)
+  );
 }
 
 /**
@@ -3781,7 +4503,13 @@ async function sendVariantList(phone, attr, session = null) {
       await zapi.sendVariantButtonCard(phone, productForCard, filteredAttr, version);
     } else {
       const productName = session?.purchaseFlow?.productName || 'este produto';
-      await zapi.sendVariantOptionList(phone, filteredAttr, version, productName);
+      await zapi.sendVariantOptionList(
+        phone,
+        filteredAttr,
+        version,
+        productName,
+        getProductShowcaseMessageId(session, productForCard)
+      );
     }
   } catch {
     const opts = availableOptions.map((o, i) => `${i + 1}. *${o}*`).join('\n');
@@ -3929,6 +4657,32 @@ function parseMultiVariantGrade(text, attrOptions, productSizes) {
 
   if (hits.length === 0) return null;
 
+  // Pre-pass: "QTY VARIANT SIZE" — ex: "2 mae gg 3 filha g"
+  // Padrão onde a quantidade vem antes da variante e o tamanho vem depois.
+  // Só é usado quando todas as variantes encontradas têm match (cobertura total).
+  {
+    const sizesPatternLocal = productSizes.slice()
+      .sort((a, b) => b.length - a.length)
+      .map(s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+      .join('|');
+    const qtyVarSizeRx = new RegExp(
+      `(\\d+)\\s+(${escapedOptions.join('|')})\\s+(${sizesPatternLocal})(?=\\s|,|;|\\.|$)`,
+      'gi'
+    );
+    const directPairs = [];
+    let dm;
+    while ((dm = qtyVarSizeRx.exec(normText)) !== null) {
+      const qty = parseInt(dm[1], 10);
+      const variant = attrOptions.find(opt => normalizeVariantText(opt) === normalizeVariantText(dm[2])) || dm[2];
+      const sizeUpper = dm[3].toUpperCase();
+      const originalSize = productSizes.find(s => s.toUpperCase() === sizeUpper) || dm[3];
+      if (qty > 0 && qty <= 999) {
+        directPairs.push({ variant, grade: [{ size: originalSize, qty }] });
+      }
+    }
+    if (directPairs.length === hits.length && directPairs.length > 0) return directPairs;
+  }
+
   // Ordenação 1: grade APÓS a variante ("mãe 2G filha 1M")
   const afterPairs = [];
   for (let i = 0; i < hits.length; i++) {
@@ -4011,6 +4765,15 @@ function getCartStats(session) {
  */
 async function addToCart(phone, qty, session) {
   const pf = session.purchaseFlow;
+
+  // Guard: cliente está em meio à confirmação de uma grade composta. Adicionar
+  // itens novos pode confundir o plano em curso. Pede pra resolver compound antes.
+  if (session.awaitingCompoundConfirmation &&
+      session.compoundConfirmationExpiresAt &&
+      Date.now() < session.compoundConfirmationExpiresAt) {
+    await zapi.sendText(phone, '⏸️ Tô esperando você confirmar aquela grade que mandei (responde "sim" ou "não" amor 😊).');
+    return false;
+  }
 
   if (!pf.productId || !pf.selectedSize) {
     await zapi.sendText(phone, '❌ Nenhum produto/tamanho em foco. Escolha um produto primeiro.');
@@ -4124,6 +4887,24 @@ function isStaleEvent(eventId, session) {
   return eventVersion < sessionVersion;
 }
 
+function parseSizeQtyEvent(eventId) {
+  if (!eventId?.startsWith('sizeqty_')) return null;
+
+  // Formato: sizeqty_{productId}_{size}_{qty}_v{version}
+  const withoutPrefix = eventId.slice('sizeqty_'.length);
+  const vIdx = withoutPrefix.lastIndexOf('_v');
+  const withoutVersion = vIdx >= 0 ? withoutPrefix.slice(0, vIdx) : withoutPrefix;
+  const parts = withoutVersion.split('_');
+
+  if (parts.length < 3) return null;
+
+  const productIdStr = parts[0];
+  const qty = parseInt(parts[parts.length - 1], 10);
+  const size = parts.slice(1, -1).join('_'); // suporta tamanhos multi-char como GG, EXG
+
+  return { productIdStr, size, qty };
+}
+
 /**
  * Intercepta cart_finalize quando há produtos na buyQueue.
  * Retorna true se interceptou (webhook deve dar return), false caso contrário.
@@ -4211,9 +4992,12 @@ function interpretQueueGuardAnswer(text) {
 async function addToBuyDebounce(phone, eventId, session) {
   // buy_{id}  ou  buy_variant_{id}_{opt}
   let productId;
+  let showcaseVariantOpt = null;
   if (eventId.startsWith('buy_variant_')) {
     const withoutPrefix = eventId.slice('buy_variant_'.length); // "{id}_{opt}"
-    productId = parseInt(withoutPrefix.split('_')[0], 10);
+    const firstUnderscore = withoutPrefix.indexOf('_');
+    productId = parseInt(firstUnderscore >= 0 ? withoutPrefix.slice(0, firstUnderscore) : withoutPrefix, 10);
+    showcaseVariantOpt = firstUnderscore >= 0 ? withoutPrefix.slice(firstUnderscore + 1) : null;
   } else {
     productId = parseInt(eventId.split('_')[1], 10);
   }
@@ -4230,9 +5014,9 @@ async function addToBuyDebounce(phone, eventId, session) {
     buyDebounceBuffer.set(phone, entry);
   }
 
-  // Deduplica por productId
-  if (!entry.products.some(p => p.id === product.id)) {
-    entry.products.push(product);
+  // Deduplica por productId + variante escolhida
+  if (!entry.products.some(p => p.id === product.id && (p._showcaseVariantOpt || null) === (showcaseVariantOpt || null))) {
+    entry.products.push(showcaseVariantOpt ? { ...product, _showcaseVariantOpt: showcaseVariantOpt } : product);
   }
 
   // Reseta o timer a cada novo clique
@@ -4268,31 +5052,35 @@ async function flushBuyDebounce(phone) {
       // FSM livre: inicia com o primeiro, enfileira o resto silenciosamente
       if (!Array.isArray(pf.buyQueue)) pf.buyQueue = [];
       for (const p of rest) {
-        if (!pf.buyQueue.some(q => q.productId === p.id)) {
-          pf.buyQueue.push({ productId: p.id, productName: p.name, productSnapshot: p });
+        const selectedVariant = p._showcaseVariantOpt || null;
+        const alreadyQueued = pf.buyQueue.some(q =>
+          q.productId === p.id && (q.selectedVariant || null) === selectedVariant
+        );
+        if (!alreadyQueued) {
+          const queueEntry = { productId: p.id, productName: p.name, productSnapshot: p };
+          if (selectedVariant) queueEntry.selectedVariant = selectedVariant;
+          pf.buyQueue.push(queueEntry);
         }
       }
-      if (rest.length > 0) {
-        const namesStr = rest.map(p => `*${p.name}*`).join(', ');
-        await zapi.sendText(phone, `📋 Guardei na fila: ${namesStr}. Vamos começar com *${first.name}*! 😊`);
+      if (first._showcaseVariantOpt) {
+        await startInteractivePurchase(phone, first, session, null, true);
+        await tryAdvanceToSize(phone, session, first._showcaseVariantOpt);
+      } else {
+        await startInteractivePurchase(phone, first, session);
       }
-      await startInteractivePurchase(phone, first, session);
     } else {
-      // FSM ocupada: todos os produtos vão para a fila — UMA única notificação
+      // FSM ocupada: todos os produtos vão para a fila em silêncio
       if (!Array.isArray(pf.buyQueue)) pf.buyQueue = [];
-      const added = [];
       for (const p of entry.products) {
-        if (String(p.id) !== String(pf.productId) && !pf.buyQueue.some(q => q.productId === p.id)) {
-          pf.buyQueue.push({ productId: p.id, productName: p.name, productSnapshot: p });
-          added.push(p.name);
+        const selectedVariant = p._showcaseVariantOpt || null;
+        const alreadyQueued = pf.buyQueue.some(q =>
+          q.productId === p.id && (q.selectedVariant || null) === selectedVariant
+        );
+        if (String(p.id) !== String(pf.productId) && !alreadyQueued) {
+          const queueEntry = { productId: p.id, productName: p.name, productSnapshot: p };
+          if (selectedVariant) queueEntry.selectedVariant = selectedVariant;
+          pf.buyQueue.push(queueEntry);
         }
-      }
-      if (added.length > 0) {
-        const namesStr = added.map(n => `*${n}*`).join(', ');
-        const queueMsg = added.length === 1
-          ? `✅ *${namesStr}* adicionado à fila!`
-          : `✅ Adicionei à fila: ${namesStr}`;
-        await zapi.sendText(phone, queueMsg);
       }
     }
 
@@ -4443,7 +5231,13 @@ async function handlePurchaseFlowEvent(phone, eventId, session) {
   // ── sizeqty_{productId}_{size}_{qty}_v{version} ──────────────────────
   // Lista combinada tamanho+quantidade: uma interação fecha compra direto.
   if (eventId.startsWith('sizeqty_')) {
-    if (isStaleEvent(eventId, session)) {
+    const parsed = parseSizeQtyEvent(eventId);
+    const isStaleSizeQty = isStaleEvent(eventId, session);
+    const isSameFocusedProduct = parsed?.productIdStr && String(parsed.productIdStr) === String(pf.productId);
+    const reusableSizeQtyStates = new Set(['awaiting_size', 'awaiting_more_sizes']);
+    const canReuseFocusedProductList = isSameFocusedProduct && reusableSizeQtyStates.has(pf.state);
+
+    if (isStaleSizeQty && !canReuseFocusedProductList) {
       logger.info({ phone, eventId }, '[FSM] sizeqty_ expirado → reenviando lista combinada');
       await zapi.sendText(phone, '⏱️ Esse menu expirou! Enviando a lista atualizada...');
       const staleProd = await ensureProductStockData(
@@ -4453,14 +5247,13 @@ async function handlePurchaseFlowEvent(phone, eventId, session) {
       return;
     }
 
-    // Parse resiliente: sizeqty_{productId}_{size}_{qty}_v{version}
-    const withoutPrefix = eventId.slice('sizeqty_'.length);
-    const vIdx = withoutPrefix.lastIndexOf('_v');
-    const withoutVersion = vIdx >= 0 ? withoutPrefix.slice(0, vIdx) : withoutPrefix;
-    const parts = withoutVersion.split('_');
-    const productIdStr = parts[0];
-    const qty = parseInt(parts[parts.length - 1], 10);
-    const size = parts.slice(1, -1).join('_'); // suporta tamanhos multi-char como GG, EXG
+    if (isStaleSizeQty) {
+      logger.info({ phone, eventId, productId: parsed.productIdStr }, '[FSM] sizeqty_ antigo do mesmo produto aceito');
+    }
+
+    const productIdStr = parsed?.productIdStr;
+    const qty = parsed?.qty;
+    const size = parsed?.size;
 
     const product = await ensureProductStockData(await resolveProductById(session, productIdStr));
 
@@ -4780,12 +5573,21 @@ async function processNextInQueue(phone, session, replyToMessageId = null) {
     if (showcaseSizes.length > 0) showcaseSizeLine = `\n📏 Disponível: *${showcaseSizes.join(' | ')}*`;
   }
   const showcaseCaption = `✨ *${product.name}*\n${showcasePriceLine}${showcaseSizeLine}`;
+  let showcaseMessageId = null;
   if (product.imageUrl) {
-    await zapi.sendImage(phone, product.imageUrl, showcaseCaption);
+    const imgRes = await zapi.sendImage(phone, product.imageUrl, showcaseCaption);
+    showcaseMessageId = imgRes?.data?.messageId || imgRes?.data?.zaapId || null;
   } else {
-    await zapi.sendText(phone, showcaseCaption);
+    const textRes = await zapi.sendText(phone, showcaseCaption);
+    showcaseMessageId = textRes?.data?.messageId || textRes?.data?.zaapId || null;
   }
-  if (nextSecondaryAttr) {
+  if (showcaseMessageId) {
+    session.productShowcaseMessageId = session.productShowcaseMessageId || {};
+    session.productShowcaseMessageId[product.id] = showcaseMessageId;
+  }
+  if (nextSecondaryAttr && next.selectedVariant) {
+    await tryAdvanceToSize(phone, session, next.selectedVariant);
+  } else if (nextSecondaryAttr) {
     await sendVariantList(phone, nextSecondaryAttr, session);
   } else {
     await sendStockAwareSizeQtyList(phone, session, product, pf.interactiveVersion);
@@ -5067,6 +5869,8 @@ async function handleCartEditFromQuote(phone, session, text) {
 }
 
 async function showCart(phone, session) {
+  // Aguarda matches de foto ainda em curso pra evitar "carrinho vazio" prematuro
+  await awaitPendingImageMatches(session);
   if (!session.items || session.items.length === 0) {
     await sendCategoryMenu(phone, '🛒 Seu carrinho está vazio por enquanto. Qual linha você quer ver agora?');
     return;
@@ -5597,10 +6401,227 @@ async function showProductPhotos(phone, productRef, session) {
   }
 }
 
+function setCatalogSearchSessionProducts(session, products) {
+  session.products = products;
+  session.currentCategory = null;
+  session.activeCategory = null;
+  session.currentPage = 1;
+  session.totalPages = 1;
+  session.totalProducts = products.length;
+
+  if (products.length > 0) {
+    session.lastViewedProduct = products[products.length - 1];
+    session.lastViewedProductIndex = products.length;
+  }
+}
+
+function buildCatalogAssistantText(result, kind) {
+  const intent = result.intent || {};
+  const query = intent.query || 'esse modelo';
+
+  if (kind === 'auto') {
+    if (intent.theme) return `Achei essa estampa aqui disponível 😊`;
+    if (intent.recency?.type === 'yesterday') return `Achei esse daqui de ontem ainda disponível 😊`;
+    return `Achei esse aqui disponível 😊`;
+  }
+
+  if (kind === 'multiple') {
+    if (intent.theme) return `Achei essas opções com essa estampa 😊`;
+    return `Achei alguns modelos de *${query}* disponíveis 😊`;
+  }
+
+  if (kind === 'out_of_stock_with_similar') {
+    return `Esse não apareceu disponível agora 😕 Mas separei outros parecidos que ainda tenho em estoque.`;
+  }
+
+  if (kind === 'out_of_stock') {
+    return `Esse não apareceu disponível agora 😕 Me manda uma referência ou uma foto que eu tento achar outro parecido pra você.`;
+  }
+
+  return `Não consegui achar esse modelo certinho agora 😕 Me manda a referência, uma foto ou mais um detalhe da estampa.`;
+}
+
+function recordCatalogDeterministicReply(session, userText, assistantText, result) {
+  if (userText) {
+    appendHistory(session, 'user', userText);
+    conversationMemory.refreshConversationMemory(session, { userText });
+  }
+  if (assistantText) {
+    appendHistory(session, 'assistant', assistantText);
+    conversationMemory.refreshConversationMemory(session, {
+      assistantText,
+      action: { type: 'BUSCAR', payload: result.intent?.query || null },
+    });
+  }
+}
+
+async function sendCatalogProductImageOnly(phone, product, session, productNumber = 1) {
+  const caption = woocommerce.buildCaption(product, productNumber);
+  if (product.imageUrl) {
+    const imgRes = await zapi.sendImage(phone, product.imageUrl, caption);
+    registerMessageProduct(session, imgRes?.data?.zaapId, imgRes?.data?.messageId, product);
+    const messageId = imgRes?.data?.messageId || imgRes?.data?.zaapId || null;
+    if (messageId) {
+      session.productShowcaseMessageId = session.productShowcaseMessageId || {};
+      session.productShowcaseMessageId[product.id] = messageId;
+    }
+    return imgRes;
+  }
+
+  const textRes = await zapi.sendText(phone, caption);
+  registerMessageProduct(session, textRes?.data?.zaapId, textRes?.data?.messageId, product);
+  const messageId = textRes?.data?.messageId || textRes?.data?.zaapId || null;
+  if (messageId) {
+    session.productShowcaseMessageId = session.productShowcaseMessageId || {};
+    session.productShowcaseMessageId[product.id] = messageId;
+  }
+  return textRes;
+}
+
+async function sendCatalogProductCards(phone, products, session) {
+  const sentProducts = [];
+  session.purchaseFlow.interactiveVersion = Date.now();
+
+  for (const [i, product] of products.entries()) {
+    const enriched = await ensureProductStockData(product);
+    if (!enriched) continue;
+    sentProducts.push(enriched);
+
+    if (enriched.imageUrl) {
+      try {
+        const showcaseButtons = buildShowcaseButtons(enriched);
+        const scRes = await zapi.sendProductShowcase(phone, enriched, session.purchaseFlow.interactiveVersion, showcaseButtons);
+        registerMessageProduct(session, scRes?.data?.zaapId, scRes?.data?.messageId, enriched);
+        if (scRes?.data?.messageId) {
+          session.productShowcaseMessageId = session.productShowcaseMessageId || {};
+          session.productShowcaseMessageId[enriched.id] = scRes.data.messageId;
+        }
+      } catch {
+        try {
+          await sendCatalogProductImageOnly(phone, enriched, session, i + 1);
+        } catch (imgErr) {
+          logger.warn({ productId: enriched.id, err: imgErr?.message }, '[CatalogSearch] Falha ao enviar imagem');
+        }
+      }
+    } else {
+      await sendCatalogProductImageOnly(phone, enriched, session, i + 1);
+    }
+
+    await zapi.delay(400);
+  }
+
+  return sentProducts;
+}
+
+async function openCatalogProductDirectly(phone, product, session, introText) {
+  const enriched = await ensureProductStockData(product);
+  if (!enriched) return false;
+
+  setCatalogSearchSessionProducts(session, [enriched]);
+
+  if (enriched.secondaryAttributes?.length > 0) {
+    await startInteractivePurchase(phone, enriched, session, introText);
+    return true;
+  }
+
+  await zapi.sendText(phone, introText);
+  await sendCatalogProductImageOnly(phone, enriched, session, 1);
+  await startInteractivePurchase(phone, enriched, session);
+  return true;
+}
+
+async function renderCommercialCatalogResult(phone, result, session, opts = {}) {
+  const userText = opts.userText || null;
+
+  if (result.shouldAutoOpen && result.inStock.length === 1) {
+    const assistantText = buildCatalogAssistantText(result, 'auto');
+    recordCatalogDeterministicReply(session, userText, assistantText, result);
+    await openCatalogProductDirectly(phone, result.inStock[0], session, assistantText);
+    return true;
+  }
+
+  if (result.inStock.length > 0) {
+    const assistantText = buildCatalogAssistantText(result, 'multiple');
+    recordCatalogDeterministicReply(session, userText, assistantText, result);
+    await zapi.sendText(phone, assistantText);
+    const sentProducts = await sendCatalogProductCards(phone, result.inStock, session);
+    setCatalogSearchSessionProducts(session, sentProducts.length > 0 ? sentProducts : result.inStock);
+    return true;
+  }
+
+  if (result.outOfStock.length > 0) {
+    const hasSimilar = result.similarInStock.length > 0;
+    const assistantText = buildCatalogAssistantText(result, hasSimilar ? 'out_of_stock_with_similar' : 'out_of_stock');
+    recordCatalogDeterministicReply(session, userText, assistantText, result);
+    await zapi.sendText(phone, assistantText);
+
+    if (hasSimilar) {
+      const sentProducts = await sendCatalogProductCards(phone, result.similarInStock, session);
+      setCatalogSearchSessionProducts(session, sentProducts.length > 0 ? sentProducts : result.similarInStock);
+    }
+    return true;
+  }
+
+  const assistantText = buildCatalogAssistantText(result, 'not_found');
+  recordCatalogDeterministicReply(session, userText, assistantText, result);
+  await zapi.sendText(phone, assistantText);
+  return true;
+}
+
+async function runCommercialCatalogSearch(phone, query, session, opts = {}) {
+  const intent = opts.intent || catalogQueryResolver.resolveCatalogQuery(query);
+  if (!intent.shouldHandle) return false;
+
+  const result = await catalogSearch.searchCatalog(intent, {
+    woocommerce,
+    imageMatcher,
+    logger,
+    resolveProductById: (productId) => resolveProductById(session, productId),
+  });
+
+  return renderCommercialCatalogResult(phone, result, session, {
+    userText: opts.userText || null,
+  });
+}
+
+async function tryHandleCommercialCatalogQuery(phone, text, session, semanticQuick) {
+  if (!CATALOG_RESOLVER_ENABLED) return false;
+  if (!catalogQueryResolver.shouldUseCatalogResolver({ text, session, semanticQuick, env: process.env })) {
+    return false;
+  }
+
+  const intent = catalogQueryResolver.resolveCatalogQuery(text);
+
+  try {
+    logger.info(
+      { phone, query: intent.query, intentType: intent.intentType, recency: intent.recency?.type || null },
+      '[CatalogResolver] Busca comercial determinística'
+    );
+    const phrase = pickSearchLoadingPhrase(intent.query);
+    await sendLoadingMessage(phone, phrase.text, phrase.tts);
+    return await runCommercialCatalogSearch(phone, intent.query, session, { intent, userText: text });
+  } catch (err) {
+    logger.warn({ phone, err: err?.message || String(err), text: text.slice(0, 120) }, '[CatalogResolver] Falha — caindo para fluxo antigo');
+    return false;
+  }
+}
+
 async function searchAndShowProducts(phone, query, session) {
   clearSupportMode(session, 'search_products');
   const phrase = pickSearchLoadingPhrase(query);
   await sendLoadingMessage(phone, phrase.text, phrase.tts);
+
+  if (CATALOG_RESOLVER_ENABLED) {
+    try {
+      const intent = catalogQueryResolver.resolveCatalogQuery(query);
+      if (intent.shouldHandle) {
+        const handled = await runCommercialCatalogSearch(phone, query, session, { intent });
+        if (handled) return;
+      }
+    } catch (err) {
+      logger.warn({ query, err: err?.message || String(err) }, '[searchAndShowProducts] Busca comercial falhou — usando legado');
+    }
+  }
 
   let searchResult;
   try {
@@ -5611,7 +6632,29 @@ async function searchAndShowProducts(phone, query, session) {
     return;
   }
 
-  const products = searchResult.products;
+  let products = searchResult.products;
+
+  // Fallback semântico: WC search por nome falhou (ex: "sonic" não está em
+  // "Pijama Masculino - Ref 672S"). Usa embedding de texto contra a base de
+  // descrições visuais indexadas via image-matcher.
+  if (!products || products.length === 0) {
+    try {
+      const { candidates } = await imageMatcher.searchByText(query, 8, 0.55);
+      if (candidates.length > 0) {
+        const resolved = await Promise.all(
+          candidates.map((c) => resolveProductById(session, c.product_id).catch(() => null))
+        );
+        products = resolved.filter(Boolean);
+        logger.info(
+          { query, semanticMatches: candidates.length, resolved: products.length },
+          '[searchAndShowProducts] Fallback semântico encontrou produtos'
+        );
+      }
+    } catch (err) {
+      logger.warn({ query, err: err.message }, '[searchAndShowProducts] Fallback semântico falhou');
+    }
+  }
+
   if (!products || products.length === 0) {
     await zapi.sendText(phone, `😕 Poxa, não encontrei nada buscando por "${query}".`);
     return;
@@ -6002,6 +7045,311 @@ async function sendProductPage(phone, result, session, startIdx = 0) {
   }
 }
 
+// ── Compound Grade — Raciocínio multimodal sobre múltiplas fotos + texto composto ─────
+// Casos cobertos: cliente envia N fotos de pijamas em sequência + texto como
+// "6 de cada estampa / 2 de cada tamanho". A Bela precisa: contar estampas,
+// validar aritmética, confirmar visualmente antes de executar pushCartItem.
+// Ver ADR-046 (compound reasoning) e plano em plans/qual-seria-a-abordagem-indexed-piglet.md
+
+/**
+ * Varre os textos pendentes de uma sessão em modo fechar_pedido e decide se o
+ * caso é composto — ou seja, se há 2+ fotos identificadas + texto com spec
+ * "N de cada estampa" ou "N de cada tamanho".
+ *
+ * @returns {{ spec: {perVariant, perSize}, sourceText: string } | null}
+ */
+function detectCompoundCase(session) {
+  const matched = session.matchedProducts || [];
+  if (matched.length < 2) return null;
+
+  const candidates = [];
+  for (const t of (session.pendingSizeTexts || [])) {
+    if (t?.text) candidates.push(t.text);
+  }
+  for (const m of matched) {
+    if (m?.caption) candidates.push(m.caption);
+  }
+  if (candidates.length === 0) return null;
+
+  for (const text of candidates) {
+    const spec = parseCompoundSpec(text);
+    if (spec) return { spec, sourceText: text };
+  }
+  return null;
+}
+
+/**
+ * Classifica resposta do cliente após Bela mandar a confirmação da grade composta.
+ * @returns {'accept'|'reject'|'correct'|'unclear'}
+ */
+function classifyCompoundReply(text) {
+  if (!text || typeof text !== 'string') return 'unclear';
+  const t = text.trim().toLowerCase();
+
+  const acceptRegex = /^(sim|isso|ok|okay|certo|fechou|fechado|pode|bora|manda|confirma|confirmado|t[aá] certo|perfeito|show|beleza|blz|pode mandar|pode ser|tudo certo|s)\.?!?$/i;
+  if (acceptRegex.test(t)) return 'accept';
+
+  const rejectRegex = /^(n[aã]o|nao|negativo|peraí|pera|espera|calma|muda|trocar|troca|espera a[ií]|deixa|nops|ñ|nn)\.?!?$/i;
+  if (rejectRegex.test(t)) return 'reject';
+
+  // Presença de números ou tamanhos no texto → correção
+  if (/\d+|\b(pp|p|m|g|gg|xg|xgg)\b/i.test(t)) return 'correct';
+
+  return 'unclear';
+}
+
+function clearCompoundState(session) {
+  session.pendingCompoundGrade = null;
+  session.awaitingCompoundConfirmation = false;
+  session.compoundConfirmationExpiresAt = null;
+  session.pendingCompoundPlan = null;
+  session.pendingCompoundSpec = null;
+}
+
+/**
+ * Agenda a confirmação composta da Bela com debounce curto (3s). Toda vez
+ * que uma nova mensagem chega no fluxo composto, o timer é resetado.
+ * Quando expirar, chama `runCompoundConfirmation` que orquestra:
+ *   1. distributeCompoundGrade (determinístico)
+ *   2. cross-check determinístico de incertezas/duplicatas
+ *   3. template fixo + envio da mensagem de confirmação
+ */
+function schedulePendingCompoundConfirmation(phone, session) {
+  const existing = compoundConfirmationTimers.get(phone);
+  if (existing) clearTimeout(existing);
+
+  const timer = setTimeout(async () => {
+    compoundConfirmationTimers.delete(phone);
+    try {
+      const inFlight = session.pendingImageMatches || 0;
+      const waitedSince = session.firstPhotoAt || Date.now();
+      const waitedMs = Date.now() - waitedSince;
+
+      if (inFlight > 0 && waitedMs < MAX_WAIT_FOR_FLIGHT) {
+        logger.info(
+          { phone, inFlight, waitedMs },
+          '[Compound] Aguardando fila ImageMatch — re-agendando'
+        );
+        schedulePendingCompoundConfirmation(phone, session);
+        return;
+      }
+
+      if (inFlight > 0) {
+        logger.warn(
+          { phone, inFlight, waitedMs },
+          '[Compound] Timeout esperando fila — disparando com lista parcial'
+        );
+      }
+
+      await runCompoundConfirmation(phone, session);
+    } catch (err) {
+      logger.error(
+        { phone, err: err.message, stack: err?.stack?.slice(0, 400) },
+        '[Compound] Falha em runCompoundConfirmation — fallback para handoff'
+      );
+      // Fallback seguro: volta para fluxo humano normal
+      clearCompoundState(session);
+      scheduleFecharPedidoHandoff(phone, session);
+    }
+  }, COMPOUND_DEBOUNCE_MS);
+
+  compoundConfirmationTimers.set(phone, timer);
+  logger.info({ phone, debounceMs: COMPOUND_DEBOUNCE_MS }, '[Compound] Timer de confirmação agendado');
+}
+
+/**
+ * Variante do schedulePendingCompoundConfirmation para o fluxo NORMAL
+ * (ver lançamento, catálogo). Usa debounce mais curto (1.5s) e em caso de
+ * falha NÃO faz handoff humano — apenas limpa o estado e deixa a IA seguir
+ * naturalmente. Antes de disparar, integra ADR-022 (Reply é Cursor): se a
+ * FSM está em outro produto, enfileira via switchFsmFocus.
+ */
+function scheduleNormalCompoundCheck(phone, session) {
+  const existing = normalCompoundTimers.get(phone);
+  if (existing) clearTimeout(existing);
+
+  const timer = setTimeout(async () => {
+    normalCompoundTimers.delete(phone);
+    try {
+      const inFlight = session.pendingImageMatches || 0;
+      const waitedSince = session.firstPhotoAt || Date.now();
+      const waitedMs = Date.now() - waitedSince;
+
+      if (inFlight > 0 && waitedMs < MAX_WAIT_FOR_FLIGHT) {
+        logger.info(
+          { phone, inFlight, waitedMs },
+          '[Compound] Aguardando fila ImageMatch — re-agendando'
+        );
+        scheduleNormalCompoundCheck(phone, session);
+        return;
+      }
+
+      if (inFlight > 0) {
+        logger.warn(
+          { phone, inFlight, waitedMs },
+          '[Compound] Timeout esperando fila — disparando com lista parcial'
+        );
+      }
+
+      // ADR-022: se há produto em foco diferente dos do compound, enfileira
+      const matched = (session.matchedProducts || []).filter((m) => m.compoundOrigin === 'normal');
+      const pf = session.purchaseFlow;
+      const focusedId = pf?.productId ? String(pf.productId) : null;
+      const compoundIds = new Set(matched.map((m) => String(m.productId)));
+      if (focusedId && pf?.state && pf.state !== 'idle' && !compoundIds.has(focusedId)) {
+        const firstMatch = matched[0];
+        if (firstMatch) {
+          const productForFocus = getLoadedProductById(session, firstMatch.productId)
+            || (await resolveProductById(session, firstMatch.productId).catch(() => null));
+          if (productForFocus) {
+            const { contextMessage } = switchFsmFocus(session, productForFocus);
+            if (contextMessage) {
+              appendHistory(session, 'assistant', contextMessage);
+              conversationMemory.refreshConversationMemory(session, { assistantText: contextMessage });
+            }
+          }
+        }
+      }
+
+      await runCompoundConfirmation(phone, session, { fromNormal: true });
+    } catch (err) {
+      logger.error(
+        { phone, err: err.message, stack: err?.stack?.slice(0, 400) },
+        '[Compound] Falha em scheduleNormalCompoundCheck — limpando estado'
+      );
+      clearCompoundState(session);
+      // Em modo normal, não força handoff — IA segue na próxima mensagem
+    }
+  }, NORMAL_COMPOUND_DEBOUNCE_MS);
+
+  normalCompoundTimers.set(phone, timer);
+  logger.info({ phone, debounceMs: NORMAL_COMPOUND_DEBOUNCE_MS }, '[Compound] Timer modo normal agendado');
+}
+
+const COMPOUND_CONFIRMATION_TTL_MS = 5 * 60 * 1000; // 5min
+
+/**
+ * Cross-check determinístico do compound. Não bloqueia a confirmação: só deixa
+ * visível para a cliente quando há identificação incerta ou duplicata suspeita.
+ */
+function detectCompoundInconsistencies(matched, plan) {
+  const issues = [...(Array.isArray(plan?.inconsistencies) ? plan.inconsistencies : [])];
+  const uncertain = (matched || []).filter((m) => m.uncertain || (m.confidence ?? 1) < 0.65);
+
+  if (uncertain.length > 0) {
+    issues.push(`${uncertain.length} foto(s) com identificação incerta — vou confirmar uma a uma se você concordar`);
+  }
+
+  const idCounts = {};
+  for (const match of matched || []) {
+    if (!match?.productId) continue;
+    idCounts[match.productId] = (idCounts[match.productId] || 0) + 1;
+  }
+  const duplicate = Object.entries(idCounts).find(([, count]) => count > 1);
+  if (duplicate) {
+    issues.push(`Identifiquei o mesmo produto em ${duplicate[1]} fotos — pode ser estampa diferente parecida`);
+  }
+
+  return issues;
+}
+
+function renderCompoundConfirmation(plan) {
+  const lines = [];
+  lines.push('Deixa eu confirmar pra não errar 😊');
+  lines.push('');
+
+  for (const item of plan.items || []) {
+    const grade = (item.grade || [])
+      .map((entry) => `${entry.qty}${entry.size}${entry.variant ? ` ${entry.variant}` : ''}`)
+      .join(' ');
+    lines.push(`• *${item.name}* — ${grade}`);
+  }
+
+  lines.push('');
+  lines.push(`Total: *${plan.totalPieces} peças*`);
+
+  if (plan.inconsistencies?.length > 0) {
+    lines.push('');
+    lines.push('⚠️ Algumas inconsistências que precisam confirmar:');
+    for (const issue of plan.inconsistencies) {
+      lines.push(`- ${issue}`);
+    }
+  }
+
+  lines.push('');
+  lines.push('É isso mesmo? Manda *sim* que eu fecho 💖');
+  return lines.join('\n');
+}
+
+async function runCompoundConfirmation(phone, session, options = {}) {
+  const fromNormal = options.fromNormal === true;
+  const fallback = (reason) => {
+    if (fromNormal) {
+      logger.info({ phone, reason }, '[Compound] Fallback em modo normal — limpando estado, IA segue');
+      clearCompoundState(session);
+      // Limpa buffer normal pra não re-disparar
+      if (Array.isArray(session.matchedProducts)) {
+        session.matchedProducts = session.matchedProducts.filter((m) => m.compoundOrigin !== 'normal');
+      }
+    } else {
+      scheduleFecharPedidoHandoff(phone, session);
+    }
+  };
+
+  const detected = detectCompoundCase(session);
+  if (!detected) {
+    logger.warn({ phone }, '[Compound] runCompoundConfirmation sem caso composto');
+    fallback('no_compound_detected');
+    return;
+  }
+
+  const matched = session.matchedProducts || [];
+  const productsForPlan = matched.map((m) => ({
+    productId: m.productId,
+    name: m.name,
+    sizes: Array.isArray(m.sizes) && m.sizes.length > 0 ? m.sizes : ['P', 'M', 'G'],
+    attrOptions: Array.isArray(m.attrOptions) ? m.attrOptions : null,
+  }));
+
+  const computed = distributeCompoundGrade(productsForPlan, detected.spec);
+  const plan = {
+    items: Array.isArray(computed.items) ? computed.items : (computed.plan || []),
+    totalPieces: computed.totalPieces || 0,
+    inconsistencies: detectCompoundInconsistencies(matched, computed),
+  };
+
+  if (!Array.isArray(plan.items) || plan.items.length === 0 || plan.totalPieces <= 0) {
+    logger.warn({ phone, computed }, '[Compound] Plano determinístico vazio — fallback');
+    fallback('empty_deterministic_plan');
+    return;
+  }
+
+  session.pendingCompoundSpec = detected.spec;
+  session.pendingCompoundPlan = computed;
+  session.pendingCompoundGrade = plan;
+  session.awaitingCompoundConfirmation = true;
+  session.compoundConfirmationExpiresAt = Date.now() + COMPOUND_CONFIRMATION_TTL_MS;
+
+  const visibleMessage = renderCompoundConfirmation(plan);
+  appendHistory(session, 'assistant', visibleMessage);
+  conversationMemory.refreshConversationMemory(session, { assistantText: visibleMessage });
+  await zapi.sendText(phone, visibleMessage);
+
+  logger.info(
+    {
+      phone,
+      totalPieces: plan.totalPieces,
+      itemCount: plan.items.length,
+      inconsistencyCount: plan.inconsistencies.length,
+    },
+    '[Compound] Grade composta determinística proposta ao cliente — aguardando confirmação'
+  );
+
+  persistSession(phone);
+}
+
+// ── Handoff humano (fluxo tradicional) ─────────────────────────────────────
+
 /**
  * Finalizes the order by notifying the customer and forwarding the order summary to the admin.
  * Called when the AI emits [HANDOFF] or the customer confirms checkout with a pending queue.
@@ -6017,11 +7365,34 @@ function scheduleFecharPedidoHandoff(phone, session) {
     fecharPedidoInactivityTimers.delete(phone);
     // Só dispara se a sessão ainda está no modo fechar pedido e sem compras em andamento
     if (session.supportMode !== 'fechar_pedido_pending') return;
+
+    const relayBuffer = Array.isArray(session.fecharPedidoRelayBuffer) ? session.fecharPedidoRelayBuffer : [];
+    const matched = session.matchedProducts || [];
+    const pendingSizeTexts = Array.isArray(session.pendingSizeTexts) ? session.pendingSizeTexts : [];
+    const hasAnyOrderInput = relayBuffer.length > 0 || matched.length > 0 || pendingSizeTexts.length > 0;
+
+    if (!hasAnyOrderInput) {
+      const helpMsg =
+        'Ainda quer enviar as fotos do seu pedido? 😊\n\n' +
+        'Pode mandar aqui mesmo: *foto do produto + tamanho + quantidade*.\n' +
+        'Se precisar de ajuda ou tiver *dúvidas*, me chama por aqui que eu te explico.';
+      try {
+        await zapi.sendText(phone, helpMsg);
+        appendHistory(session, 'assistant', helpMsg);
+        conversationMemory.refreshConversationMemory(session, { assistantText: helpMsg });
+      } catch (err) {
+        logger.error({ phone, err: err.message }, '[FecharPedido] Falha ao enviar lembrete sem itens');
+      }
+      session.fecharPedidoEmptyPromptSentAt = Date.now();
+      persistSession(phone);
+      logger.info({ phone }, '[FecharPedido] Nenhum item recebido — lembrete enviado sem handoff');
+      return;
+    }
+
     session.supportMode = 'human_pending';
 
     // Monta resumo dos produtos identificados pela IA de visão.
     // Divide em confirmados (alta confiança) e incertos (precisa revisão humana).
-    const matched = session.matchedProducts || [];
     const confirmed = matched.filter((m) => !m.uncertain);
     const uncertain = matched.filter((m) => m.uncertain);
 
@@ -6143,7 +7514,7 @@ function scheduleFecharPedidoHandoff(phone, session) {
 
       // Textos de grade que sobraram na fila (sem foto correspondente) vão pra
       // vendedora como órfãos — nunca descartar silenciosamente.
-      orphanTexts = (session.pendingSizeTexts || [])
+      orphanTexts = pendingSizeTexts
         .map((o) => (typeof o === 'string' ? o : o?.text))
         .filter(Boolean);
       if (orphanTexts.length > 0) {
@@ -6201,7 +7572,7 @@ function scheduleFecharPedidoHandoff(phone, session) {
       (session.customerName ? `👤 *${session.customerName}*\n` : '') +
       `\n_Fotos e legendas exatas do cliente abaixo 👇_`;
 
-    const buffer = session.fecharPedidoRelayBuffer || [];
+    const buffer = relayBuffer;
 
     for (const adminPhone of ADMIN_PHONES) {
       try { await zapi.sendText(adminPhone, openingMsg); } catch (err) {
@@ -6303,10 +7674,10 @@ function scheduleFecharPedidoHandoff(phone, session) {
     session.pendingSizeTexts = [];
     session.fecharPedidoRelayBuffer = [];
     persistSession(phone);
-  }, 90_000);
+  }, 180_000);
 
   fecharPedidoInactivityTimers.set(phone, timer);
-  logger.info({ phone }, '[FecharPedido] Timer de 90s agendado');
+  logger.info({ phone }, '[FecharPedido] Timer de 180s agendado');
 }
 
 async function handoffToHuman(phone, session) {
@@ -6499,6 +7870,7 @@ async function scheduleUpsellAndHandoff(phone, session) {
   const existing = upsellHandoffTimers.get(phone);
   if (existing?.timer) clearTimeout(existing.timer);
 
+  const delayMs = Math.max(0, (session.handoffDueAt || 0) - Date.now());
   const timer = setTimeout(async () => {
     upsellHandoffTimers.delete(phone);
     try {
@@ -6519,10 +7891,10 @@ async function scheduleUpsellAndHandoff(phone, session) {
     } catch (err) {
       logger.error({ err: err?.message, phone }, '[UpsellHandoff] Falha ao executar handoff diferido');
     }
-  }, 5 * 60 * 1000); // 5 minutos
+  }, delayMs);
 
   upsellHandoffTimers.set(phone, { timer });
-  logger.info({ phone, upsellSlug, delayMs: 300_000 }, '[UpsellHandoff] Timer de 5min agendado');
+  logger.info({ phone, delayMs }, '[UpsellHandoff] Timer de handoff agendado');
 }
 
 async function handoffToConsultant(phone, session) {
@@ -6537,6 +7909,11 @@ async function handoffToConsultant(phone, session) {
     logger.warn({ phone }, '[Handoff] Duplicated handoff blocked');
     return;
   }
+
+  // Guard race condition: cliente clica "Finalizar" enquanto matchProductFromImage
+  // ainda processa (até 8s). Sem isso, lê items vazio e responde "carrinho vazio"
+  // mesmo o pushCartItem da foto estando para rodar nos próximos ms.
+  await awaitPendingImageMatches(session);
 
   if (!session.items || session.items.length === 0) {
     await zapi.sendText(phone, '😊 Seu carrinho está vazio! Adicione alguns produtos antes de fechar o pedido.');
@@ -6565,6 +7942,8 @@ async function handoffToConsultant(phone, session) {
   // ── 2. Salva snapshot e agenda upsell + handoff diferido ─────────────────
   session.upsellSnapshot = { items: [...session.items], total, summary };
   session.upsellPending  = true;
+  session.handoffDueAt   = Date.now() + 5 * 60 * 1000;
+  persistSession(phone);
 
   // Fire-and-forget: não bloqueia o webhook
   scheduleUpsellAndHandoff(phone, session).catch(err =>
@@ -6606,4 +7985,20 @@ server.listen(PORT, () => {
   // Garante que produtos novos/atualizados/deletados no WooCommerce fiquem
   // refletidos no Supabase sem intervenção manual.
   catalogSync.start();
+
+  // Recover handoffs pendentes: sessões que tinham upsellPending=true quando o
+  // servidor foi reiniciado recebem o timer recriado com o delay restante.
+  db.getExpiredSessions(0).then(rows => {
+    const pending = rows.filter(r => r.data?.upsellPending && !r.data?.handoffDone);
+    if (pending.length === 0) return;
+    logger.info({ count: pending.length }, '[Boot] Recriando timers de handoff pendentes');
+    for (const row of pending) {
+      const phone = row.phone;
+      const sess  = row.data;
+      sessions[phone] = sess;
+      scheduleUpsellAndHandoff(phone, sess).catch(err =>
+        logger.error({ phone, err: err?.message }, '[Boot] Falha ao recriar timer de handoff')
+      );
+    }
+  }).catch(err => logger.error({ err: err?.message }, '[Boot] Falha ao verificar handoffs pendentes'));
 });

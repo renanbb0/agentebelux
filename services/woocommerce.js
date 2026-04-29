@@ -129,6 +129,93 @@ async function searchProducts(query, perPage = 20, page = 1) {
 }
 
 /**
+ * Searches published products without filtering by stock status.
+ * Used only by the commercial catalog resolver to explain "exists, but is
+ * unavailable now" without changing the legacy in-stock search behavior.
+ */
+async function searchProductsIncludingOutOfStock(query, perPage = 20, page = 1) {
+  const cacheKey = `search-all-stock:${String(query).toLowerCase().trim()}:${perPage}:${page}`;
+  const cached = searchCache.get(cacheKey);
+  if (cached && (Date.now() - cached.loadedAt) < SEARCH_CACHE_TTL_MS) {
+    logger.debug({ cacheKey }, '[WooCommerce] searchCache hit');
+    return { ...cached.result, products: cached.result.products.map((p) => ({ ...p })) };
+  }
+
+  const response = await wooApi.get('/products', {
+    params: {
+      search: query,
+      per_page: perPage,
+      page,
+      status: 'publish',
+    },
+  });
+
+  const total = parseInt(response.headers['x-wp-total'] || '0', 10);
+  const totalPages = parseInt(response.headers['x-wp-totalpages'] || '1', 10);
+  const products = deduplicateProducts(response.data.map(formatProduct));
+  const result = { products, page, totalPages, total, hasMore: page < totalPages };
+
+  searchCache.set(cacheKey, { result, loadedAt: Date.now() });
+  return { ...result, products: result.products.map((p) => ({ ...p })) };
+}
+
+/**
+ * Searches published products within a WooCommerce date window.
+ * Defaults to in-stock products, matching the storefront behavior.
+ */
+async function searchProductsByDate({
+  query = '',
+  after,
+  before,
+  perPage = 20,
+  page = 1,
+  includeOutOfStock = false,
+  categorySlug = null,
+} = {}) {
+  const cacheKey = [
+    'search-date',
+    String(query).toLowerCase().trim(),
+    after || '',
+    before || '',
+    perPage,
+    page,
+    includeOutOfStock ? 'all' : 'instock',
+    categorySlug || '',
+  ].join(':');
+  const cached = searchCache.get(cacheKey);
+  if (cached && (Date.now() - cached.loadedAt) < SEARCH_CACHE_TTL_MS) {
+    logger.debug({ cacheKey }, '[WooCommerce] searchCache hit');
+    return { ...cached.result, products: cached.result.products.map((p) => ({ ...p })) };
+  }
+
+  const params = {
+    per_page: perPage,
+    page,
+    status: 'publish',
+    orderby: 'date',
+    order: 'desc',
+  };
+  if (query) params.search = query;
+  if (after) params.after = after;
+  if (before) params.before = before;
+  if (!includeOutOfStock) params.stock_status = 'instock';
+  if (categorySlug) {
+    const categoryId = await getCategoryIdBySlug(categorySlug);
+    if (categoryId) params.category = categoryId;
+  }
+
+  const response = await wooApi.get('/products', { params });
+
+  const total = parseInt(response.headers['x-wp-total'] || '0', 10);
+  const totalPages = parseInt(response.headers['x-wp-totalpages'] || '1', 10);
+  const products = deduplicateProducts(response.data.map(formatProduct));
+  const result = { products, page, totalPages, total, hasMore: page < totalPages };
+
+  searchCache.set(cacheKey, { result, loadedAt: Date.now() });
+  return { ...result, products: result.products.map((p) => ({ ...p })) };
+}
+
+/**
  * Fetches a single product by WooCommerce ID.
  */
 async function getProductById(productId) {
@@ -457,6 +544,8 @@ function formatProduct(product) {
     salePrice: product.sale_price,
     stockStatus: product.stock_status,
     stockQuantity: parseStockQuantity(product.stock_quantity),
+    dateCreated: product.date_created || product.date_created_gmt || null,
+    dateModified: product.date_modified || product.date_modified_gmt || null,
     imageUrl: product.images.length > 0 ? product.images[0].src : null,
     images: product.images.map((img) => img.src), // ✅ todas as fotos preservadas
     sizes: extractSizes(product),
@@ -583,6 +672,8 @@ module.exports = {
   getProductsByCategory,
   getProductById,
   searchProducts,
+  searchProductsIncludingOutOfStock,
+  searchProductsByDate,
   formatPrice,
   buildCaption,
   buildCatalogContext,

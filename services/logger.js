@@ -1,13 +1,23 @@
 const pino = require('pino');
 const path = require('path');
+const fs   = require('fs');
 
-const logger = pino({
-  level: 'info',
-  transport: {
-    target: 'pino-pretty',
-    options: { colorize: true },
-  },
+const logsDir = path.join(__dirname, '..', 'logs');
+if (!fs.existsSync(logsDir)) fs.mkdirSync(logsDir, { recursive: true });
+
+const now = new Date();
+const pad = (n) => String(n).padStart(2, '0');
+const fileName = `belux-${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}.log`;
+const filePath = path.join(logsDir, fileName);
+
+const transport = pino.transport({
+  targets: [
+    { target: 'pino-pretty', options: { colorize: true } },
+    { target: 'pino-pretty', options: { colorize: false, destination: filePath, mkdir: true } },
+  ],
 });
+
+const logger = pino({ level: 'info' }, transport);
 
 module.exports = logger;
 

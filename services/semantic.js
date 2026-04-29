@@ -62,11 +62,15 @@ function analyzeUserMessage(text) {
 
   const wantsLaunches = matchAny(normalized, [
     /\blancamento(s)?\b/,
+    /\blancad[oa]s?\b/,
     /\bnovidade(s)?\b/,
+    /\bnovidade(s)?.*\bontem\b/,
     /\bnovo(s)?\b/,
     /\brecem cheg/,
     /\bo que tem de novo\b/,
     /\bo que chegou\b/,
+    /\bchegou\s+ontem\b/,
+    /\bontem\b/,
     /\bultim[ao] cole/,
   ]);
 
@@ -225,6 +229,17 @@ function analyzeUserMessage(text) {
   const wantsProductSearch = matchAny(normalized, [
     /\bref\s*\d/,
     /\breferencia\s*\d/,
+    /\breposicao\b/,
+    /\brepor\b/,
+    /\bvai voltar\b/,
+    /\bvolta\b.*\bestoque\b/,
+    /\bchegar de novo\b/,
+    /\bestampa\b/,
+    /\bpersonagem\b/,
+    /\bhomem aranha\b/,
+    /\bsonic\b/,
+    /\bstitch\b/,
+    /\bhello kitty\b/,
     /\btem\b.*\bref\b/,
     /\btem\b.*\bpijama\b/,
     /\btem\b.*\bcalcinha\b/,

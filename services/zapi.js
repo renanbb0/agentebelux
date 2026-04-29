@@ -139,8 +139,9 @@ async function sendButtonList(to, message, title, footer, buttonList) {
  * @param {string} title - título da lista
  * @param {string} buttonLabel - texto do botão (max 20 chars)
  * @param {Array<{id:string, title:string, description:string}>} options - itens do menu
+ * @param {string|null} replyToMessageId - messageId da peça a citar/responder
  */
-async function sendOptionList(to, message, title, buttonLabel, options) {
+async function sendOptionList(to, message, title, buttonLabel, options, replyToMessageId = null) {
   try {
     const typingSeconds = Math.min(Math.max(Math.ceil(message.length / 80), 1), 5);
     const payload = {
@@ -153,8 +154,9 @@ async function sendOptionList(to, message, title, buttonLabel, options) {
       },
       delayMessage: typingSeconds,
     };
+    if (replyToMessageId) payload.messageId = replyToMessageId;
     const res = await zapiClient.post('/send-option-list', payload);
-    logger.info({ to, zaapId: res.data?.zaapId }, '[Z-API] sendOptionList');
+    logger.info({ to, replyTo: replyToMessageId || null, zaapId: res.data?.zaapId }, '[Z-API] sendOptionList');
     return res;
   } catch (err) {
     logger.error({ err: err.message }, '[Z-API] sendOptionList failed');
@@ -233,7 +235,7 @@ async function sendProductShowcase(phone, product, version, customButtons = null
  * @param {{ id: number, name: string, sizes: string[] }} product
  * @param {number} version
  */
-async function sendSizeList(phone, product, version, excludeSizes = [], showSkip = false) {
+async function sendSizeList(phone, product, version, excludeSizes = [], showSkip = false, replyToMessageId = null) {
   const sizeDetails = Array.isArray(product.sizeDetails) && product.sizeDetails.length > 0
     ? product.sizeDetails
     : (product.sizes || []).map((size) => ({ size, stockLabel: 'Disponível', isAvailable: true }));
@@ -286,10 +288,11 @@ async function sendSizeList(phone, product, version, excludeSizes = [], showSkip
       options,
     },
   };
+  if (replyToMessageId) payload.messageId = replyToMessageId;
 
   try {
     const res = await zapiClient.post('/send-option-list', payload);
-    logger.info({ phone, productId: product.id, excludeSizes, zaapId: res.data?.zaapId }, '[Z-API] sendSizeList');
+    logger.info({ phone, productId: product.id, replyTo: replyToMessageId || null, excludeSizes, zaapId: res.data?.zaapId }, '[Z-API] sendSizeList');
     return res;
   } catch (err) {
     logger.error({ err: err.message, productId: product.id }, '[Z-API] sendSizeList failed');
@@ -351,7 +354,7 @@ async function sendQuantityList(phone, size, version, availableQty = null, showS
  * @param {number} version - interactiveVersion anti-stale
  * @param {Array<{size, isAvailable, availableQuantity, stockLabel}>} sizeDetails
  */
-async function sendSizeQuantityList(phone, product, version, sizeDetails) {
+async function sendSizeQuantityList(phone, product, version, sizeDetails, replyToMessageId = null) {
   const PRESET_QTY = [1, 2, 3, 6, 12];
   const options = [];
 
@@ -381,10 +384,11 @@ async function sendSizeQuantityList(phone, product, version, sizeDetails) {
 
   return await sendOptionList(
     phone,
-    `Escolha o tamanho e a quantidade de *${product.name}* 😊\n_Pode digitar tamanho + quantidade (ex: 2M, 1G) ou usar o botão 👇_`,
+    `Escolha o tamanho e a quantidade de *${product.name}* 😊\n_Pode tocar em várias opções dessa lista, uma por vez. Também pode digitar tamanho + quantidade (ex: 2M, 1G)._`,
     'Tamanho e Quantidade',
     'Ver Opções',
     options,
+    replyToMessageId,
   );
 }
 
@@ -480,7 +484,7 @@ async function sendReaction(phone, messageId, reaction) {
  * @param {number} version - versão da FSM (interactiveVersion)
  * @param {string} productName
  */
-async function sendVariantOptionList(phone, attr, version, productName) {
+async function sendVariantOptionList(phone, attr, version, productName, replyToMessageId = null) {
   const options = attr.options.map((opt) => ({
     id: `variant_v${version}_${opt}`,
     title: opt,
@@ -496,10 +500,11 @@ async function sendVariantOptionList(phone, attr, version, productName) {
       options,
     },
   };
+  if (replyToMessageId) payload.messageId = replyToMessageId;
 
   try {
     const res = await zapiClient.post('/send-option-list', payload);
-    logger.info({ phone, attr: attr.name, version, zaapId: res.data?.zaapId }, '[Z-API] sendVariantOptionList');
+    logger.info({ phone, attr: attr.name, version, replyTo: replyToMessageId || null, zaapId: res.data?.zaapId }, '[Z-API] sendVariantOptionList');
     return res;
   } catch (err) {
     logger.error({ err: err.message }, '[Z-API] sendVariantOptionList failed');
@@ -561,7 +566,7 @@ async function sendVariantButtonCard(phone, product, attr, version) {
 }
 
 /**
- * Menu inicial de escolha: catálogo ou vendedora humana.
+ * Menu inicial de escolha: catálogo, fechamento ou dúvidas.
  * Enviado antes de qualquer interação com clientes novos (history vazio).
  */
 async function sendInitialGate(phone) {
@@ -572,7 +577,7 @@ async function sendInitialGate(phone) {
       buttons: [
         { id: 'btn_fechar_pedido', label: '📦 Fechar meu pedido' },
         { id: 'gate_catalog',      label: '🆕 Ver lançamentos' },
-        { id: 'gate_seller',       label: '❓ Resolver um problema' },
+        { id: 'gate_seller',       label: '❓ Dúvidas' },
       ],
     },
   };

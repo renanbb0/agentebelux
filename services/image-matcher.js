@@ -1,12 +1,17 @@
 /**
  * Image Matcher — identifica produtos do catálogo a partir de fotos enviadas pela cliente.
  *
- * Fluxo:
- *   1. describeImage(url)    → usa Gemini Vision para gerar descrição visual estruturada
- *   2. embedText(desc)       → gera embedding 768-dim com text-embedding-004
+ * Fluxo ATIVO (text embedding):
+ *   1. describeImage(url)    → Gemini Vision gera descrição visual estruturada
+ *   2. embedText(desc)       → gemini-embedding-001 gera vetor 768D via Matryoshka
  *   3. findSimilarProducts() → busca top-K no Supabase via pgvector cosine
- *   4. confirmMatch()        → Gemini Vision compara foto da cliente com top candidatos
+ *   4. confirmMatch()        → Gemini Vision compara foto do cliente com top candidatos
  *      e devolve o produto certo com nível de confiança
+ *
+ * Fluxo STANDBY (multimodal — não ativo):
+ *   Função `embedImage` disponível e validada, mas fora do hot path.
+ *   Ver comentário em MULTIMODAL_EMBEDDING_MODEL para histórico da regressão
+ *   e checklist do que falta resolver antes de reativar.
  */
 
 const { GoogleGenerativeAI, HarmCategory, HarmBlockThreshold } = require('@google/generative-ai');
@@ -18,8 +23,80 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
 
 const VISION_MODEL    = 'gemini-2.5-flash-lite';
-const EMBEDDING_MODEL = 'gemini-embedding-001';
 const EMBEDDING_DIMS  = 768;
+const VISION_CONCURRENCY = 3;
+
+let activeVisionCalls = 0;
+const visionQueue = [];
+
+async function withVisionSemaphore(fn) {
+  await new Promise((resolve) => {
+    const acquire = () => {
+      activeVisionCalls++;
+      resolve();
+    };
+
+    if (activeVisionCalls < VISION_CONCURRENCY) {
+      acquire();
+    } else {
+      visionQueue.push(acquire);
+    }
+  });
+
+  try {
+    return await fn();
+  } finally {
+    activeVisionCalls = Math.max(0, activeVisionCalls - 1);
+    const next = visionQueue.shift();
+    if (next) next();
+  }
+}
+
+function isRetryableGeminiError(err) {
+  const status = err?.response?.status;
+  const message = String(err?.message || '').toLowerCase();
+  return status === 503
+    || status === 429
+    || message.includes('503')
+    || message.includes('429')
+    || message.includes('overloaded');
+}
+
+async function withRetry503(fn, label, retries = 3) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (isRetryableGeminiError(err) && attempt < retries) {
+        const delay = attempt * 4000;
+        logger.warn(
+          { label, attempt, delay, status: err?.response?.status },
+          '[ImageMatcher] 503/429 — retry'
+        );
+        await new Promise((resolve) => setTimeout(resolve, delay));
+        continue;
+      }
+      throw err;
+    }
+  }
+  return null;
+}
+
+// ===== Pipeline ATIVO (hot path): texto (Vision → Embedding de texto) =====
+// Descreve a imagem em linguagem natural e embeda o texto — perde sinal visual fino,
+// mas compensa com riqueza semântica do DESCRIBE_PROMPT (personagens, cores, público).
+const TEXT_EMBEDDING_MODEL = 'gemini-embedding-001';
+
+// ===== Pipeline STANDBY: multimodal nativo (imagem → vetor direto) =====
+// Implementado e validado, mas desativado no hot path por regressão de precisão
+// (experimento 2026-04-20: 66% → 25% após troca). Problemas identificados:
+//   1) falta de taskType (RETRIEVAL_DOCUMENT/QUERY) na API → recall ruim
+//   2) nameHint genérico contamina cluster vetorial
+//   3) safety filter nativo do modelo bloqueia lingerie (embedContent não aceita
+//      safetySettings override como o generateContent)
+// Para reativar: trocar as chamadas em indexProduct/findSimilarProducts para embedImage.
+const MULTIMODAL_EMBEDDING_MODEL    = 'gemini-embedding-2-preview';
+const MULTIMODAL_EMBEDDING_ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models/${MULTIMODAL_EMBEDDING_MODEL}:embedContent`;
 
 // Moda íntima / pijamas são catálogo legítimo — relaxamos filtros para evitar
 // que o modelo bloqueie lingerie, sutiãs etc. como "conteúdo sexual explícito".
@@ -60,35 +137,77 @@ async function fetchImageAsBase64(imageUrl) {
 async function describeImage(imageUrl, retries = 3) {
   const model = genAI.getGenerativeModel({ model: VISION_MODEL, safetySettings: SAFETY_SETTINGS });
   const { data, mimeType } = await fetchImageAsBase64(imageUrl);
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
+
+  return withVisionSemaphore(() =>
+    withRetry503(async () => {
       const result = await model.generateContent([
         { text: DESCRIBE_PROMPT },
         { inlineData: { data, mimeType } },
       ]);
       return result.response.text().trim();
+    }, 'describeImage', retries)
+  );
+}
+
+/**
+ * [ATIVO] Gera embedding de texto via gemini-embedding-001 (768D via Matryoshka).
+ * Usa SDK @google/generative-ai.
+ */
+async function embedText(text) {
+  const model = genAI.getGenerativeModel({ model: TEXT_EMBEDDING_MODEL });
+  return withRetry503(async () => {
+    const result = await model.embedContent({
+      content: { parts: [{ text }] },
+      outputDimensionality: EMBEDDING_DIMS,
+    });
+    return result.embedding.values;
+  }, 'embedText');
+}
+
+/**
+ * [STANDBY] Embedding multimodal nativo via gemini-embedding-2-preview.
+ * Imagem (+ nameHint opcional) → vetor 768D direto, sem etapa intermediária de texto.
+ *
+ * NÃO USADO no hot path atual — ver nota no topo do arquivo sobre a regressão.
+ * Mantido testado e pronto para reativação futura (com fix de taskType).
+ *
+ * Por que REST e não SDK?
+ *   O @google/generative-ai@^0.24.0 não expõe inlineData no embedContent —
+ *   foi projetado para texto puro. REST via axios é previsível e evita upgrade.
+ *
+ * nameHint: nome do produto concatenado como part de texto — aumenta recall em
+ *   produtos com personagem/marca no título. Omitir nas queries do cliente.
+ */
+async function embedImage(imageUrl, { nameHint = null, retries = 3 } = {}) {
+  const { data, mimeType } = await fetchImageAsBase64(imageUrl);
+
+  const parts = [{ inlineData: { mimeType, data } }];
+  if (nameHint) parts.push({ text: nameHint });
+
+  const body = {
+    model: `models/${MULTIMODAL_EMBEDDING_MODEL}`,
+    content: { parts },
+    outputDimensionality: EMBEDDING_DIMS,
+  };
+  const url = `${MULTIMODAL_EMBEDDING_ENDPOINT}?key=${process.env.GEMINI_API_KEY}`;
+
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const res = await axios.post(url, body, { timeout: 30_000 });
+      return res.data.embedding.values;
     } catch (err) {
-      const is503 = err.message?.includes('503') || err.message?.includes('overloaded');
-      if (is503 && attempt < retries) {
+      const status = err.response?.status;
+      const is503or429 = status === 503 || status === 429 || err.message?.includes('503') || err.message?.includes('overloaded');
+      if (is503or429 && attempt < retries) {
         const delay = attempt * 4000;
-        logger.warn({ attempt, delay }, '[ImageMatcher] 503 — aguardando antes de retry');
+        logger.warn({ attempt, delay, status }, '[ImageMatcher] embedImage — aguardando antes de retry');
         await new Promise((r) => setTimeout(r, delay));
         continue;
       }
+      logger.error({ err: err.response?.data || err.message, attempt }, '[ImageMatcher] embedImage falhou');
       throw err;
     }
   }
-}
-
-async function embedText(text) {
-  const model = genAI.getGenerativeModel({ model: EMBEDDING_MODEL });
-  // gemini-embedding-001 retorna 3072 dims por padrão; truncamos para 768 via
-  // outputDimensionality (Matryoshka) para caber no limite do HNSW do pgvector (2000).
-  const result = await model.embedContent({
-    content: { parts: [{ text }] },
-    outputDimensionality: EMBEDDING_DIMS,
-  });
-  return result.embedding.values;
 }
 
 /**
@@ -101,6 +220,8 @@ async function indexProduct(product) {
     return null;
   }
 
+  // Pipeline text-only: descreve a imagem → embeda o texto.
+  // O nome do produto entra na string embedada como reforço (personagem/marca no título).
   const description = await describeImage(product.imageUrl);
   const embedding   = await embedText(`${product.name}\n${description}`);
 
@@ -123,9 +244,43 @@ async function indexProduct(product) {
 }
 
 /**
+ * Busca semântica via texto livre — embeda a query e roda o mesmo RPC
+ * `match_products` usado pela busca por imagem. Útil como fallback quando
+ * `woocommerce.searchProducts(query)` retorna 0 (nome do produto não tem
+ * a palavra-chave que o cliente usou, ex: "sonic" em "Pijama Masculino - Ref 672S").
+ *
+ * @param {string} query
+ * @param {number} topK
+ * @param {number} minScore - score mínimo (0..1) pra aceitar match — default 0.55
+ * @returns {Promise<{candidates: Array<{product_id, name, image_url, price, score}>}>}
+ */
+async function searchByText(query, topK = 8, minScore = 0.55) {
+  if (!query || typeof query !== 'string') return { candidates: [] };
+
+  const embedding = await embedText(query);
+  const { data, error } = await supabase.rpc('match_products', {
+    query_embedding: embedding,
+    match_count:     topK,
+  });
+
+  if (error) {
+    logger.error({ query, err: error.message }, '[ImageMatcher] searchByText RPC falhou');
+    throw error;
+  }
+
+  const candidates = (data || []).filter((c) => (c.score ?? c.similarity ?? 0) >= minScore);
+  logger.info(
+    { query, matched: candidates.length, total: data?.length || 0 },
+    '[ImageMatcher] searchByText'
+  );
+  return { candidates };
+}
+
+/**
  * Busca os top-K produtos mais similares a uma foto recebida.
  */
 async function findSimilarProducts(clientImageUrl, topK = 3) {
+  // Pipeline text-only: descreve a foto do cliente → embeda o texto → busca vetorial.
   const description = await describeImage(clientImageUrl);
   const embedding   = await embedText(description);
 
@@ -180,7 +335,9 @@ FOTO DO CLIENTE:` },
 
   parts.push({ text: '\nResponda só o JSON, sem markdown.' });
 
-  const result = await model.generateContent(parts);
+  const result = await withVisionSemaphore(() =>
+    withRetry503(() => model.generateContent(parts), 'confirmMatch')
+  );
   const raw = result.response.text().trim().replace(/^```json\s*|\s*```$/g, '');
 
   try {
@@ -286,6 +443,7 @@ module.exports = {
   removeProduct,
   listIndexedIds,
   findSimilarProducts,
+  searchByText,
   confirmMatch,
   matchProductFromImage,
   describeImage,

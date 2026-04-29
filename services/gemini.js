@@ -111,6 +111,8 @@ REGRAS CRÍTICAS — NUNCA VIOLE:
 12. MENSAGENS DE LOADING: O sistema exibe automaticamente as mensagens de carregamento ("Fica comigo um instantinho...", etc.). NUNCA escreva frases de loading manual como "estou buscando...", "aguarde...", "um momento...". O catálogo aparece sozinho — sua função é reagir depois que ele aparecer.
 13. GRADE POR TEXTO vs GRADE POR BOTÃO: Se o lojista enviou tamanho e quantidade por texto corrido (ex: "coloca 3P e 2M desse"), o produto está FECHADO. Não ofereça "quer adicionar mais tamanhos?". Só faça essa pergunta se ele escolheu via botão interativo do menu.
 14. NUNCA AFIRME TER MOSTRADO ALGO QUE VOCÊ NÃO MOSTROU. Os campos "Preferencias detectadas" e "Termos que o cliente citou" do contexto são regex sobre a FALA DO CLIENTE — eles não são prova de que você já exibiu aquela linha. Só afirme "já te mostrei X" se o turno correspondente estiver visível no histórico ativo com um token [VER:*] que você emitiu. Em caso de dúvida, pergunte: "quer que eu puxe a linha masculina agora?" em vez de dizer "já te mostrei".
+15. NUNCA "ANOTE" SEM TOKEN. Dizer "já anotei", "adicionei", "tá no carrinho", "ajustei aqui" SEM emitir [TAMANHO], [QUANTIDADE] ou [COMPRAR_DIRETO] é MENTIRA para o lojista — o item nunca entra no carrinho real e o fechamento vai falhar com "carrinho vazio". Regra inviolável: se você entendeu o tamanho e a quantidade, EMITA o token. Se não conseguir (esquema não cobre, ambiguidade, múltiplas variantes num turno só), PERGUNTE UMA COISA POR VEZ em vez de confirmar no vazio.
+16. MÚLTIPLOS ITENS NUM TURNO (ex: "M mãe e M filha", "quero 2P desse e 1G daquele"): você só pode emitir UM token por resposta. Comprometa-se com o primeiro ("Separei a mãe M 😊 [VARIANTE:Mãe]" — e no próximo turno o sistema pede a variante seguinte), OU pergunte qual dos dois começar. NUNCA escreva "anotei ambos" / "ajustei os dois" quando só um token cabe por turno — isso é o bug #Cíntia-2026-04-23.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
 COMO O SISTEMA FUNCIONA AO SEU REDOR
@@ -176,7 +178,7 @@ Adicione NO MÁXIMO UM token, sempre ao final da resposta, em linha isolada.
 | [PROXIMOS]              | Ver próxima página de produtos |
 | [FOTOS:N]               | Mostrar imagens do Produto número N da lista |
 | [SELECIONAR:N]          | Lojista QUER esse modelo N para ver tamanho |
-| [VARIANTE:X]            | Lojista escolheu a variante do produto (ex: [VARIANTE:Mãe] ou [VARIANTE:Filha]). Só use quando a etapa for awaiting_variant |
+| [VARIANTE:X]            | Lojista escolheu a variante do produto (ex: [VARIANTE:Mãe] ou [VARIANTE:Filha]). Só use quando a etapa for awaiting_variant. Se o cliente pediu AS DUAS na mesma mensagem ("M mãe e M filha"), comprometa-se com UMA agora — o sistema abre a próxima variante no turno seguinte. |
 | [TAMANHO:N]             | Lojista escolheu tamanho — N pode ser índice (ex: [TAMANHO:2]) ou nome (ex: [TAMANHO:G]) |
 | [QUANTIDADE:N]           | Lojista informou quantidade durante compra (ex: [QUANTIDADE:3]). Só use quando a etapa for awaiting_quantity |
 | [CARRINHO]              | Ver resumo |
@@ -198,9 +200,11 @@ REGRAS DE SEQUENCIAMENTO — MÚLTIPLAS CATEGORIAS:
  * Sanitizes the AI response — removes <think> blocks and any leaked action tokens.
  */
 function sanitizeVisible(text) {
-  return text
+  return String(text || '')
     .replace(/<think>[\s\S]*?<\/think>/gi, '')
     .replace(/<think>[\s\S]*/gi, '')
+    .replace(/^\s*think\s*[\r\n]+[\s\S]*?(?:resposta\s+final\s*:|resposta\s+vis[íi]vel\s*:|mensagem\s+final\s*:)\s*/i, '')
+    .replace(/^\s*think\s*[\r\n]+[\s\S]*/i, '')
     .replace(/\[VER_TODOS[_:]?[^\]]*\]/gi, '')
     .replace(/\[VER[_:]?[^\]]*\]/gi, '')
     .replace(/\[BUSCAR[^\]]*\]/gi, '')
@@ -227,6 +231,10 @@ function sanitizeVisible(text) {
  * - 'system' → merged as 'user' (Gemini doesn't support system role in history)
  * - Consecutive same-role messages are merged to maintain alternation.
  *
+ * Aceita opcionalmente `msg.imageParts: Array<{data, mimeType}>` para anexar
+ * imagens à mensagem do usuário (multimodal). Quando presente, as imagens
+ * viram `inlineData` parts adicionais após o texto.
+ *
  * CRITICAL: Gemini API requires the first message in history to have role='user'.
  * If the bot sent a proactive greeting (e.g. inactivity follow-up), the history
  * may start with role='model'. We drop leading 'model' entries until we find
@@ -239,11 +247,22 @@ function toGeminiHistory(history) {
   for (const msg of history) {
     const role = msg.role === 'assistant' ? 'model' : 'user';
     const text = msg.content;
+    const hasImages = Array.isArray(msg.imageParts) && msg.imageParts.length > 0;
 
-    if (converted.length > 0 && converted[converted.length - 1].role === role) {
+    if (converted.length > 0 && converted[converted.length - 1].role === role && !hasImages) {
+      // Mensagens consecutivas do mesmo role são concatenadas — mas só
+      // quando a nova não traz imagens (senão perderíamos o binding texto↔imagem).
       converted[converted.length - 1].parts[0].text += '\n' + text;
     } else {
-      converted.push({ role, parts: [{ text }] });
+      const parts = [{ text }];
+      if (hasImages) {
+        for (const img of msg.imageParts) {
+          if (img?.data && img?.mimeType) {
+            parts.push({ inlineData: { data: img.data, mimeType: img.mimeType } });
+          }
+        }
+      }
+      converted.push({ role, parts });
     }
   }
 
@@ -265,26 +284,108 @@ function toGeminiHistory(history) {
 }
 
 /**
- * Sends the full conversation history to Gemini and returns the raw response text.
+ * Schema JSON forçado no modo composto — a Bela DEVE retornar exatamente
+ * estes campos (validado pelo responseSchema nativo do Gemini).
  */
-async function chat(history, catalogContext, nudge = null) {
+const COMPOUND_RESPONSE_SCHEMA = {
+  type: 'object',
+  properties: {
+    visibleMessage: {
+      type: 'string',
+      description: 'Mensagem humana em português BR enviada ao cliente no WhatsApp.',
+    },
+    confirmarGrade: {
+      type: 'object',
+      nullable: true,
+      description: 'Preenchido apenas quando a grade está pronta para confirmar. Null se houver dúvida ou precisar de mais info.',
+      properties: {
+        items: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              productId: { type: 'number' },
+              name: { type: 'string' },
+              grade: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: {
+                    size: { type: 'string' },
+                    qty:  { type: 'number' },
+                  },
+                  required: ['size', 'qty'],
+                },
+              },
+            },
+            required: ['productId', 'name', 'grade'],
+          },
+        },
+        totalPieces: { type: 'number' },
+      },
+      required: ['items', 'totalPieces'],
+    },
+    needsClarification: {
+      type: 'string',
+      nullable: true,
+      description: 'Preenchido quando a Bela precisa perguntar algo ao cliente antes de executar. Se presente, confirmarGrade deve ser null.',
+    },
+  },
+  required: ['visibleMessage'],
+};
+
+/**
+ * Monta a configuração do Gemini para o turno corrente. No modo composto
+ * (detecção multimodal + N fotos + texto de grade composta), ativa thinking
+ * budget maior e structured output via responseSchema. Nos demais turnos,
+ * mantém a config legada (temperatura 0.85 criativa, texto livre).
+ */
+function buildGenerationConfig(options = {}) {
+  if (options.compoundMode) {
+    return {
+      temperature: 0.6,        // mais baixa: raciocínio composto precisa ser literal
+      maxOutputTokens: 1500,
+      thinkingConfig: {
+        thinkingBudget: 2048,
+        includeThoughts: false,
+      },
+      responseMimeType: 'application/json',
+      responseSchema: COMPOUND_RESPONSE_SCHEMA,
+    };
+  }
+  return {
+    temperature: 0.85,
+    maxOutputTokens: 800,
+  };
+}
+
+/**
+ * Sends the full conversation history to Gemini and returns the raw response text.
+ *
+ * @param {Array<{role, content, imageParts?}>} history
+ * @param {string} catalogContext
+ * @param {string|null} nudge - comando prioritário injetado acima do system prompt
+ * @param {{compoundMode?:boolean, extraContext?:string, images?:Array<{data,mimeType}>}} [options]
+ */
+async function chat(history, catalogContext, nudge = null, options = {}) {
   const nudgeBlock = nudge ? `\n\n━━━━━━━━━━━━━━━━━━━━━━━━\nCOMANDO DE SISTEMA PRIORITÁRIO\n━━━━━━━━━━━━━━━━━━━━━━━━\n${nudge}\n\n` : '';
   const active = await learnings.getActive();
   const learningsBlock = active.length > 0
     ? `\n\n━━━━━━━━━━━━━━━━━━━━━━━━\nAPRENDIZADOS DE CONVERSAS REAIS\n━━━━━━━━━━━━━━━━━━━━━━━━\n${active.map((l, i) => `${i + 1}. ${l}`).join('\n')}`
     : '';
 
+  const extraBlock = options.extraContext
+    ? `\n\n━━━━━━━━━━━━━━━━━━━━━━━━\nCONTEXTO EXTRA DO TURNO\n━━━━━━━━━━━━━━━━━━━━━━━━\n${options.extraContext}`
+    : '';
+
   const systemContent = catalogContext
-    ? `${nudgeBlock}${SYSTEM_PROMPT}${learningsBlock}\n\nCONTEXTO DA SESSAO:\n${catalogContext}`
-    : `${nudgeBlock}${SYSTEM_PROMPT}${learningsBlock}`;
+    ? `${nudgeBlock}${SYSTEM_PROMPT}${learningsBlock}${extraBlock}\n\nCONTEXTO DA SESSAO:\n${catalogContext}`
+    : `${nudgeBlock}${SYSTEM_PROMPT}${learningsBlock}${extraBlock}`;
 
   const model = genAI.getGenerativeModel({
-    model: 'gemini-3.1-flash-lite-preview',
+    model: 'gemini-2.5-flash',
     systemInstruction: { parts: [{ text: systemContent }] },
-    generationConfig: {
-      temperature: 0.85,     // mais calor humano — reduz tom "seco" do lite
-      maxOutputTokens: 800,
-    },
+    generationConfig: buildGenerationConfig(options),
   });
 
   // All messages except the last go into history; last is sent as the new turn
@@ -292,11 +393,36 @@ async function chat(history, catalogContext, nudge = null) {
   const lastMsg = history[history.length - 1];
 
   const chatSession = model.startChat({ history: geminiHistory });
-  const result = await chatSession.sendMessage(lastMsg.content);
+
+  // Se houver imagens anexadas ao turno, envia parts (texto + inlineData).
+  // Caso contrário, mantém a chamada legada com string (backward-compat).
+  const hasImages = Array.isArray(options.images) && options.images.length > 0;
+  const sendMsg = () => hasImages
+    ? chatSession.sendMessage([
+        { text: lastMsg.content },
+        ...options.images.map(img => ({ inlineData: { data: img.data, mimeType: img.mimeType } })),
+      ])
+    : chatSession.sendMessage(lastMsg.content);
+
+  // Retry automático em 503 (modelo sobrecarregado): 2 tentativas extras, 1.5s entre cada
+  let result;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      result = await sendMsg();
+      break;
+    } catch (err) {
+      const is503 = err?.message?.includes('503') || err?.message?.includes('Service Unavailable');
+      if (is503 && attempt < 3) {
+        await new Promise(r => setTimeout(r, 1500));
+        continue;
+      }
+      throw err;
+    }
+  }
 
   const raw = result.response.text().trim();
 
-  // Extrai e loga o raciocínio interno
+  // Extrai e loga o raciocínio interno (modo legado com <think>)
   const thinkMatch = raw.match(/<think>([\s\S]*?)<\/think>/i);
   if (thinkMatch) {
     const logger = require('./logger');
@@ -360,4 +486,83 @@ function parseAction(text) {
   return { cleanText: sanitizeVisible(text), action: null };
 }
 
-module.exports = { chat, parseAction, toGeminiHistory };
+/**
+ * Formata um resumo de pedido B2B "Fechar Pedido" em Markdown WhatsApp-ready
+ * para a vendedora. Stateless (não reusa SYSTEM_PROMPT da Bela).
+ *
+ * Retorna o texto formatado OU null se:
+ *   - chamada falhou / timeout (8s)
+ *   - guardrail detectou que o total PIX do texto não bate com o calculado
+ *
+ * Caller deve fazer fallback pro formato hard-coded em caso de null.
+ */
+async function formatOrderSummaryForSeller({ matchedProducts, orphanTexts = [], customerName, totalPix }) {
+  const items = (matchedProducts || []).map((m, i) => ({
+    idx: i + 1,
+    productId: m.productId,
+    name: m.name,
+    caption: m.caption || null,
+    price: parseFloat(m.price) || 0,
+    uncertain: !!m.uncertain,
+    confidence: Math.round((m.confidence || 0) * 100),
+  }));
+
+  const expectedTotal = `R$ ${totalPix.toFixed(2).replace('.', ',')}`;
+
+  const prompt = `Você é um formatador de resumo de pedido B2B atacado. Gere um texto CLARO, ORGANIZADO e BEM DIAGRAMADO pra VENDEDORA separar o pedido no estoque.
+
+REGRAS DE FORMATO:
+- Comece com: 🛒 *CARRINHO IDENTIFICADO (IA)*
+- Use Markdown do WhatsApp (*negrito*, _itálico_).
+- Cada item em bloco próprio (linhas separadas):
+  • Número sequencial + #productId + nome do produto
+  • Grade de tamanhos NORMALIZADA numa linha só (ex: "2M · 3G · 3P" — sem \\n, sem repetições, letras maiúsculas)
+  • Quantidade total ×N + Preço total PIX + confiança IA em %
+- Itens uncertain: mantém na lista mas marca "⚠️ CONFIRMAR" no fim da linha.
+- Rodapé: *💰 Total no PIX:* ${expectedTotal}
+- Se houver textos órfãos, bloco separado no fim: "⚠️ *TEXTOS NÃO PAREADOS:*" com cada texto em uma linha (• "texto").
+
+REGRAS DE CÁLCULO:
+- Quantidade: some os números antes de cada letra da caption. Ex: "3m 2g" = 5. "2m 1g 2p" = 5.
+- Preço PIX unitário = price × 0.90.
+- Preço PIX total = pixUnit × qty.
+- NÃO invente produtos, NÃO some errado. Use SÓ os dados recebidos.
+- O total do rodapé DEVE ser EXATAMENTE ${expectedTotal} (já calculado).
+
+DADOS:
+Cliente: ${customerName || 'não informado'}
+Itens: ${JSON.stringify(items, null, 2)}
+Textos órfãos: ${JSON.stringify(orphanTexts)}
+
+Retorne APENAS o texto final, pronto pra WhatsApp.`;
+
+  const model = genAI.getGenerativeModel({
+    model: 'gemini-2.5-flash',
+    generationConfig: { temperature: 0.3, maxOutputTokens: 1500 },
+  });
+
+  const timeoutPromise = new Promise((_, rej) =>
+    setTimeout(() => rej(new Error('gemini-summary-timeout')), 8000));
+  const callPromise = model.generateContent(prompt).then((r) => r.response.text().trim());
+
+  const logger = require('./logger');
+  let text;
+  try {
+    text = await Promise.race([callPromise, timeoutPromise]);
+  } catch (err) {
+    logger.warn({ err: err.message }, '[Gemini] formatOrderSummaryForSeller falhou');
+    return null;
+  }
+
+  if (!text || !text.includes(expectedTotal)) {
+    logger.warn(
+      { expectedTotal, textHead: text?.slice(0, 200) },
+      '[Gemini] formatOrderSummaryForSeller — total esperado ausente, caller deve usar fallback',
+    );
+    return null;
+  }
+
+  return text;
+}
+
+module.exports = { chat, parseAction, toGeminiHistory, formatOrderSummaryForSeller };
