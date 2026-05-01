@@ -7,6 +7,9 @@
     "start": "node index.js",
     "dev": "node --watch index.js",
     "test": "node tests/tts.test.js",
+    "test:all": "node scripts/run-all-tests.js",
+    "smoke": "node scripts/smoke-boot.js",
+    "replay": "node scripts/replay-webhook.js",
     "monitor": "node .agent/scripts/monitor_tempo_real.js",
     "relatorio": "node .agent/scripts/extrator_dados_producao.js"
   },
