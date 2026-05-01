@@ -54,6 +54,116 @@ const MAX_HISTORY_MESSAGES = parseInt(process.env.MAX_HISTORY_MESSAGES || '80', 
 const CONTEXT_WINDOW_MS = parseInt(process.env.CONTEXT_WINDOW_MS || String(20 * 60 * 1000), 10);
 const INACTIVITY_GREETING_MS = parseInt(process.env.INACTIVITY_GREETING_MS || String(20 * 60 * 1000), 10);
 const CATALOG_RESOLVER_ENABLED = String(process.env.CATALOG_RESOLVER_ENABLED || '').toLowerCase() !== 'false';
+
+// -- Manual Bela pause helpers --
+const HUMAN_PAUSE_MODES = new Set(['human_pending', 'manual_human_pause']);
+
+function digitsOnly(value) {
+  return String(value || '').replace(/\D/g, '');
+}
+
+function normalizeWhatsAppPhone(value) {
+  let digits = digitsOnly(value);
+  if (!digits) return null;
+
+  while (digits.startsWith('00')) digits = digits.slice(2);
+  while (digits.startsWith('0')) digits = digits.slice(1);
+
+  if (digits.length === 10 || digits.length === 11) {
+    digits = `55${digits}`;
+  }
+
+  if (digits.length < 12 || digits.length > 15) return null;
+  return digits;
+}
+
+function isAdminPhone(phone) {
+  const normalized = normalizeWhatsAppPhone(phone);
+  if (!normalized) return false;
+  return ADMIN_PHONES.some((adminPhone) => normalizeWhatsAppPhone(adminPhone) === normalized);
+}
+
+function parseBelaPauseCommand(text) {
+  const raw = String(text || '').trim();
+  const match = raw.match(/^(pausar|ativar|reativar)\s+bela\s+(.+)$/i);
+  if (!match) return null;
+
+  const targetPhone = normalizeWhatsAppPhone(match[2]);
+  if (!targetPhone) return null;
+
+  return {
+    action: match[1].toLowerCase() === 'pausar' ? 'pause' : 'resume',
+    targetPhone,
+  };
+}
+
+function parseTrackingCommand(text) {
+  const raw = String(text || '').trim();
+  if (!raw) return null;
+
+  let body = raw;
+  let isSlash = false;
+
+  const slashMatch = raw.match(/^\/rastreio\b\s*(.*)$/i);
+  if (slashMatch) {
+    isSlash = true;
+    body = slashMatch[1].trim();
+    if (!body) return null;
+  } else if (!/\b(rastreio|rastrear)\b/i.test(raw)) {
+    return null;
+  }
+
+  const phoneMatch = body.match(/(\+?\d[\d\s().-]{8,})/);
+  if (!phoneMatch) return isSlash ? { error: 'invalid_phone' } : null;
+
+  const targetPhone = normalizeWhatsAppPhone(phoneMatch[0]);
+  if (!targetPhone) return { error: 'invalid_phone' };
+
+  // Código de rastreio: último token alfanumérico (pode ter "-") com pelo menos
+  // um dígito e 5+ caracteres alfanuméricos. Exige dígito para evitar capturar
+  // palavras como "codigo", "para", "envia" etc.
+  const afterPhone = body.slice(phoneMatch.index + phoneMatch[0].length);
+  const tokens = afterPhone.match(/[A-Z0-9][A-Z0-9-]*/gi) || [];
+  const codeCandidate = tokens
+    .reverse()
+    .find((t) => /\d/.test(t) && t.replace(/-/g, '').length >= 5);
+
+  if (!codeCandidate) return isSlash ? { error: 'invalid_code' } : null;
+
+  const trackingCode = codeCandidate.toUpperCase();
+  return { targetPhone, trackingCode };
+}
+
+function isBotSuspendedForHuman(session) {
+  return HUMAN_PAUSE_MODES.has(session?.supportMode);
+}
+
+function shouldSkipBotAutomation(session) {
+  return isBotSuspendedForHuman(session);
+}
+
+function isHumanPauseResumeIntent(analysis, text = '') {
+  const normalizedText = String(text || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/_/g, ' ');
+
+  return Boolean(
+    analysis?.wantsBrowse
+    || analysis?.wantsLaunches
+    || analysis?.wantsMoreProducts
+    || analysis?.wantsProductSelection
+    || analysis?.wantsCheckout
+    || analysis?.wantsPhotosExplicit
+    || analysis?.wantsSize
+    || analysis?.wantsQuantity
+    || analysis?.wantsProductSearch
+    || analysis?.categories?.length > 0
+    || /\b(catalogo|lancamentos?|novidades?|pecas?|produtos?|modelos?|vitrine|fechar pedido|fazer pedido|continuar vendo|ver mais)\b/i.test(normalizedText)
+  );
+}
+// -- End Manual Bela pause helpers --
 // ── Grade Parser ─────────────────────────────────────────────────────────
 
 const WORD_TO_NUM_COMPOUND = {
@@ -270,6 +380,94 @@ function parseGradeText(text, knownSizes) {
 }
 
 // ── Sessions ──────────────────────────────────────────────────────────────
+const inboundTextDebounceBuffer = new Map();
+const INBOUND_TEXT_DEBOUNCE_MS = parseInt(process.env.INBOUND_TEXT_DEBOUNCE_MS || '2500', 10);
+
+function shouldDebounceInboundText(body, text) {
+  const value = String(text || '').trim();
+  if (!value) return false;
+  if (body?.image?.imageUrl) return false;
+  if (body?.listResponseMessage || body?.buttonsResponseMessage) return false;
+  if (body?.quotedMessage || body?.referenceMessageId) return false;
+  if (/^\[(?:audio|audio_stt|sticker)\]$/i.test(value.normalize('NFD').replace(/[\u0300-\u036f]/g, ''))) return false;
+  if (/^(CART_VIEW|CART_REMOVE_ITEM|CART_FINALIZE|FALAR_ATENDENTE|BTN_FECHAR_PEDIDO|BUSCAR_PRODUTO_MENU|VER_TODOS_CATEGORIA)$/i.test(value)) return false;
+  if (value.includes('CONTA EM TRIAL') || value.includes('MENSAGEM DE TESTE')) return false;
+  return true;
+}
+
+function formatBufferedInboundMessages(messages) {
+  const texts = (messages || [])
+    .map(entry => String(entry?.text || '').trim())
+    .filter(Boolean);
+
+  if (texts.length <= 1) return texts[0] || '';
+
+  return [
+    `Cliente enviou ${texts.length} mensagens em sequencia. Leia como uma unica fala e responda ao pedido completo, sem responder item por item:`,
+    ...texts.map(text => `- ${text}`),
+  ].join('\n');
+}
+
+function enqueueInboundTextDebounce(phone, body, text, opts = {}) {
+  const bufferMap = opts.bufferMap || inboundTextDebounceBuffer;
+  const debounceMs = Number.isFinite(opts.debounceMs) ? opts.debounceMs : INBOUND_TEXT_DEBOUNCE_MS;
+  const setTimer = opts.setTimeout || setTimeout;
+  const clearTimer = opts.clearTimeout || clearTimeout;
+
+  const message = {
+    body,
+    text: String(text || '').trim(),
+    messageId: body?.messageId || null,
+    ts: Date.now(),
+  };
+
+  const existing = bufferMap.get(phone);
+  if (existing) {
+    existing.messages.push(message);
+    clearTimer(existing.timer);
+    existing.timer = setTimer(() => {
+      bufferMap.delete(phone);
+      existing.resolve(buildInboundTextFlush(existing.messages));
+    }, debounceMs);
+    return null;
+  }
+
+  let resolveFlush;
+  const firstFlush = new Promise(resolve => {
+    resolveFlush = resolve;
+  });
+
+  const entry = {
+    messages: [message],
+    resolve: resolveFlush,
+    timer: null,
+  };
+
+  entry.timer = setTimer(() => {
+    bufferMap.delete(phone);
+    resolveFlush(buildInboundTextFlush(entry.messages));
+  }, debounceMs);
+
+  bufferMap.set(phone, entry);
+  return firstFlush;
+}
+
+function buildInboundTextFlush(messages) {
+  const last = messages[messages.length - 1] || {};
+  const text = formatBufferedInboundMessages(messages);
+  const body = JSON.parse(JSON.stringify(last.body || {}));
+  body.text = { ...(body.text || {}), message: text };
+
+  return {
+    body,
+    text,
+    messageId: last.messageId || null,
+    messageIds: messages.map(entry => entry.messageId).filter(Boolean),
+    messages,
+  };
+}
+
+// -- Sessions
 const sessions = {};
 const sessionLoadLocks = new Map();
 const persistQueues = new Map();
@@ -867,6 +1065,87 @@ async function cancelCurrentFlow(phone, session, userText = null) {
   await sendCategoryMenu(phone, 'Quer ver alguma linha específica?');
 }
 
+async function handleBelaPauseAdminCommand(adminPhone, text) {
+  const command = parseBelaPauseCommand(text);
+  if (!command) return false;
+
+  if (!isAdminPhone(adminPhone)) {
+    logger.warn({ adminPhone }, '[ManualPause] Comando PAUSAR/ATIVAR BELA ignorado: remetente nao autorizado');
+    return false;
+  }
+
+  const session = await getSession(command.targetPhone);
+
+  if (command.action === 'pause') {
+    if (session.purchaseFlow) {
+      session.purchaseFlow.buyQueue = [];
+    }
+    resetPurchaseFlow(session);
+    session.supportMode = 'manual_human_pause';
+    session.greetingNotified = true;
+    await zapi.sendText(adminPhone, `Bela pausada para wa.me/${command.targetPhone}.`);
+    logger.info({ adminPhone, targetPhone: command.targetPhone }, '[ManualPause] Bela pausada por comando da atendente');
+  } else {
+    clearSupportMode(session, 'manual_bela_resume');
+    session.greetingNotified = false;
+    await zapi.sendText(adminPhone, `Bela reativada para wa.me/${command.targetPhone}.`);
+    logger.info({ adminPhone, targetPhone: command.targetPhone }, '[ManualPause] Bela reativada por comando da atendente');
+  }
+
+  persistSession(command.targetPhone);
+  return true;
+}
+
+async function handleTrackingAdminCommand(adminPhone, text) {
+  const command = parseTrackingCommand(text);
+  if (!command) return false;
+
+  if (!isAdminPhone(adminPhone)) {
+    logger.warn({ adminPhone }, '[TrackingAdmin] Comando ignorado: remetente nao autorizado');
+    return false;
+  }
+
+  if (command.error === 'invalid_phone') {
+    await zapi.sendText(adminPhone, 'Não consegui identificar o telefone do cliente. Use: /rastreio <telefone> <codigo>');
+    return true;
+  }
+  if (command.error === 'invalid_code') {
+    await zapi.sendText(adminPhone, 'Código de rastreio parece inválido. Use: /rastreio <telefone> <codigo>');
+    return true;
+  }
+
+  const message =
+    `Olá!\n` +
+    `Seu pedido *BELUX MODA INTIMA* acabou de ser enviado! 📦✨\n\n` +
+    `Agora é só aguardar que ele está a caminho:\n\n` +
+    `🔎 *Código de rastreio:* ${command.trackingCode}\n\n` +
+    `Qualquer dúvida, é só chamar.\n` +
+    `Até mais!`;
+
+  try {
+    await zapi.sendText(command.targetPhone, message);
+    await zapi.sendText(
+      adminPhone,
+      `Rastreio enviado para wa.me/${command.targetPhone} ✅\nCódigo: ${command.trackingCode}`,
+    );
+    logger.info(
+      { adminPhone, targetPhone: command.targetPhone, trackingCode: command.trackingCode },
+      '[TrackingAdmin] Rastreio enviado para cliente',
+    );
+  } catch (err) {
+    logger.error(
+      { err, adminPhone, targetPhone: command.targetPhone },
+      '[TrackingAdmin] Falha ao enviar rastreio',
+    );
+    await zapi.sendText(
+      adminPhone,
+      `Não consegui enviar o rastreio para wa.me/${command.targetPhone}. Tente novamente.`,
+    );
+  }
+
+  return true;
+}
+
 async function getSession(phone) {
   if (sessions[phone]) {
     sessions[phone].previousLastActivity = sessions[phone].lastActivity || null;
@@ -981,7 +1260,13 @@ function persistSession(phone) {
   const next = previous
     .catch(() => {})
     .then(() => db.upsertSession(phone, session))
-    .catch(err => logger.error({ err: err.message }, '[Supabase] upsertSession'));
+    .catch(err => logger.error({
+      err: err.message,
+      cause: err.cause?.message,
+      code: err.cause?.code,
+      details: err.cause?.details,
+      hint: err.cause?.hint,
+    }, '[Supabase] upsertSession'));
 
   persistQueues.set(phone, next);
   next.finally(() => {
@@ -1032,6 +1317,7 @@ const CART_ABANDON_MS = 2 * 60 * 60 * 1000; // 2 horas sem interação
 setInterval(async () => {
   const now = Date.now();
   for (const [phone, session] of Object.entries(sessions)) {
+    if (shouldSkipBotAutomation(session)) continue;
     if (
       session.items?.length > 0 &&
       !session.cartNotified &&
@@ -1056,6 +1342,7 @@ setInterval(async () => {
 setInterval(async () => {
   const now = Date.now();
   for (const [phone, session] of Object.entries(sessions)) {
+    if (shouldSkipBotAutomation(session)) continue;
     if (session.greetingNotified) continue;
     if (now - session.lastActivity < INACTIVITY_GREETING_MS) continue;
     // Não duplicar com cart recovery (tem mensagem própria)
@@ -1219,7 +1506,7 @@ app.post('/webhook', async (req, res) => {
 
   let from = '';
   try {
-    const body = req.body;
+    let body = req.body;
     logger.info({ body }, '[Webhook] Evento recebido');
     from = body?.phone || '';
     if (!from) return;
@@ -1244,7 +1531,7 @@ app.post('/webhook', async (req, res) => {
     }
     // ────────────────────────────────────────────────────────────────────
 
-    const messageId = body?.messageId;
+    let messageId = body?.messageId;
 
     // ── Deduplicação de eventos duplicados (ADR-034) ──────────────────────
     // Z-API reenvia webhooks em caso de timeout. Sem isso, a mesma mensagem
@@ -1307,6 +1594,15 @@ app.post('/webhook', async (req, res) => {
       text = ''; // foto sem caption: segue o fluxo com texto vazio
     }
 
+    if (text === '[Áudio]' || text === '[Sticker]') {
+      const mediaSession = await getSession(from);
+      if (shouldSkipBotAutomation(mediaSession)) {
+        logger.info({ from, supportMode: mediaSession.supportMode }, '[ManualPause] Bot suspenso - midia ignorada');
+        persistSession(from);
+        return;
+      }
+    }
+
     // Fallbacks de áudio/sticker que NÃO precisam de sessão (respondem direto)
     if (text === '[Áudio]') {
       logger.info({ from }, '[Intercept] Áudio recebido — fallback humano');
@@ -1320,8 +1616,31 @@ app.post('/webhook', async (req, res) => {
 
     if (text.includes('CONTA EM TRIAL') || text.includes('MENSAGEM DE TESTE')) return;
 
+    if (await handleBelaPauseAdminCommand(from, text)) return;
+    if (await handleTrackingAdminCommand(from, text)) return;
+
+    let bufferedMessageIds = null;
+    if (shouldDebounceInboundText(body, text)) {
+      const buffered = await enqueueInboundTextDebounce(from, body, text);
+      if (!buffered) {
+        logger.info({ phone: from, text }, '[MSG] Aguardando possivel complemento do cliente');
+        if (messageId) zapi.readMessage(from, messageId);
+        return;
+      }
+
+      body = buffered.body;
+      text = buffered.text;
+      messageId = buffered.messageId;
+      bufferedMessageIds = buffered.messageIds;
+      logger.info(
+        { phone: from, count: buffered.messages.length, messageIds: buffered.messageIds },
+        '[MSG] Rajada de texto agrupada antes da IA'
+      );
+    }
+
     logger.info({ phone: from, text }, '[MSG] Received');
-    if (messageId) zapi.readMessage(from, messageId);
+    const readMessageIds = bufferedMessageIds || (messageId ? [messageId] : []);
+    for (const id of readMessageIds) zapi.readMessage(from, id);
 
     // ── Per-phone serialization ────────────────────────────────────────────────
     // Serializa processamento por telefone: aguarda qualquer mensagem anterior do
@@ -1352,7 +1671,7 @@ app.post('/webhook', async (req, res) => {
     // simultânea pode escrever session.currentProduct enquanto esta aguarda, e a escrita
     // prematura sobrescreveria o produto correto. O commit para session só ocorre depois
     // que o interceptor de grade ou a IA já processou, confirmando o produto.
-    const inlineImageUrl = session.supportMode !== 'fechar_pedido_pending'
+    const inlineImageUrl = session.supportMode !== 'fechar_pedido_pending' && !shouldSkipBotAutomation(session)
       ? (body.image?.imageUrl || null)
       : null;
     let inlineProduct = null;
@@ -1636,6 +1955,18 @@ app.post('/webhook', async (req, res) => {
           transcription: text.slice(0, 80),
           fsmState: session.purchaseFlow.state,
         }, '[STT] Áudio transcrito durante FSM ativa');
+      }
+    }
+
+    if (shouldSkipBotAutomation(session)) {
+      const pausedAnalysis = semantic.analyzeUserMessage(text);
+      if (isHumanPauseResumeIntent(pausedAnalysis, text)) {
+        logger.info({ from, supportMode: session.supportMode }, '[ManualPause] Cliente demonstrou interesse comercial - reativando bot');
+        clearSupportMode(session, 'customer_resume_intent');
+      } else {
+        logger.info({ from, supportMode: session.supportMode }, '[ManualPause] Bot suspenso - webhook ignorado');
+        persistSession(from);
+        return;
       }
     }
 
@@ -5069,10 +5400,28 @@ async function flushBuyDebounce(phone) {
         await startInteractivePurchase(phone, first, session);
       }
     } else {
-      // FSM ocupada: todos os produtos vão para a fila em silêncio
+      // FSM ocupada: produtos diferentes vão para a fila em silêncio.
+      // Variante (cor/opção) DO PRODUTO ATUAL → roteia para handlePurchaseFlowEvent,
+      // caso contrário a seleção da cliente seria descartada silenciosamente
+      // (ex.: clicar em "ROSE" no card do produto que a FSM já está processando).
       if (!Array.isArray(pf.buyQueue)) pf.buyQueue = [];
       for (const p of entry.products) {
         const selectedVariant = p._showcaseVariantOpt || null;
+
+        // Variante do produto que a FSM já está processando → handler de eventos
+        if (String(p.id) === String(pf.productId) && selectedVariant) {
+          logger.info(
+            { phone, productId: p.id, variant: selectedVariant },
+            '[BuyDebounce] variante do produto atual — roteando para handlePurchaseFlowEvent'
+          );
+          await handlePurchaseFlowEvent(
+            phone,
+            `buy_variant_${p.id}_${selectedVariant}`,
+            session
+          );
+          continue;
+        }
+
         const alreadyQueued = pf.buyQueue.some(q =>
           q.productId === p.id && (q.selectedVariant || null) === selectedVariant
         );
