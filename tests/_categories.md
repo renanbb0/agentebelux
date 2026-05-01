@@ -1,6 +1,10 @@
 # Categorias dos Testes
 
-Baseline de 2026-05-01: **20/20 tests passam** com `npm run test:all`.
+Baseline atual (após Fase 1A): **22/22 tests passam** com `npm run test:all`.
+
+Histórico:
+- 2026-05-01 Fase 0: 20/20 baseline.
+- 2026-05-01 Fase 1A: 22/22 (deletou 2 fragile-textual; adicionou 4 novos em subdiretórios).
 
 Este arquivo categoriza cada test para guiar decisões durante a modularização do `index.js`.
 
@@ -25,27 +29,30 @@ Categorias:
 - gemini-sanitize.test.js — unit — sanitização Gemini
 - handoff-pdf-flow.test.js — integration — fluxo de handoff PDF
 - inbound-message-buffer.test.js — fragile-textual — extrai bloco `// -- Inbound text debounce --` de index.js (Fase 1F)
-- manual-bela-pause.test.js — fragile-textual — extrai bloco `// -- Manual Bela pause helpers --` de index.js (Fase 1A/1F)
 - order-groups.test.js — unit — agrupamento de pedidos
 - order-guide-image.test.js — unit — imagem de guia
 - order-pdf.test.js — unit — geração de PDF
 - semantic-commercial-intents.test.js — unit — intents comerciais
 - size-prompt-reply.test.js — unit — prompt de tamanho
 - stock-and-reply-context.test.js — unit — contexto de stock/reply
-- tracking-command.test.js — fragile-textual — extrai bloco `// -- Tracking command --` de index.js (Fase 1F)
 - tts.test.js — integration — stub de axios para Gemini TTS
+- utils/phone.test.js — unit — Fase 1A: digitsOnly, normalizeWhatsAppPhone, isAdminPhone
+- inbound/command-parsers.test.js — unit — Fase 1A: parseBelaPauseCommand, parseTrackingCommand
+- session/flags.test.js — unit — Fase 1A: HUMAN_PAUSE_MODES, isBotSuspendedForHuman, shouldSkipBotAutomation
+- ai/intent.test.js — unit — Fase 1A: isHumanPauseResumeIntent
 - woocommerce-commercial-search.test.js — integration — Woo search
 - zapi-document.test.js — unit — sendDocument
 
 ## Notas para a Fase 1
 
-Os 3 tests **fragile-textual** dependem de marcadores de comentário em `index.js`. Quando os helpers correspondentes migrarem para `src/`:
+Restante da Fase 1:
 
-1. **manual-bela-pause.test.js** (Fase 1A/1F) — passar a importar de `src/utils/phone.js` e `src/inbound/command-parsers.js`
-2. **tracking-command.test.js** (Fase 1F) — passar a importar de `src/inbound/command-parsers.js`
-3. **inbound-message-buffer.test.js** (Fase 1F) — passar a importar do novo módulo `src/inbound/debounce.js`
+1. **inbound-message-buffer.test.js** (Fase 1F) — vai ser substituído pelo teste de `src/inbound/debounce.js` quando o debounce migrar.
 
 A migração do test e do helper deve ser **no mesmo commit**, para manter o commit verde.
+
+Status histórico (Fase 1A — 2026-05-01):
+- Deletados: `manual-bela-pause.test.js`, `tracking-command.test.js` (cobertura migrou para `tests/utils/phone.test.js`, `tests/inbound/command-parsers.test.js`, `tests/session/flags.test.js`, `tests/ai/intent.test.js`).
 
 ## Como gerar baseline de replay
 

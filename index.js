@@ -22,6 +22,11 @@ const catalogSearch = require('./services/catalog-search');
 const pdfService = require('./services/pdf');
 const { buildProductGroupsFromCart, buildProductGroupsFromMatched } = require('./services/order-groups');
 const { distributeCompoundGrade } = require('./services/grade-distributor');
+const phoneUtils = require('./src/utils/phone');
+const { parseBelaPauseCommand, parseTrackingCommand } = require('./src/inbound/command-parsers');
+const { HUMAN_PAUSE_MODES, isBotSuspendedForHuman, shouldSkipBotAutomation } = require('./src/session/flags');
+const { isHumanPauseResumeIntent } = require('./src/ai/intent');
+const { digitsOnly, normalizeWhatsAppPhone } = phoneUtils;
 
 const TTS_ENABLED = process.env.TTS_ENABLED === 'true';
 
@@ -55,115 +60,11 @@ const CONTEXT_WINDOW_MS = parseInt(process.env.CONTEXT_WINDOW_MS || String(20 * 
 const INACTIVITY_GREETING_MS = parseInt(process.env.INACTIVITY_GREETING_MS || String(20 * 60 * 1000), 10);
 const CATALOG_RESOLVER_ENABLED = String(process.env.CATALOG_RESOLVER_ENABLED || '').toLowerCase() !== 'false';
 
-// -- Manual Bela pause helpers --
-const HUMAN_PAUSE_MODES = new Set(['human_pending', 'manual_human_pause']);
+// Wrapper que injeta ADMIN_PHONES na função pura de src/utils/phone.js.
+const isAdminPhone = (phone) => phoneUtils.isAdminPhone(phone, ADMIN_PHONES);
 
-function digitsOnly(value) {
-  return String(value || '').replace(/\D/g, '');
-}
+// (helpers de pause/tracking/intent movidos para src/)
 
-function normalizeWhatsAppPhone(value) {
-  let digits = digitsOnly(value);
-  if (!digits) return null;
-
-  while (digits.startsWith('00')) digits = digits.slice(2);
-  while (digits.startsWith('0')) digits = digits.slice(1);
-
-  if (digits.length === 10 || digits.length === 11) {
-    digits = `55${digits}`;
-  }
-
-  if (digits.length < 12 || digits.length > 15) return null;
-  return digits;
-}
-
-function isAdminPhone(phone) {
-  const normalized = normalizeWhatsAppPhone(phone);
-  if (!normalized) return false;
-  return ADMIN_PHONES.some((adminPhone) => normalizeWhatsAppPhone(adminPhone) === normalized);
-}
-
-function parseBelaPauseCommand(text) {
-  const raw = String(text || '').trim();
-  const match = raw.match(/^(pausar|ativar|reativar)\s+bela\s+(.+)$/i);
-  if (!match) return null;
-
-  const targetPhone = normalizeWhatsAppPhone(match[2]);
-  if (!targetPhone) return null;
-
-  return {
-    action: match[1].toLowerCase() === 'pausar' ? 'pause' : 'resume',
-    targetPhone,
-  };
-}
-
-function parseTrackingCommand(text) {
-  const raw = String(text || '').trim();
-  if (!raw) return null;
-
-  let body = raw;
-  let isSlash = false;
-
-  const slashMatch = raw.match(/^\/rastreio\b\s*(.*)$/i);
-  if (slashMatch) {
-    isSlash = true;
-    body = slashMatch[1].trim();
-    if (!body) return null;
-  } else if (!/\b(rastreio|rastrear)\b/i.test(raw)) {
-    return null;
-  }
-
-  const phoneMatch = body.match(/(\+?\d[\d\s().-]{8,})/);
-  if (!phoneMatch) return isSlash ? { error: 'invalid_phone' } : null;
-
-  const targetPhone = normalizeWhatsAppPhone(phoneMatch[0]);
-  if (!targetPhone) return { error: 'invalid_phone' };
-
-  // Código de rastreio: último token alfanumérico (pode ter "-") com pelo menos
-  // um dígito e 5+ caracteres alfanuméricos. Exige dígito para evitar capturar
-  // palavras como "codigo", "para", "envia" etc.
-  const afterPhone = body.slice(phoneMatch.index + phoneMatch[0].length);
-  const tokens = afterPhone.match(/[A-Z0-9][A-Z0-9-]*/gi) || [];
-  const codeCandidate = tokens
-    .reverse()
-    .find((t) => /\d/.test(t) && t.replace(/-/g, '').length >= 5);
-
-  if (!codeCandidate) return isSlash ? { error: 'invalid_code' } : null;
-
-  const trackingCode = codeCandidate.toUpperCase();
-  return { targetPhone, trackingCode };
-}
-
-function isBotSuspendedForHuman(session) {
-  return HUMAN_PAUSE_MODES.has(session?.supportMode);
-}
-
-function shouldSkipBotAutomation(session) {
-  return isBotSuspendedForHuman(session);
-}
-
-function isHumanPauseResumeIntent(analysis, text = '') {
-  const normalizedText = String(text || '')
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .toLowerCase()
-    .replace(/_/g, ' ');
-
-  return Boolean(
-    analysis?.wantsBrowse
-    || analysis?.wantsLaunches
-    || analysis?.wantsMoreProducts
-    || analysis?.wantsProductSelection
-    || analysis?.wantsCheckout
-    || analysis?.wantsPhotosExplicit
-    || analysis?.wantsSize
-    || analysis?.wantsQuantity
-    || analysis?.wantsProductSearch
-    || analysis?.categories?.length > 0
-    || /\b(catalogo|lancamentos?|novidades?|pecas?|produtos?|modelos?|vitrine|fechar pedido|fazer pedido|continuar vendo|ver mais)\b/i.test(normalizedText)
-  );
-}
-// -- End Manual Bela pause helpers --
 // ── Grade Parser ─────────────────────────────────────────────────────────
 
 const WORD_TO_NUM_COMPOUND = {

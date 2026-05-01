@@ -26,20 +26,36 @@ function loadSkipList() {
   return skipped;
 }
 
+function collectTestFiles(dir) {
+  const out = [];
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (entry.name.startsWith('_') || entry.name.startsWith('.')) continue;
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      out.push(...collectTestFiles(full));
+    } else if (entry.isFile() && entry.name.endsWith('.test.js')) {
+      out.push(full);
+    }
+  }
+  return out;
+}
+
 const skipList = loadSkipList();
-const files = fs.readdirSync(TESTS_DIR)
-  .filter((f) => f.endsWith('.test.js'))
+const files = collectTestFiles(TESTS_DIR)
+  .map((p) => path.relative(TESTS_DIR, p))
   .sort();
 
 const results = [];
-for (const file of files) {
-  if (skipList.has(file)) {
+for (const relFile of files) {
+  const file = relFile.replace(/\\/g, '/');
+  const baseName = path.basename(file);
+  if (skipList.has(file) || skipList.has(baseName)) {
     process.stdout.write(`⏭  ${file} (skip via _categories.md)\n`);
     results.push({ file, status: 'skipped' });
     continue;
   }
 
-  const fullPath = path.join(TESTS_DIR, file);
+  const fullPath = path.join(TESTS_DIR, relFile);
   process.stdout.write(`\n▶ ${file}\n`);
   const startedAt = Date.now();
   const res = spawnSync('node', [fullPath], {
