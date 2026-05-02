@@ -29,6 +29,7 @@ const { isHumanPauseResumeIntent } = require('./src/ai/intent');
 const { parseGradeText, parseMultiVariantGrade, normalizeVariantText, matchVariant, normalizeSizeValue } = require('./src/utils/variant-text');
 const { parseCompoundSpec } = require('./src/utils/compound-parser');
 const { extractTextFromEvent, extractAudioUrl, extractEventVersion, parseSizeQtyEvent } = require('./src/utils/event-extractor');
+const { getPublicBaseUrl, buildPublicAssetUrl } = require('./src/utils/public-url');
 const { digitsOnly, normalizeWhatsAppPhone } = phoneUtils;
 
 const TTS_ENABLED = process.env.TTS_ENABLED === 'true';
@@ -1060,25 +1061,6 @@ setInterval(async () => {
 //   Delivery URL: https://<ngrok>/wc-webhook/product
 //   Secret: defina WC_WEBHOOK_SECRET no .env
 // Opcional — o cron de 1h já captura tudo sem webhook.
-function getPublicBaseUrl(req) {
-  const configured = process.env.PUBLIC_BASE_URL?.trim().replace(/\/+$/, '');
-  if (configured) return configured;
-
-  const forwardedProto = String(req.headers['x-forwarded-proto'] || req.protocol || 'http')
-    .split(',')[0]
-    .trim();
-  const forwardedHost = String(req.headers['x-forwarded-host'] || req.get?.('host') || req.headers.host || `localhost:${PORT}`)
-    .split(',')[0]
-    .trim();
-
-  return `${forwardedProto}://${forwardedHost}`;
-}
-
-function buildPublicAssetUrl(req, assetPath) {
-  const normalizedPath = String(assetPath || '').startsWith('/') ? assetPath : `/${assetPath}`;
-  return `${getPublicBaseUrl(req)}${normalizedPath}`;
-}
-
 let orderGuideImageDataUri = null;
 
 function getOrderGuideImageDataUri() {
