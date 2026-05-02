@@ -163,9 +163,7 @@ test('processNextInQueue responde com citacao quando recebe replyToMessageId', a
 test('handlePurchaseFlowEvent aceita nova escolha sizeqty do mesmo menu e mesmo produto', async () => {
   const source = readSource(indexPath);
   const functionSource = extractNamedFunction(source, 'handlePurchaseFlowEvent');
-  const parseSizeQtyEvent = instantiateFunction(extractNamedFunction(source, 'parseSizeQtyEvent'), 'parseSizeQtyEvent', {
-    parseInt,
-  });
+  const parseSizeQtyEvent = require('../src/utils/event-extractor').parseSizeQtyEvent;
   const sent = [];
   const added = [];
   const product = { id: 620, name: 'Pijama americano Bordado', price: '60', salePrice: '', sizes: ['M', 'G', 'GG'] };
@@ -220,9 +218,7 @@ test('handlePurchaseFlowEvent aceita nova escolha sizeqty do mesmo menu e mesmo 
 test('handlePurchaseFlowEvent aceita sizeqty antigo do produto em awaiting_size', async () => {
   const source = readSource(indexPath);
   const functionSource = extractNamedFunction(source, 'handlePurchaseFlowEvent');
-  const parseSizeQtyEvent = instantiateFunction(extractNamedFunction(source, 'parseSizeQtyEvent'), 'parseSizeQtyEvent', {
-    parseInt,
-  });
+  const parseSizeQtyEvent = require('../src/utils/event-extractor').parseSizeQtyEvent;
   const sent = [];
   const added = [];
   const product = { id: 7855, name: 'Pijama manga longa infantil', price: '60', salePrice: '', sizes: ['M', 'G', 'GG'] };
