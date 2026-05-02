@@ -8,6 +8,26 @@ const supabase = createClient(
 
 // ── Sessions ──────────────────────────────────────────────────────────────
 
+// Sanitiza valores destinados a colunas JSONB:
+// - undefined / NaN / Infinity → fallback (Postgres rejeita esses tipos)
+// - round-trip JSON.parse(JSON.stringify(...)) elimina undefined aninhado e
+//   valida serializabilidade (lança em referências circulares)
+// - empty string em coluna JSONB dispara "Empty or invalid json" no Postgres
+function sanitizeJsonField(value, fallback) {
+  if (value === undefined || value === null) return fallback;
+  if (value === '') return fallback;
+  if (typeof value === 'number' && !Number.isFinite(value)) return fallback;
+  try {
+    const round = JSON.parse(JSON.stringify(value));
+    // round-trip pode retornar undefined se value for puro undefined aninhado
+    if (round === undefined || round === null) return fallback;
+    if (round === '') return fallback;
+    return round;
+  } catch {
+    return fallback;
+  }
+}
+
 async function getSession(phone) {
   const { data } = await supabase
     .from('sessions')
@@ -24,32 +44,44 @@ async function upsertSession(phone, session) {
     // contextMemory removido de purchase_flow — agora em coluna própria (P1.6)
   };
 
+  const payload = {
+    phone,
+    history:              sanitizeJsonField(session.history, []),
+    items:                sanitizeJsonField(session.items, []),
+    products:             sanitizeJsonField(session.products, []),
+    current_product:      sanitizeJsonField(session.currentProduct, null),
+    customer_name:        session.customerName ?? null,
+    current_category:     session.currentCategory ?? null,
+    current_page:         session.currentPage ?? 0,
+    total_pages:          session.totalPages ?? 1,
+    total_products:       session.totalProducts ?? 0,
+    last_viewed_product:  sanitizeJsonField(session.lastViewedProduct, null),
+    last_viewed_product_index: session.lastViewedProductIndex ?? null,
+    purchase_flow:        sanitizeJsonField(purchaseFlowPayload, {}),
+    conversation_memory:  sanitizeJsonField(session.conversationMemory, null),
+    message_product_map:  sanitizeJsonField(session.messageProductMap, {}),
+    last_activity:        session.lastActivity ?? Date.now(),
+    active_category:      session.activeCategory ?? null,
+    support_mode:         session.supportMode ?? null,
+    cart_notified:        Boolean(session.cartNotified),
+    updated_at:           new Date().toISOString(),
+  };
+
   const { error } = await supabase
     .from('sessions')
-    .upsert({
-      phone,
-      history:              session.history,
-      items:                session.items,
-      products:             session.products,
-      current_product:      session.currentProduct,
-      customer_name:        session.customerName,
-      current_category:     session.currentCategory,
-      current_page:         session.currentPage,
-      total_pages:          session.totalPages,
-      total_products:       session.totalProducts,
-      last_viewed_product:  session.lastViewedProduct,
-      last_viewed_product_index: session.lastViewedProductIndex,
-      purchase_flow:        purchaseFlowPayload,
-      conversation_memory:  session.conversationMemory || null,
-      message_product_map:  session.messageProductMap || {},
-      last_activity:        session.lastActivity,
-      active_category:      session.activeCategory || null,
-      support_mode:         session.supportMode || null,
-      cart_notified:        session.cartNotified || false,
-      updated_at:           new Date().toISOString(),
-    }, { onConflict: 'phone' });
+    .upsert(payload, { onConflict: 'phone' });
 
-  if (error) throw error;
+  if (error) {
+    // Anexa contexto do Supabase (code/details/hint) para diagnóstico.
+    const detailedErr = new Error(
+      `[upsertSession] ${error.message}` +
+      (error.code    ? ` | code=${error.code}`       : '') +
+      (error.details ? ` | details=${error.details}` : '') +
+      (error.hint    ? ` | hint=${error.hint}`       : '')
+    );
+    detailedErr.cause = error;
+    throw detailedErr;
+  }
 }
 
 async function clearAllSessions() {

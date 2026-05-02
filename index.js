@@ -22,6 +22,15 @@ const catalogSearch = require('./services/catalog-search');
 const pdfService = require('./services/pdf');
 const { buildProductGroupsFromCart, buildProductGroupsFromMatched } = require('./services/order-groups');
 const { distributeCompoundGrade } = require('./services/grade-distributor');
+const phoneUtils = require('./src/utils/phone');
+const { parseBelaPauseCommand, parseTrackingCommand } = require('./src/inbound/command-parsers');
+const { HUMAN_PAUSE_MODES, isBotSuspendedForHuman, shouldSkipBotAutomation } = require('./src/session/flags');
+const { isHumanPauseResumeIntent } = require('./src/ai/intent');
+const { parseGradeText, parseMultiVariantGrade, normalizeVariantText, matchVariant, normalizeSizeValue } = require('./src/utils/variant-text');
+const { parseCompoundSpec } = require('./src/utils/compound-parser');
+const { extractTextFromEvent, extractAudioUrl, extractEventVersion, parseSizeQtyEvent } = require('./src/utils/event-extractor');
+const { getPublicBaseUrl, buildPublicAssetUrl } = require('./src/utils/public-url');
+const { digitsOnly, normalizeWhatsAppPhone } = phoneUtils;
 
 const TTS_ENABLED = process.env.TTS_ENABLED === 'true';
 
@@ -54,222 +63,103 @@ const MAX_HISTORY_MESSAGES = parseInt(process.env.MAX_HISTORY_MESSAGES || '80', 
 const CONTEXT_WINDOW_MS = parseInt(process.env.CONTEXT_WINDOW_MS || String(20 * 60 * 1000), 10);
 const INACTIVITY_GREETING_MS = parseInt(process.env.INACTIVITY_GREETING_MS || String(20 * 60 * 1000), 10);
 const CATALOG_RESOLVER_ENABLED = String(process.env.CATALOG_RESOLVER_ENABLED || '').toLowerCase() !== 'false';
-// ── Grade Parser ─────────────────────────────────────────────────────────
 
-const WORD_TO_NUM_COMPOUND = {
-  um: 1, uma: 1, dois: 2, duas: 2, três: 3, tres: 3, quatro: 4, cinco: 5, seis: 6,
-};
+// Wrapper que injeta ADMIN_PHONES na função pura de src/utils/phone.js.
+const isAdminPhone = (phone) => phoneUtils.isAdminPhone(phone, ADMIN_PHONES);
 
-/**
- * Detecta spec de grade composta multi-produto em texto livre, SEM exigir
- * knownSizes (porque no caso composto múltiplos produtos podem ter grades
- * diferentes — o solver determinístico resolve por produto depois).
- *
- * Padrões suportados:
- *   - "6 de cada estampa"   → perVariant=6
- *   - "2 de cada tamanho"   → perSize=2
- *   - combinados: "6 de cada estampa, 2 de cada tamanho"
- *
- * @param {string} text
- * @returns {{ perVariant: number|null, perSize: number|null } | null}
- */
-function parseCompoundSpec(text) {
-  if (!text || typeof text !== 'string') return null;
-  const normalized = text.replace(/[\n\r]/g, ' ');
+// (helpers de pause/tracking/intent movidos para src/)
 
-  const perVariantRegex = /\b(\d+|um|uma|dois|duas|tr[eê]s|quatro|cinco|seis)\s+de\s+cada\s+(estampa|modelo|cor|desenho|padr[ãa]o)\b/i;
-  const perSizeRegex    = /\b(\d+|um|uma|dois|duas|tr[eê]s|quatro|cinco|seis)\s+de\s+cada\s+tamanho\b/i;
-  const perVariantSizesRegex =
-    /\b(\d+|um|uma|dois|duas|tr[eê]s|quatro|cinco|seis)\s+de\s+cada(?:\s+um)?\s+(?:(?:no|na|nos|nas)\s+)?(?:tam(?:anho)?s?|tamanhos)\s+([a-zà-ú0-9\s,;\/e]+?)(?=[.!?]|$)/i;
-
-  // Padrão "<grade> de cada estampa" — onde <grade> é uma especificação de
-  // tamanhos completa, ex: "2M de cada estampa", "1P 2M 1G de cada modelo".
-  // Captura tudo antes da frase "de cada (estampa|...)" e tenta parsear como grade.
-  const variantPhraseRegex = /\bde\s+cada\s+(estampa|modelo|cor|desenho|padr[ãa]o)s?\b/i;
-
-  const toNumber = (raw) => {
-    const key = String(raw).toLowerCase();
-    return WORD_TO_NUM_COMPOUND[key] ?? parseInt(key, 10);
-  };
-
-  const vMatch = normalized.match(perVariantRegex);
-  const sMatch = normalized.match(perSizeRegex);
-
-  const perVariant = vMatch ? toNumber(vMatch[1]) : null;
-  const perSize    = sMatch ? toNumber(sMatch[1]) : null;
-  const valid = (n) => Number.isFinite(n) && n > 0 && n <= 999;
-
-  // Tenta extrair perVariantGrade ANTES de validar — pega a grade antes de
-  // "de cada estampa". Só ativa se o perVariant simples não casou (evita
-  // conflitar com "6 de cada estampa" puro).
-  // Suporta variantes PT-BR ("2g mae de cada estampa" → {G,2,variant:'Mãe'}).
-  let perVariantGrade = null;
-  const STD_SIZES = ['PP', 'P', 'M', 'G', 'GG', 'XG', 'XGG', 'XGGG'];
-  const sizeListMatch = normalized.match(perVariantSizesRegex);
-  if (sizeListMatch) {
-    const qty = toNumber(sizeListMatch[1]);
-    const grade = parseGradeText(sizeListMatch[2], STD_SIZES);
-    if (valid(qty) && Array.isArray(grade) && grade.length > 0) {
-      perVariantGrade = grade.map(({ size }) => ({ size, qty }));
-    }
-  }
-
-  if (!vMatch) {
-    const phraseMatch = normalized.match(variantPhraseRegex);
-    if (phraseMatch && phraseMatch.index > 0) {
-      const prefix = normalized.slice(0, phraseMatch.index).trim();
-      // Primeiro tenta parse com variante (mãe/filha etc.) — parseMultiVariantGrade
-      // é hoisted e pode ser chamada aqui mesmo estando definida depois no arquivo.
-      const KNOWN_VARIANTS = ['Mãe', 'Filha', 'Adulto', 'Adulta', 'Infantil', 'Criança', 'Bebê'];
-      const multiPairs = parseMultiVariantGrade(prefix, KNOWN_VARIANTS, STD_SIZES);
-      if (Array.isArray(multiPairs) && multiPairs.length > 0) {
-        perVariantGrade = multiPairs.flatMap(({ variant, grade: g }) =>
-          g.map(({ size, qty }) => ({ size, qty, variant }))
-        );
-      } else {
-        const grade = parseGradeText(prefix, STD_SIZES);
-        if (Array.isArray(grade) && grade.length > 0) {
-          perVariantGrade = grade;
-        }
-      }
-    }
-  }
-
-  if (!valid(perVariant) && !valid(perSize) && !perVariantGrade) return null;
-
-  return {
-    perVariant: valid(perVariant) ? perVariant : null,
-    perSize:    valid(perSize)    ? perSize    : null,
-    perVariantGrade,
-  };
-}
-
-/**
- * Extracts a size+quantity grid from free text.
- * Only call when FSM is active and the focused product has known sizes.
- * @param {string} text
- * @param {string[]} knownSizes - e.g. ['P','M','G','GG']
- * @returns {{ size: string, qty: number }[] | null}
- */
-function parseGradeText(text, knownSizes) {
-  if (!text || !knownSizes?.length) return null;
-  text = text.replace(/[\n\r]/g, ' '); // normalizar quebras de linha
-
-  // ── Expressões de "N de cada tamanho" (PT-BR naturais) ──────────────────
-  // Ex: "1 de cada tamanho", "um de cada", "2 de cada", "manda toda a grade"
-  {
-    const WORD_TO_NUM = { um: 1, uma: 1, dois: 2, duas: 2, três: 3, tres: 3, quatro: 4, cinco: 5 };
-    const eachPattern = /\b(?:manda\s+)?(\d+|um|uma|dois|duas|tr[eê]s|quatro|cinco)\s+de\s+cada\s*(?:tamanho)?\b/i;
-    const fullGradePattern = /\b(?:toda\s+[ao]\s+grade|uma?\s+grade\s+completa|manda\s+toda\s+[ao]\s+grade)\b/i;
-    const eachMatch = text.match(eachPattern);
-    const fullGrade = fullGradePattern.test(text);
-    if (eachMatch || fullGrade) {
-      const rawQty = eachMatch ? eachMatch[1].toLowerCase() : '1';
-      const qty = WORD_TO_NUM[rawQty] ?? parseInt(rawQty, 10);
-      if (qty > 0 && qty <= 999) {
-        return knownSizes.map(s => ({ size: s, qty }));
-      }
-    }
-  }
-
-  // Produto de tamanho único: aceita qualquer número digitado como quantidade
-  // Ex: "5", "5 pacotes", "5 unidades", "quero 5", "5 peças"
-  if (knownSizes.length === 1) {
-    const singleMatch = text.trim().match(/^(?:quero\s+)?(\d{1,3})\s*(?:pe[çc]as?|unidades?|pacotes?|pares?|itens?|pc|pcs|un?)?$/i);
-    if (singleMatch) {
-      const qty = parseInt(singleMatch[1], 10);
-      if (qty > 0 && qty <= 999) {
-        return [{ size: knownSizes[0], qty }];
-      }
-    }
-  }
-
-  const knownSizesUpper = new Set(knownSizes.map(size => size.toUpperCase()));
-  const sizesPattern = knownSizes
-    .slice()
-    .sort((a, b) => b.length - a.length) // GG before G
-    .join('|');
-
-  const totalsBySize = new Map();
-  const orderedSizes = [];
-
-  // Pattern: number before size — cobre variações PT-BR:
-  //   "9P", "9 P", "9 do P", "9 da P", "9 de P", "9 dos P", "9 das P",
-  //   "9x P", "9 tamanho P", "9:P"
-  // Lookahead aceita espaço, vírgula, ponto, ponto-e-vírgula, barra, "e", fim de string.
-  const regexQtyFirst = new RegExp(
-    `(\\d+)\\s*(?:do|da|de|dos|das|x|:|tamanho)?\\s*(${sizesPattern})(?=\\s|,|;|\\.|/|!|\\?|e\\b|$)`,
-    'gi'
-  );
-
-  // Pattern: size before number — "P: 9", "P=9", "P - 9"
-  const regexSizeFirst = new RegExp(
-    `\\b(${sizesPattern})\\s*[=:\\-]\\s*(\\d+)`,
-    'gi'
-  );
-
-  function addGradeEntry(rawSize, rawQty) {
-    const size = String(rawSize).toUpperCase();
-    const qty = parseInt(rawQty, 10);
-    if (!knownSizesUpper.has(size) || qty <= 0 || qty > 999) return;
-
-    if (!totalsBySize.has(size)) {
-      totalsBySize.set(size, 0);
-      orderedSizes.push(size);
-    }
-    totalsBySize.set(size, totalsBySize.get(size) + qty);
-  }
-
-  let match;
-  while ((match = regexQtyFirst.exec(text)) !== null) {
-    addGradeEntry(match[2], match[1]);
-  }
-  while ((match = regexSizeFirst.exec(text)) !== null) {
-    addGradeEntry(match[1], match[2]);
-  }
-
-  // Passe 3: tamanhos sem quantidade (ex: "gg", "p m g") → qty implícita = 1.
-  // Só adiciona tamanhos que os passes 1 e 2 ainda não capturaram (não sobrescreve).
-  const regexSizeOnly = new RegExp(`\\b(${sizesPattern})\\b`, 'gi');
-  while ((match = regexSizeOnly.exec(text)) !== null) {
-    const sizeOnly = String(match[1]).toUpperCase();
-    if (knownSizesUpper.has(sizeOnly) && !totalsBySize.has(sizeOnly)) {
-      addGradeEntry(sizeOnly, '1');
-    }
-  }
-
-  const validResults = orderedSizes.map(size => ({ size, qty: totalsBySize.get(size) }));
-
-  // Detecta tamanhos "órfãos": padrões de tamanho comum (P, M, G, GG, etc.) que o
-  // cliente digitou no texto mas NÃO correspondem a nenhum knownSize do produto.
-  // Sem isso, "1P" num produto que só tem M/G/GG é silenciosamente descartado.
-  const COMMON_SIZES = ['PP', 'P', 'M', 'G', 'GG', 'XG', 'EXGG', 'EXG', 'XGG', 'EG', 'XXG', 'XXXG'];
-  const orphanSizes = [];
-  // Regex genérica: captura padrões qty+size ou size+qty com qualquer letra(s) maiúscula(s)
-  const orphanRegex = /(?:(\d+)\s*(?:do|da|de|dos|das|x|:|tamanho)?\s*([A-Z]{1,4})(?=\s|,|;|\.|$))|(?:\b([A-Z]{1,4})\s*[=:\-]\s*(\d+))/gi;
-  let oMatch;
-  while ((oMatch = orphanRegex.exec(text)) !== null) {
-    const orphanSize = (oMatch[2] || oMatch[3] || '').toUpperCase();
-    if (
-      orphanSize &&
-      !knownSizesUpper.has(orphanSize) &&
-      !orphanSizes.includes(orphanSize) &&
-      COMMON_SIZES.includes(orphanSize)
-    ) {
-      orphanSizes.push(orphanSize);
-    }
-  }
-
-  if (validResults.length === 0 && orphanSizes.length === 0) return null;
-
-  // Retorna array com grade + _orphanSizes para que os callers possam avisar o cliente.
-  // Quando só há órfãos (nenhum match válido), retorna array vazio com a propriedade.
-  const result = validResults.length > 0 ? validResults : [];
-  result._orphanSizes = orphanSizes;
-  return result;
-}
+// (grade parser movido para src/utils/compound-parser.js e src/utils/variant-text.js)
 
 // ── Sessions ──────────────────────────────────────────────────────────────
+const inboundTextDebounceBuffer = new Map();
+const INBOUND_TEXT_DEBOUNCE_MS = parseInt(process.env.INBOUND_TEXT_DEBOUNCE_MS || '2500', 10);
+
+function shouldDebounceInboundText(body, text) {
+  const value = String(text || '').trim();
+  if (!value) return false;
+  if (body?.image?.imageUrl) return false;
+  if (body?.listResponseMessage || body?.buttonsResponseMessage) return false;
+  if (body?.quotedMessage || body?.referenceMessageId) return false;
+  if (/^\[(?:audio|audio_stt|sticker)\]$/i.test(value.normalize('NFD').replace(/[\u0300-\u036f]/g, ''))) return false;
+  if (/^(CART_VIEW|CART_REMOVE_ITEM|CART_FINALIZE|FALAR_ATENDENTE|BTN_FECHAR_PEDIDO|BUSCAR_PRODUTO_MENU|VER_TODOS_CATEGORIA)$/i.test(value)) return false;
+  if (value.includes('CONTA EM TRIAL') || value.includes('MENSAGEM DE TESTE')) return false;
+  return true;
+}
+
+function formatBufferedInboundMessages(messages) {
+  const texts = (messages || [])
+    .map(entry => String(entry?.text || '').trim())
+    .filter(Boolean);
+
+  if (texts.length <= 1) return texts[0] || '';
+
+  return [
+    `Cliente enviou ${texts.length} mensagens em sequencia. Leia como uma unica fala e responda ao pedido completo, sem responder item por item:`,
+    ...texts.map(text => `- ${text}`),
+  ].join('\n');
+}
+
+function enqueueInboundTextDebounce(phone, body, text, opts = {}) {
+  const bufferMap = opts.bufferMap || inboundTextDebounceBuffer;
+  const debounceMs = Number.isFinite(opts.debounceMs) ? opts.debounceMs : INBOUND_TEXT_DEBOUNCE_MS;
+  const setTimer = opts.setTimeout || setTimeout;
+  const clearTimer = opts.clearTimeout || clearTimeout;
+
+  const message = {
+    body,
+    text: String(text || '').trim(),
+    messageId: body?.messageId || null,
+    ts: Date.now(),
+  };
+
+  const existing = bufferMap.get(phone);
+  if (existing) {
+    existing.messages.push(message);
+    clearTimer(existing.timer);
+    existing.timer = setTimer(() => {
+      bufferMap.delete(phone);
+      existing.resolve(buildInboundTextFlush(existing.messages));
+    }, debounceMs);
+    return null;
+  }
+
+  let resolveFlush;
+  const firstFlush = new Promise(resolve => {
+    resolveFlush = resolve;
+  });
+
+  const entry = {
+    messages: [message],
+    resolve: resolveFlush,
+    timer: null,
+  };
+
+  entry.timer = setTimer(() => {
+    bufferMap.delete(phone);
+    resolveFlush(buildInboundTextFlush(entry.messages));
+  }, debounceMs);
+
+  bufferMap.set(phone, entry);
+  return firstFlush;
+}
+
+function buildInboundTextFlush(messages) {
+  const last = messages[messages.length - 1] || {};
+  const text = formatBufferedInboundMessages(messages);
+  const body = JSON.parse(JSON.stringify(last.body || {}));
+  body.text = { ...(body.text || {}), message: text };
+
+  return {
+    body,
+    text,
+    messageId: last.messageId || null,
+    messageIds: messages.map(entry => entry.messageId).filter(Boolean),
+    messages,
+  };
+}
+
+// -- Sessions
 const sessions = {};
 const sessionLoadLocks = new Map();
 const persistQueues = new Map();
@@ -867,6 +757,87 @@ async function cancelCurrentFlow(phone, session, userText = null) {
   await sendCategoryMenu(phone, 'Quer ver alguma linha específica?');
 }
 
+async function handleBelaPauseAdminCommand(adminPhone, text) {
+  const command = parseBelaPauseCommand(text);
+  if (!command) return false;
+
+  if (!isAdminPhone(adminPhone)) {
+    logger.warn({ adminPhone }, '[ManualPause] Comando PAUSAR/ATIVAR BELA ignorado: remetente nao autorizado');
+    return false;
+  }
+
+  const session = await getSession(command.targetPhone);
+
+  if (command.action === 'pause') {
+    if (session.purchaseFlow) {
+      session.purchaseFlow.buyQueue = [];
+    }
+    resetPurchaseFlow(session);
+    session.supportMode = 'manual_human_pause';
+    session.greetingNotified = true;
+    await zapi.sendText(adminPhone, `Bela pausada para wa.me/${command.targetPhone}.`);
+    logger.info({ adminPhone, targetPhone: command.targetPhone }, '[ManualPause] Bela pausada por comando da atendente');
+  } else {
+    clearSupportMode(session, 'manual_bela_resume');
+    session.greetingNotified = false;
+    await zapi.sendText(adminPhone, `Bela reativada para wa.me/${command.targetPhone}.`);
+    logger.info({ adminPhone, targetPhone: command.targetPhone }, '[ManualPause] Bela reativada por comando da atendente');
+  }
+
+  persistSession(command.targetPhone);
+  return true;
+}
+
+async function handleTrackingAdminCommand(adminPhone, text) {
+  const command = parseTrackingCommand(text);
+  if (!command) return false;
+
+  if (!isAdminPhone(adminPhone)) {
+    logger.warn({ adminPhone }, '[TrackingAdmin] Comando ignorado: remetente nao autorizado');
+    return false;
+  }
+
+  if (command.error === 'invalid_phone') {
+    await zapi.sendText(adminPhone, 'Não consegui identificar o telefone do cliente. Use: /rastreio <telefone> <codigo>');
+    return true;
+  }
+  if (command.error === 'invalid_code') {
+    await zapi.sendText(adminPhone, 'Código de rastreio parece inválido. Use: /rastreio <telefone> <codigo>');
+    return true;
+  }
+
+  const message =
+    `Olá!\n` +
+    `Seu pedido *BELUX MODA INTIMA* acabou de ser enviado! 📦✨\n\n` +
+    `Agora é só aguardar que ele está a caminho:\n\n` +
+    `🔎 *Código de rastreio:* ${command.trackingCode}\n\n` +
+    `Qualquer dúvida, é só chamar.\n` +
+    `Até mais!`;
+
+  try {
+    await zapi.sendText(command.targetPhone, message);
+    await zapi.sendText(
+      adminPhone,
+      `Rastreio enviado para wa.me/${command.targetPhone} ✅\nCódigo: ${command.trackingCode}`,
+    );
+    logger.info(
+      { adminPhone, targetPhone: command.targetPhone, trackingCode: command.trackingCode },
+      '[TrackingAdmin] Rastreio enviado para cliente',
+    );
+  } catch (err) {
+    logger.error(
+      { err, adminPhone, targetPhone: command.targetPhone },
+      '[TrackingAdmin] Falha ao enviar rastreio',
+    );
+    await zapi.sendText(
+      adminPhone,
+      `Não consegui enviar o rastreio para wa.me/${command.targetPhone}. Tente novamente.`,
+    );
+  }
+
+  return true;
+}
+
 async function getSession(phone) {
   if (sessions[phone]) {
     sessions[phone].previousLastActivity = sessions[phone].lastActivity || null;
@@ -981,7 +952,13 @@ function persistSession(phone) {
   const next = previous
     .catch(() => {})
     .then(() => db.upsertSession(phone, session))
-    .catch(err => logger.error({ err: err.message }, '[Supabase] upsertSession'));
+    .catch(err => logger.error({
+      err: err.message,
+      cause: err.cause?.message,
+      code: err.cause?.code,
+      details: err.cause?.details,
+      hint: err.cause?.hint,
+    }, '[Supabase] upsertSession'));
 
   persistQueues.set(phone, next);
   next.finally(() => {
@@ -1032,6 +1009,7 @@ const CART_ABANDON_MS = 2 * 60 * 60 * 1000; // 2 horas sem interação
 setInterval(async () => {
   const now = Date.now();
   for (const [phone, session] of Object.entries(sessions)) {
+    if (shouldSkipBotAutomation(session)) continue;
     if (
       session.items?.length > 0 &&
       !session.cartNotified &&
@@ -1056,6 +1034,7 @@ setInterval(async () => {
 setInterval(async () => {
   const now = Date.now();
   for (const [phone, session] of Object.entries(sessions)) {
+    if (shouldSkipBotAutomation(session)) continue;
     if (session.greetingNotified) continue;
     if (now - session.lastActivity < INACTIVITY_GREETING_MS) continue;
     // Não duplicar com cart recovery (tem mensagem própria)
@@ -1075,96 +1054,6 @@ setInterval(async () => {
 
 // ── Text Extraction ──────────────────────────────────────────────────────
 
-function extractTextFromEvent(event) {
-  try {
-    if (!event) return '';
-
-    // Intercepta cliques em Option List da Z-API
-    const listId = event.listResponseMessage?.selectedRowId;
-    if (listId) {
-      logger.info({ from: event.phone, listId }, '[ListResponse] Item selecionado');
-      if (listId === 'cat_feminina') return 'CAT_FEMININO';
-      if (listId === 'cat_feminino_infantil') return 'CAT_FEMININOINFANTIL';
-      if (listId === 'cat_masculina') return 'CAT_MASCULINO';
-      if (listId === 'cat_masculino_infantil') return 'CAT_MASCULINOINFANTIL';
-      if (listId === 'cat_lancamentos') return 'CAT_LANCAMENTOS';
-      if (listId === 'btn_ver_todos') return 'VER_TODOS_CATEGORIA';
-      if (listId === 'cart_view') return 'CART_VIEW';
-      if (listId === 'cart_finalize') return 'CART_FINALIZE';
-      if (listId === 'cart_remove_item') return 'CART_REMOVE_ITEM';
-      if (listId === 'cart_other_category') return 'VER_OUTRA_CATEGORIA';
-      // Sentinela determinístico — evita colisão com detector de fotos ("ver mais").
-      // Interceptado no webhook e roteado direto para navegação/catálogo.
-      if (listId === 'cart_more_products') return 'VER_MAIS_PRODUTOS';
-      if (listId === 'falar_atendente') return 'FALAR_ATENDENTE';
-      if (listId === 'buscar_produto') return 'BUSCAR_PRODUTO_MENU';
-      return listId;
-    }
-
-    // Botões de cards sendButtonList (buttonsResponseMessage) — ex: sendCategoryShowcase
-    // Z-API envia este campo para cliques em send-button-list, NÃO como button_reply
-    const brmId = event.buttonsResponseMessage?.buttonId;
-    if (brmId) {
-      logger.info({ buttonId: brmId }, '[extractText] buttonsResponseMessage recebido');
-      // Normaliza IDs legados lowercase → sentinelas canônicas
-      if (brmId === 'btn_fechar_pedido')   return 'BTN_FECHAR_PEDIDO';
-      if (brmId === 'btn_lancamentos')     return 'CAT_LANCAMENTOS';
-      if (brmId === 'btn_problema')        return 'FALAR_ATENDENTE';
-      if (brmId === 'cat_feminina')        return 'CAT_FEMININO';
-      if (brmId === 'cat_masculina')       return 'CAT_MASCULINO';
-      if (brmId === 'cat_lancamentos')     return 'CAT_LANCAMENTOS';
-      if (brmId === 'btn_outra_cat')       return 'OUTRA CATEGORIA';
-      if (brmId === 'cart_view')           return 'CART_VIEW';
-      if (brmId === 'cart_finalize')       return 'CART_FINALIZE';
-      if (brmId === 'cart_remove_item')    return 'CART_REMOVE_ITEM';
-      if (brmId === 'cart_other_category') return 'VER_OUTRA_CATEGORIA';
-      if (brmId === 'cart_more_products')  return 'VER_MAIS_PRODUTOS';
-      if (brmId === 'falar_atendente')     return 'FALAR_ATENDENTE';
-      if (brmId === 'buscar_produto')      return 'BUSCAR_PRODUTO_MENU';
-      // IDs já canônicos (CAT_MASCULINO, CAT_FEMININO, CAT_FEMININOINFANTIL,
-      // CAT_MASCULINOINFANTIL, CAT_LANCAMENTOS, buy_*, size_*, qty_*, etc.)
-      return brmId;
-    }
-
-    // Intercepta botões da Z-API e trata como texto transparente para a IA
-    if (event.type === 'button_reply' && event.buttonReply?.id) {
-       if (event.buttonReply.id === 'btn_outra_cat') return 'OUTRA CATEGORIA';
-       if (event.buttonReply.id === 'cart_view') return 'CART_VIEW';
-       if (event.buttonReply.id === 'cart_finalize') return 'CART_FINALIZE';
-       if (event.buttonReply.id === 'cart_remove_item') return 'CART_REMOVE_ITEM';
-       if (event.buttonReply.id === 'cart_other_category') return 'VER_OUTRA_CATEGORIA';
-       if (event.buttonReply.id === 'cart_more_products') return 'VER_MAIS_PRODUTOS';
-       if (event.buttonReply.id === 'falar_atendente') return 'FALAR_ATENDENTE';
-       if (event.buttonReply.id === 'cat_feminina')    return 'CAT_FEMININO';
-       if (event.buttonReply.id === 'cat_masculina')   return 'CAT_MASCULINO';
-       if (event.buttonReply.id === 'cat_lancamentos') return 'CAT_LANCAMENTOS';
-       return event.buttonReply.id;
-    }
-
-    // Suporte para múltiplos formatos de payload da Z-API
-    if (typeof event.text === 'string') return event.text;
-    if (event.text && typeof event.text.message === 'string') return event.text.message;
-    if (event.content && typeof event.content === 'string') return event.content;
-    if (event.audio || event?.message?.audio) return '[Áudio_STT]';
-    if (event.image?.caption) return event.image.caption.trim();
-    if (event.sticker) return '[Sticker]';
-
-    // Fallback para objetos complexos
-    return event.text?.message || event.content || '';
-  } catch (err) {
-    return '';
-  }
-}
-
-function extractAudioUrl(event) {
-  return event?.audio?.audioUrl
-    || event?.audio?.url
-    || event?.audioUrl
-    || event?.message?.audioUrl
-    || event?.message?.audio?.audioUrl
-    || event?.message?.audio?.url
-    || null;
-}
 
 // ── WooCommerce Webhook (sync em tempo real do catálogo) ─────────────────
 // Configurar no WooCommerce: Settings → Advanced → Webhooks →
@@ -1172,25 +1061,6 @@ function extractAudioUrl(event) {
 //   Delivery URL: https://<ngrok>/wc-webhook/product
 //   Secret: defina WC_WEBHOOK_SECRET no .env
 // Opcional — o cron de 1h já captura tudo sem webhook.
-function getPublicBaseUrl(req) {
-  const configured = process.env.PUBLIC_BASE_URL?.trim().replace(/\/+$/, '');
-  if (configured) return configured;
-
-  const forwardedProto = String(req.headers['x-forwarded-proto'] || req.protocol || 'http')
-    .split(',')[0]
-    .trim();
-  const forwardedHost = String(req.headers['x-forwarded-host'] || req.get?.('host') || req.headers.host || `localhost:${PORT}`)
-    .split(',')[0]
-    .trim();
-
-  return `${forwardedProto}://${forwardedHost}`;
-}
-
-function buildPublicAssetUrl(req, assetPath) {
-  const normalizedPath = String(assetPath || '').startsWith('/') ? assetPath : `/${assetPath}`;
-  return `${getPublicBaseUrl(req)}${normalizedPath}`;
-}
-
 let orderGuideImageDataUri = null;
 
 function getOrderGuideImageDataUri() {
@@ -1219,7 +1089,7 @@ app.post('/webhook', async (req, res) => {
 
   let from = '';
   try {
-    const body = req.body;
+    let body = req.body;
     logger.info({ body }, '[Webhook] Evento recebido');
     from = body?.phone || '';
     if (!from) return;
@@ -1244,7 +1114,7 @@ app.post('/webhook', async (req, res) => {
     }
     // ────────────────────────────────────────────────────────────────────
 
-    const messageId = body?.messageId;
+    let messageId = body?.messageId;
 
     // ── Deduplicação de eventos duplicados (ADR-034) ──────────────────────
     // Z-API reenvia webhooks em caso de timeout. Sem isso, a mesma mensagem
@@ -1307,6 +1177,15 @@ app.post('/webhook', async (req, res) => {
       text = ''; // foto sem caption: segue o fluxo com texto vazio
     }
 
+    if (text === '[Áudio]' || text === '[Sticker]') {
+      const mediaSession = await getSession(from);
+      if (shouldSkipBotAutomation(mediaSession)) {
+        logger.info({ from, supportMode: mediaSession.supportMode }, '[ManualPause] Bot suspenso - midia ignorada');
+        persistSession(from);
+        return;
+      }
+    }
+
     // Fallbacks de áudio/sticker que NÃO precisam de sessão (respondem direto)
     if (text === '[Áudio]') {
       logger.info({ from }, '[Intercept] Áudio recebido — fallback humano');
@@ -1320,8 +1199,31 @@ app.post('/webhook', async (req, res) => {
 
     if (text.includes('CONTA EM TRIAL') || text.includes('MENSAGEM DE TESTE')) return;
 
+    if (await handleBelaPauseAdminCommand(from, text)) return;
+    if (await handleTrackingAdminCommand(from, text)) return;
+
+    let bufferedMessageIds = null;
+    if (shouldDebounceInboundText(body, text)) {
+      const buffered = await enqueueInboundTextDebounce(from, body, text);
+      if (!buffered) {
+        logger.info({ phone: from, text }, '[MSG] Aguardando possivel complemento do cliente');
+        if (messageId) zapi.readMessage(from, messageId);
+        return;
+      }
+
+      body = buffered.body;
+      text = buffered.text;
+      messageId = buffered.messageId;
+      bufferedMessageIds = buffered.messageIds;
+      logger.info(
+        { phone: from, count: buffered.messages.length, messageIds: buffered.messageIds },
+        '[MSG] Rajada de texto agrupada antes da IA'
+      );
+    }
+
     logger.info({ phone: from, text }, '[MSG] Received');
-    if (messageId) zapi.readMessage(from, messageId);
+    const readMessageIds = bufferedMessageIds || (messageId ? [messageId] : []);
+    for (const id of readMessageIds) zapi.readMessage(from, id);
 
     // ── Per-phone serialization ────────────────────────────────────────────────
     // Serializa processamento por telefone: aguarda qualquer mensagem anterior do
@@ -1352,7 +1254,7 @@ app.post('/webhook', async (req, res) => {
     // simultânea pode escrever session.currentProduct enquanto esta aguarda, e a escrita
     // prematura sobrescreveria o produto correto. O commit para session só ocorre depois
     // que o interceptor de grade ou a IA já processou, confirmando o produto.
-    const inlineImageUrl = session.supportMode !== 'fechar_pedido_pending'
+    const inlineImageUrl = session.supportMode !== 'fechar_pedido_pending' && !shouldSkipBotAutomation(session)
       ? (body.image?.imageUrl || null)
       : null;
     let inlineProduct = null;
@@ -1636,6 +1538,18 @@ app.post('/webhook', async (req, res) => {
           transcription: text.slice(0, 80),
           fsmState: session.purchaseFlow.state,
         }, '[STT] Áudio transcrito durante FSM ativa');
+      }
+    }
+
+    if (shouldSkipBotAutomation(session)) {
+      const pausedAnalysis = semantic.analyzeUserMessage(text);
+      if (isHumanPauseResumeIntent(pausedAnalysis, text)) {
+        logger.info({ from, supportMode: session.supportMode }, '[ManualPause] Cliente demonstrou interesse comercial - reativando bot');
+        clearSupportMode(session, 'customer_resume_intent');
+      } else {
+        logger.info({ from, supportMode: session.supportMode }, '[ManualPause] Bot suspenso - webhook ignorado');
+        persistSession(from);
+        return;
       }
     }
 
@@ -4299,10 +4213,6 @@ async function resolveProductById(session, productId) {
   }
 }
 
-function normalizeSizeValue(size) {
-  return String(size || '').trim().toUpperCase();
-}
-
 function getReservedCartQuantity(session, productId, size) {
   if (!Array.isArray(session?.items) || !productId || !size) return 0;
 
@@ -4588,140 +4498,6 @@ async function tryAdvanceToSize(phone, session, chosenVariant) {
 }
 
 /**
- * Normalizes text for fuzzy matching against variant option labels.
- * Strips accents and lowercases.
- */
-function normalizeVariantText(str) {
-  return String(str || '')
-    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
-    .toLowerCase().trim();
-}
-
-/**
- * Tries to match user input against a list of variant options.
- * Returns the original option string on match, null otherwise.
- * Supports: exact name, normalized name, or 1-based numeric index.
- */
-function matchVariant(text, options) {
-  if (!text || !Array.isArray(options)) return null;
-  const normInput = normalizeVariantText(text);
-
-  // Numeric: "1" → options[0]
-  const numMatch = normInput.match(/^(\d+)$/);
-  if (numMatch) {
-    const idx = parseInt(numMatch[1], 10) - 1;
-    if (idx >= 0 && idx < options.length) return options[idx];
-    return null;
-  }
-
-  // Name match (normalized)
-  return options.find((opt) => normalizeVariantText(opt) === normInput) || null;
-}
-
-/**
- * Tenta extrair pares (variante, grade) de uma mensagem combinada.
- *
- * Exemplos de input suportados:
- *   "mae 2g filha 1p"         → [{ variant: 'Mãe', grade: [{size:'G',qty:2}] }, { variant:'Filha', grade:[{size:'P',qty:1}] }]
- *   "mãe 3P 2M filha 1P"     → [{ variant: 'Mãe', grade: [{size:'P',qty:3},{size:'M',qty:2}] }, ...]
- *   "mae 2g"                  → [{ variant: 'Mãe', grade: [{size:'G',qty:2}] }]
- *
- * Retorna null se não encontrar nenhum par válido (variante + grade).
- *
- * @param {string} text
- * @param {string[]} attrOptions - opções de variante (ex: ['Mãe', 'Filha'])
- * @param {string[]} productSizes - tamanhos conhecidos do produto (ex: ['P','M','G','GG'])
- * @returns {{ variant: string, grade: {size: string, qty: number}[] }[] | null}
- */
-function parseMultiVariantGrade(text, attrOptions, productSizes) {
-  if (!text || !attrOptions?.length || !productSizes?.length) return null;
-  text = text.replace(/[\n\r]/g, ' '); // normalizar quebras de linha
-
-  // Build a regex that matches any variant option name (normalized, word boundary)
-  const escapedOptions = attrOptions.map((opt) =>
-    normalizeVariantText(opt).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  );
-  const variantRx = new RegExp(`\\b(${escapedOptions.join('|')})\\b`, 'gi');
-
-  // BUG-1 FIX: normalize text for matching (remove accents) while keeping original for slicing.
-  // PT-BR: NFD expansion then removing combining marks yields same length as original NFC text,
-  // so indices in normText map 1:1 to indices in original text (e.g. "mãe"→"mae", both length 3).
-  const normText = text.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
-
-  // Find all variant matches in order of appearance (search on normText, not original text)
-  const hits = [...normText.matchAll(variantRx)].map((m) => ({
-    index: m.index,
-    length: m[0].length,
-    original: attrOptions.find((opt) => normalizeVariantText(opt) === normalizeVariantText(m[0])) || m[0],
-  }));
-
-  if (hits.length === 0) return null;
-
-  // Pre-pass: "QTY VARIANT SIZE" — ex: "2 mae gg 3 filha g"
-  // Padrão onde a quantidade vem antes da variante e o tamanho vem depois.
-  // Só é usado quando todas as variantes encontradas têm match (cobertura total).
-  {
-    const sizesPatternLocal = productSizes.slice()
-      .sort((a, b) => b.length - a.length)
-      .map(s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
-      .join('|');
-    const qtyVarSizeRx = new RegExp(
-      `(\\d+)\\s+(${escapedOptions.join('|')})\\s+(${sizesPatternLocal})(?=\\s|,|;|\\.|$)`,
-      'gi'
-    );
-    const directPairs = [];
-    let dm;
-    while ((dm = qtyVarSizeRx.exec(normText)) !== null) {
-      const qty = parseInt(dm[1], 10);
-      const variant = attrOptions.find(opt => normalizeVariantText(opt) === normalizeVariantText(dm[2])) || dm[2];
-      const sizeUpper = dm[3].toUpperCase();
-      const originalSize = productSizes.find(s => s.toUpperCase() === sizeUpper) || dm[3];
-      if (qty > 0 && qty <= 999) {
-        directPairs.push({ variant, grade: [{ size: originalSize, qty }] });
-      }
-    }
-    if (directPairs.length === hits.length && directPairs.length > 0) return directPairs;
-  }
-
-  // Ordenação 1: grade APÓS a variante ("mãe 2G filha 1M")
-  const afterPairs = [];
-  for (let i = 0; i < hits.length; i++) {
-    const gradeText = text.slice(hits[i].index + hits[i].length, hits[i + 1]?.index ?? text.length).trim();
-    if (!gradeText) continue;
-    const grade = parseGradeText(gradeText, productSizes);
-    if (grade?.length > 0) afterPairs.push({ variant: hits[i].original, grade });
-  }
-
-  // Ordenação 2: grade ANTES da variante ("2G mãe 1M filha" / "3g mãe\n2P filha")
-  // SEMPRE calculada — não faz short-circuit em afterPairs, para poder comparar cobertura.
-  const beforePairs = [];
-  for (let i = 0; i < hits.length; i++) {
-    const start = i === 0 ? 0 : hits[i - 1].index + hits[i - 1].length;
-    const gradeText = text.slice(start, hits[i].index).trim();
-    if (!gradeText) continue;
-    const grade = parseGradeText(gradeText, productSizes);
-    if (grade?.length > 0) beforePairs.push({ variant: hits[i].original, grade });
-  }
-  // Caso especial: grade após o último hit na ordem 2 ("2G mãe filha 1M")
-  if (hits.length >= 2) {
-    const lastHit = hits[hits.length - 1];
-    const trailingText = text.slice(lastHit.index + lastHit.length).trim();
-    if (trailingText) {
-      const grade = parseGradeText(trailingText, productSizes);
-      if (grade?.length > 0) beforePairs.push({ variant: lastHit.original, grade });
-    }
-  }
-
-  // Prefere a ordenação que cobre mais variantes distintas.
-  // Ex: "3g mãe 2P filha" → afterPairs cobre 1 variante (Mãe←"2P"), beforePairs cobre 2 (Mãe←"3g", Filha←"2P").
-  // Quando empatados, prefere "after" (ordem natural pt-BR).
-  if (beforePairs.length > afterPairs.length) return beforePairs;
-  if (afterPairs.length > 0) return afterPairs;
-  return beforePairs.length > 0 ? beforePairs : null;
-}
-
-
-/**
  * Adiciona um item ao carrinho silenciosamente (sem mensagem, sem menu).
  * Usado pelo grade parser para batch insert antes de enviar uma confirmação consolidada.
  */
@@ -4867,15 +4643,6 @@ async function addToCart(phone, qty, session) {
 }
 
 /**
- * Extrai o timestamp de versão do sufixo `_v{timestamp}` de um eventId interativo.
- * Retorna o número ou null se não houver sufixo de versão.
- */
-function extractEventVersion(eventId) {
-  const match = eventId.match(/_v(\d+)$/);
-  return match ? parseInt(match[1], 10) : null;
-}
-
-/**
  * Retorna true se o evento veio de um menu desatualizado (versão menor que a sessão atual).
  * Botões de menus antigos devem ser rejeitados para evitar efeitos colaterais.
  */
@@ -4885,24 +4652,6 @@ function isStaleEvent(eventId, session) {
   const sessionVersion = session.purchaseFlow?.interactiveVersion;
   if (!sessionVersion) return false;
   return eventVersion < sessionVersion;
-}
-
-function parseSizeQtyEvent(eventId) {
-  if (!eventId?.startsWith('sizeqty_')) return null;
-
-  // Formato: sizeqty_{productId}_{size}_{qty}_v{version}
-  const withoutPrefix = eventId.slice('sizeqty_'.length);
-  const vIdx = withoutPrefix.lastIndexOf('_v');
-  const withoutVersion = vIdx >= 0 ? withoutPrefix.slice(0, vIdx) : withoutPrefix;
-  const parts = withoutVersion.split('_');
-
-  if (parts.length < 3) return null;
-
-  const productIdStr = parts[0];
-  const qty = parseInt(parts[parts.length - 1], 10);
-  const size = parts.slice(1, -1).join('_'); // suporta tamanhos multi-char como GG, EXG
-
-  return { productIdStr, size, qty };
 }
 
 /**
@@ -5069,10 +4818,28 @@ async function flushBuyDebounce(phone) {
         await startInteractivePurchase(phone, first, session);
       }
     } else {
-      // FSM ocupada: todos os produtos vão para a fila em silêncio
+      // FSM ocupada: produtos diferentes vão para a fila em silêncio.
+      // Variante (cor/opção) DO PRODUTO ATUAL → roteia para handlePurchaseFlowEvent,
+      // caso contrário a seleção da cliente seria descartada silenciosamente
+      // (ex.: clicar em "ROSE" no card do produto que a FSM já está processando).
       if (!Array.isArray(pf.buyQueue)) pf.buyQueue = [];
       for (const p of entry.products) {
         const selectedVariant = p._showcaseVariantOpt || null;
+
+        // Variante do produto que a FSM já está processando → handler de eventos
+        if (String(p.id) === String(pf.productId) && selectedVariant) {
+          logger.info(
+            { phone, productId: p.id, variant: selectedVariant },
+            '[BuyDebounce] variante do produto atual — roteando para handlePurchaseFlowEvent'
+          );
+          await handlePurchaseFlowEvent(
+            phone,
+            `buy_variant_${p.id}_${selectedVariant}`,
+            session
+          );
+          continue;
+        }
+
         const alreadyQueued = pf.buyQueue.some(q =>
           q.productId === p.id && (q.selectedVariant || null) === selectedVariant
         );

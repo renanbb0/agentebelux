@@ -1,0 +1,62 @@
+[
+  {
+    "name": "text-hello-stranger",
+    "comment": "Mensagem de texto inicial de um phone sintético (sem sessão ativa). O webhook deve aceitar (200) e disparar o gate inicial.",
+    "payload": {
+      "isStatusReply": false,
+      "chatLid": "fixture@lid",
+      "connectedPhone": "5500000000001",
+      "waitingMessage": false,
+      "isEdit": false,
+      "isGroup": false,
+      "isNewsletter": false,
+      "instanceId": "fixture-instance",
+      "messageId": "FIXTURE_MSG_TEXT_001",
+      "phone": "5500000000999",
+      "fromMe": false,
+      "momment": 1735689600000,
+      "status": "RECEIVED",
+      "chatName": "Cliente Fixture",
+      "senderPhoto": null,
+      "senderName": "Cliente Fixture",
+      "photo": null,
+      "broadcast": false,
+      "participantLid": null,
+      "forwarded": false,
+      "type": "ReceivedCallback",
+      "fromApi": false,
+      "text": {
+        "message": "oi"
+      }
+    }
+  },
+  {
+    "name": "list-response-categoria-feminina",
+    "comment": "Clique em option list — selecionou 'cat_feminina'. extractTextFromEvent retorna 'CAT_FEMININO'.",
+    "payload": {
+      "isStatusReply": false,
+      "chatLid": "fixture@lid",
+      "connectedPhone": "5500000000001",
+      "waitingMessage": false,
+      "isEdit": false,
+      "isGroup": false,
+      "isNewsletter": false,
+      "instanceId": "fixture-instance",
+      "messageId": "FIXTURE_MSG_LIST_001",
+      "phone": "5500000000999",
+      "fromMe": false,
+      "momment": 1735689601000,
+      "status": "RECEIVED",
+      "chatName": "Cliente Fixture",
+      "senderName": "Cliente Fixture",
+      "broadcast": false,
+      "forwarded": false,
+      "type": "ReceivedCallback",
+      "fromApi": false,
+      "listResponseMessage": {
+        "title": "Feminina",
+        "selectedRowId": "cat_feminina"
+      }
+    }
+  }
+]

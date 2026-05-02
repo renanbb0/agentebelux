@@ -8,6 +8,9 @@ const repoRoot = path.resolve(__dirname, '..');
 const indexPath = path.join(repoRoot, 'index.js');
 const imageMatcherPath = path.join(repoRoot, 'services', 'image-matcher.js');
 
+const { parseCompoundSpec } = require('../src/utils/compound-parser');
+const { normalizeVariantText, matchVariant, parseGradeText, parseMultiVariantGrade } = require('../src/utils/variant-text');
+
 function readSource(filePath) {
   return fs.readFileSync(filePath, 'utf8');
 }
@@ -23,9 +26,6 @@ function extractBetween(source, startMarker, endMarker) {
 function instantiateIndexHelpers(context = {}) {
   const source = readSource(indexPath);
   const script = new vm.Script(`
-    ${extractBetween(source, 'const WORD_TO_NUM_COMPOUND =', 'function parseGradeText')}
-    ${extractBetween(source, 'function parseGradeText', '// ── Sessions')}
-    ${extractBetween(source, 'function normalizeVariantText', '/**\r\n * Adiciona um item')}
     ${extractBetween(source, 'function detectCompoundCase', '/**\r\n * Classifica resposta')}
     ${extractBetween(source, 'function clearCompoundState', '/**\r\n * Agenda')}
     ${extractBetween(source, 'function detectCompoundInconsistencies', 'async function runCompoundConfirmation')}
@@ -46,6 +46,11 @@ function instantiateIndexHelpers(context = {}) {
     RegExp,
     parseInt,
     parseFloat,
+    parseCompoundSpec,
+    normalizeVariantText,
+    matchVariant,
+    parseGradeText,
+    parseMultiVariantGrade,
     ...context,
   };
   vm.createContext(sandbox);
@@ -53,8 +58,6 @@ function instantiateIndexHelpers(context = {}) {
 }
 
 test('parseCompoundSpec reconhece "N de cada no TAM P, M, G, GG" como grade por produto', () => {
-  const { parseCompoundSpec } = instantiateIndexHelpers();
-
   const spec = parseCompoundSpec('Eu quero 1 de cada no TAM P, M, g gg');
 
   assert.deepEqual(JSON.parse(JSON.stringify(spec)), {
