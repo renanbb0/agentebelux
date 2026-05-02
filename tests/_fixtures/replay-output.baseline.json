@@ -1,0 +1,12 @@
+[
+  {
+    "name": "text-hello-stranger",
+    "status": 200,
+    "body": "OK"
+  },
+  {
+    "name": "list-response-categoria-feminina",
+    "status": 200,
+    "body": "OK"
+  }
+]
