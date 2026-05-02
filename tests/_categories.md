@@ -1,10 +1,11 @@
 # Categorias dos Testes
 
-Baseline atual (após Fase 1A): **22/22 tests passam** com `npm run test:all`.
+Baseline atual (após Fase 1B+E): **24/24 tests passam** com `npm run test:all`.
 
 Histórico:
 - 2026-05-01 Fase 0: 20/20 baseline.
 - 2026-05-01 Fase 1A: 22/22 (deletou 2 fragile-textual; adicionou 4 novos em subdiretórios).
+- 2026-05-02 Fase 1B+E: 24/24 (adicionou utils/variant-text.test.js + utils/compound-parser.test.js; reescreveu compound-robustness.test.js para usar require em vez de vm.Script).
 
 Este arquivo categoriza cada test para guiar decisões durante a modularização do `index.js`.
 
@@ -40,6 +41,8 @@ Categorias:
 - inbound/command-parsers.test.js — unit — Fase 1A: parseBelaPauseCommand, parseTrackingCommand
 - session/flags.test.js — unit — Fase 1A: HUMAN_PAUSE_MODES, isBotSuspendedForHuman, shouldSkipBotAutomation
 - ai/intent.test.js — unit — Fase 1A: isHumanPauseResumeIntent
+- utils/variant-text.test.js — unit — Fase 1B+E: normalizeSizeValue, normalizeVariantText, matchVariant, parseGradeText, parseMultiVariantGrade
+- utils/compound-parser.test.js — unit — Fase 1B+E: parseCompoundSpec
 - woocommerce-commercial-search.test.js — integration — Woo search
 - zapi-document.test.js — unit — sendDocument
 
@@ -53,6 +56,9 @@ A migração do test e do helper deve ser **no mesmo commit**, para manter o com
 
 Status histórico (Fase 1A — 2026-05-01):
 - Deletados: `manual-bela-pause.test.js`, `tracking-command.test.js` (cobertura migrou para `tests/utils/phone.test.js`, `tests/inbound/command-parsers.test.js`, `tests/session/flags.test.js`, `tests/ai/intent.test.js`).
+
+Status histórico (Fase 1B+E — 2026-05-02):
+- compound-robustness.test.js: reescrito de fragile-textual (vm.Script) para unit (require direto do módulo); `instantiateIndexHelpers` agora injeta funções do módulo no sandbox em vez de extrair de index.js.
 
 ## Como gerar baseline de replay
 
